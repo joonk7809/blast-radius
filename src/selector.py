@@ -25,6 +25,9 @@ UNITEST = os.environ.get("BR_UNITEST", "0") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
 FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
+LAZYTABLES = os.environ.get("BR_LAZYTABLES", "1") == "1"
+TPCQ2 = os.environ.get("BR_TPCQ2", "1") == "1"
+GCFREEZE = os.environ.get("BR_GCFREEZE", "0") == "1"
 LAZYEXEC = os.environ.get("BR_LAZYEXEC", "1") == "1"
 LAZYUNITS = os.environ.get("BR_LAZYUNITS", "1") == "1"
 DEBUG_N = int(os.environ.get("BR_DEBUG_N", "-1"))
@@ -431,6 +434,7 @@ def candidates_for(f, old_text, new_text, cov, notes):
 FRACTION_OK = set()
 FORCE_LIST = set()
 _QKEY = re.compile(r"^s:\('(\S+) (\d+)', \[\]\)$")
+_QKEY2 = re.compile(r"""^s:\((["'])(\d+), """)
 
 
 def _pairs(text):
@@ -468,6 +472,12 @@ def changed_query_indices(path, old_text, new_text):
 def query_unit_keys(cov, n, idx, word):
     keys = [k for m, k in cov.units if m == n and k]
     sub = [k for k in keys if k.startswith("s:")]
+    tid = cov.num_id(n)
+    own = "tpc-ds" if "tpcds" in tid else "tpc-h" if "tpch" in tid else None
+    if TPCQ2 and sub and own and all(_QKEY2.match(k) for k in sub) and all(not k.startswith("f:") for k in keys):
+        if own != word:
+            return set()
+        return {"q:%s" % _QKEY2.match(k).group(2) for k in sub if int(_QKEY2.match(k).group(2)) in idx}
     if not sub or not all(_QKEY.match(k) for k in sub):
         return None
     words = {_QKEY.match(k).group(1) for k in sub}
@@ -842,7 +852,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             res = full(out | extra)
             idx = changed_query_indices(path, old_text, new_text) if TPCQ else None
             if idx is not None:
-                for n in extra - out:
+                for n in (extra | out) if TPCQ2 else extra - out:
                     keys = query_unit_keys(cov, n, idx, os.path.basename(os.path.dirname(path)))
                     if keys is not None:
                         res[n] = keys
@@ -998,8 +1008,71 @@ def install_futures():
 CHILD_LAZY = False
 
 
+_TPC_CACHE = {}
+
+
+class LazyTables(dict):
+    def __init__(self, kind, directory=None, schema=None, items=()):
+        super().__init__(items)
+        self.kind = kind
+        if directory is not None:
+            _TPC_CACHE.setdefault(("meta", kind), (directory, schema))
+
+    def __missing__(self, name):
+        key = (self.kind, name)
+        if key not in _TPC_CACHE:
+            directory, schema = _TPC_CACHE[("meta", self.kind)]
+            if name not in schema:
+                raise KeyError(name)
+            _TPC_CACHE[key] = _tpc_table(directory, name, schema[name])
+        self[name] = _TPC_CACHE[key]
+        return self[name]
+
+    def __reduce__(self):
+        return (LazyTables, (self.kind, None, None, list(self.items())))
+
+
+def _tpc_table(directory, table, columns):
+    te = sys.modules["tests.test_executor"]
+    file_name = f"{directory}{table}.csv.gz"
+    reader = te.csv.reader(te.open_file(file_name), delimiter="|")
+    rows = []
+    ctypes = []
+    next(reader)
+    for row in reader:
+        if not ctypes:
+            for i, v in enumerate(row):
+                try:
+                    ctypes.append(type(te.ast.literal_eval(v)))
+                except (ValueError, SyntaxError):
+                    ctypes.append(str)
+        rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+    return te.Table(columns=columns, rows=rows)
+
+
+def _lazy_tpc_setup(cls):
+    te = sys.modules[cls.__module__]
+    cls.tpch_conn = te.duckdb.connect()
+    cls.tpcds_conn = te.duckdb.connect()
+    for conn, directory, schema in ((cls.tpch_conn, te.DIR_TPCH, te.TPCH_SCHEMA), (cls.tpcds_conn, te.DIR_TPCDS, te.TPCDS_SCHEMA)):
+        for table, columns in schema.items():
+            file_name = f"{directory}{table}.csv.gz"
+            conn.execute(
+                f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+            )
+    cls.tpch_tables = LazyTables("h", te.DIR_TPCH, te.TPCH_SCHEMA)
+    cls.tpcds_tables = LazyTables("ds", te.DIR_TPCDS, te.TPCDS_SCHEMA)
+    cls.cache = {}
+    cls.tpch_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+    cls.tpcds_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+
+
 def _lazy_class_setup(klass, names):
-    real = vars(klass)["setUpClass"].__func__
+    real = _lazy_tpc_setup if LAZYTABLES else vars(klass)["setUpClass"].__func__
     real_down = vars(klass)["tearDownClass"].__func__ if "tearDownClass" in vars(klass) else None
     loaded = []
 
@@ -1203,6 +1276,10 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             self.key = "s:" + base + ("#%d" % n if n else "")
             self.path = ">".join(ustate["stack"] + [self.key])
             self.skip = ustate["allowed"] is not None and self.path not in ustate["allowed"]
+            if self.skip and not ustate["stack"]:
+                q = _QKEY2.match(self.key)
+                if q and "q:" + q.group(2) in ustate["allowed"]:
+                    self.skip = False
             self.inner = None if self.skip else orig_subtest(case, msg, **params)
 
         def __enter__(self):
@@ -1513,10 +1590,15 @@ def main():
             return not LAZYEXEC or r is None or bool(r & table_attrs)
 
         exec_commits = sum(1 for p in plans if any(needs_tables(n) for n in p["light"]))
-        zygote.warm(SRC, warm_ids, exec_commits >= (2 if LAZYEXEC or LEANIMP else 1))
+        zygote.warm(SRC, warm_ids, exec_commits >= (3 if LAZYTABLES else 2 if LAZYEXEC or LEANIMP else 1))
         warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
         code_idx = zygote.code_index()
         zyg = (zygote, warm_lines, code_idx)
+        if GCFREEZE:
+            import gc
+            _PARSED.clear()
+            gc.collect()
+            gc.freeze()
         log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
     results = {}
     pending = [p for p in plans if p["light"] or p["probe"]]
@@ -1567,7 +1649,7 @@ def main():
                     mode = ("swap", swaps, code_idx, nonpy)
                 log(p["cid"], "mode", mode[0])
             global CHILD_LAZY
-            CHILD_LAZY = LAZYEXEC and not any(r in ("tests/helpers.py", "sqlglot/executor/table.py", "tests/test_executor.py") or "/tpc-" in r for r in p["patched"])
+            CHILD_LAZY = LAZYEXEC and not any(r in ("tests/helpers.py", "sqlglot/executor/table.py", "tests/test_executor.py") or "/tpc-" in r and not (LAZYTABLES and r.endswith(".sql") and fixture_loads(r, c)) for r, c in p["patched"].items())
             p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode)
             p["root"] = root
             running.append(p)
