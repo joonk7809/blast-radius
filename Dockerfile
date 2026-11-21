@@ -9,6 +9,7 @@ COPY src /app
 RUN python -c "import gzip,lzma,shutil;shutil.copyfileobj(lzma.open('/app/covsets.bin.xz'),open('/app/covsets.bin','wb'));shutil.copyfileobj(gzip.open('/app/covmeta.json.gz'),open('/app/covmeta.json','wb'))" \
  && rm /app/covsets.bin.xz /app/covmeta.json.gz \
  && cd /app && python -c "import json,selector;selector.build_setup_cache('/app/setupidx.pkl',sorted({t.split('::')[0] for t in json.load(open('/app/covmeta.json'))['tests']}))" \
+ && python -c "import glob,gzip,shutil;[shutil.copyfileobj(gzip.open(f),open(f[:-3],'wb')) for f in glob.glob('/app/itmaps/*.json.gz')]" \
  && python -m compileall -q /app >/dev/null \
  && chmod -R a+rX /app
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1

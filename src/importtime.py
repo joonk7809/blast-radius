@@ -310,6 +310,12 @@ def _load(name):
     if name not in _MAPS:
         p = os.path.join(MAPDIR, name)
         try:
+            with open(p[:-3], 'rb') as f:
+                _MAPS[name] = json.load(f)
+            return _MAPS[name]
+        except FileNotFoundError:
+            pass
+        try:
             with gzip.open(p, 'rt') as f:
                 _MAPS[name] = json.load(f)
         except FileNotFoundError:
