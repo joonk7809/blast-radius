@@ -338,6 +338,9 @@ class Units:
         return out or [(0, enc[0], enc[1], enc[3], enc[4])]
 
 
+IMPORT_LAMBDAS = {tuple(x) for x in json.load(open(os.path.join(HERE, "importlambdas.json")))} if LAMBDAS else set()
+
+
 def _strip(node, called=False):
     if isinstance(node, ast.Lambda) and not called:
         return ("Lambda", _strip(node.args))
@@ -356,7 +359,7 @@ def _enclosing_stmt(units, ln):
     return min((sp for sp in units.spans if isinstance(sp[4], ast.stmt) and sp[0] <= ln <= sp[2]), key=lambda sp: sp[2] - sp[0], default=(0, 0, 0, 0, None))[4]
 
 
-def lambda_only(old_units, new_units, hunks):
+def lambda_only(path, old_units, new_units, hunks):
     olds, news = {}, {}
     for h in hunks:
         hr, ha = changed_old_lines([h])
@@ -365,7 +368,7 @@ def lambda_only(old_units, new_units, hunks):
                 u = units.unit_for(ln)
                 if u is None or u[3]:
                     continue
-                if not isinstance(u[4], ast.Lambda):
+                if not isinstance(u[4], ast.Lambda) or units is old_units and (path, u[4].lineno) in IMPORT_LAMBDAS:
                     return False
                 st = _enclosing_stmt(units, ln)
                 if st is None:
@@ -956,7 +959,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             new_units = Units(new_text, added_new_lines(f["hunks"]))
         except SyntaxError:
             new_units = None
-        lam = LAMBDAS and new_units is not None and lambda_only(units, new_units, f["hunks"])
+        lam = LAMBDAS and new_units is not None and lambda_only(path, units, new_units, f["hunks"])
         if lam:
             notes.append("lambda-only")
         for h in f["hunks"]:
