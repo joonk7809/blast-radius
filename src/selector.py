@@ -575,6 +575,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             a, b = strip_ast(old_text, res), strip_ast(new_text, res)
             if a is not None and a == b:
                 notes.append("ast-noop")
+                notes.append("noop:" + path)
                 return extra
         if old_text is None:
             notes.append("newfile")
@@ -1218,6 +1219,8 @@ def main():
             if content is None or p["old"].get(rel) is None:
                 mask = -1
                 break
+            if "noop:" + rel in p["notes"]:
+                continue
             fm = imap["files"].get(rel, {})
             removed, anchors = changed_old_lines(p["hunks"][rel])
             for ln in removed | anchors:
