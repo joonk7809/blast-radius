@@ -1502,7 +1502,7 @@ def defer_mp_parse(klass, ustate):
     def mp_execute(self, *a, **kw):
         te = sys.modules[klass.__module__]
         real = te.parse_one
-        if ustate["allowed"] is not None:
+        if ustate["allowed"] is not None and "" not in ustate["allowed"]:
             te.parse_one = lambda *pa, **pk: DeferredParse(real, pa, pk)
         try:
             return real_mp(self, *a, **kw)
