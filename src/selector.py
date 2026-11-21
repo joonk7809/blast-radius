@@ -303,6 +303,62 @@ def candidates_for(f, old_text, new_text, cov, notes):
     return r if isinstance(r, dict) else full(r)
 
 
+FRACTION_OK = set()
+_QKEY = re.compile(r"^s:\('(\S+) (\d+)', \[\]\)$")
+
+
+def _pairs(text):
+    if SRC not in sys.path:
+        sys.path.insert(0, SRC)
+    from tests import helpers
+    stmts = helpers._filter_comments(text).split(";")
+    return [(helpers._extract_meta(stmts[i].strip()), stmts[i + 1].strip()) for i in range(0, len(stmts) - 1, 2)]
+
+
+def changed_query_indices(path, old_text, new_text):
+    folder = os.path.dirname(path)
+    sql_path = os.path.join(folder, os.path.basename(folder) + ".sql")
+    if not path.startswith("tests/fixtures/") or not os.path.exists(os.path.join(SRC, sql_path)):
+        return None
+    try:
+        if path == sql_path:
+            if old_text is None or new_text is None:
+                return None
+            a, b = _pairs(old_text), _pairs(new_text)
+            if len(a) != len(b):
+                return None
+            return {i + 1 for i in range(len(a)) if a[i] != b[i]}
+        table = os.path.basename(path).split(".")[0]
+        if not table:
+            return None
+        with open(os.path.join(SRC, sql_path), encoding="utf-8") as fh:
+            pairs = _pairs(fh.read())
+        word = re.compile(r"\b%s\b" % re.escape(table), re.I)
+        return {i + 1 for i, ((sql, _), _) in enumerate(pairs) if word.search(sql)}
+    except Exception:
+        return None
+
+
+def query_unit_keys(cov, n, idx, word):
+    keys = [k for m, k in cov.units if m == n and k]
+    sub = [k for k in keys if k.startswith("s:")]
+    if not sub or not all(_QKEY.match(k) for k in sub):
+        return None
+    words = {_QKEY.match(k).group(1) for k in sub}
+    if word not in words:
+        return set()
+    if words != {word}:
+        return None
+    out = set()
+    for k in keys:
+        m = _QKEY.match(k)
+        if m and int(m.group(2)) in idx:
+            out.add(k)
+        elif k.startswith("f:") and int(k[2:]) + 1 in idx:
+            out.add(k)
+    return out
+
+
 _SETUP_INDEX = []
 
 
@@ -550,7 +606,16 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             extra = class_setup_readers(path, cov)
             if extra - out:
                 notes.append("setupclass")
-            return out | extra
+            res = full(out | extra)
+            idx = changed_query_indices(path, old_text, new_text)
+            if idx is not None:
+                for n in extra - out:
+                    keys = query_unit_keys(cov, n, idx, os.path.basename(os.path.dirname(path)))
+                    if keys is not None:
+                        res[n] = keys
+                        FRACTION_OK.add(n)
+                notes.append("queries:%d" % len(idx))
+            return res
         notes.append("unmapped-fixture")
         base = os.path.basename(path)
         out = set()
@@ -1074,7 +1139,7 @@ def main():
                 cands = full(num_to_id)
         def est(n):
             c = runcpu.get(num_to_id[n], 0)
-            if not UNITEST or cands[n] is None or not cov.nunits.get(n):
+            if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
                 return c
             return c * min(1.0, len(cands[n]) / cov.nunits[n])
 
