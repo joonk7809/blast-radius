@@ -22,6 +22,8 @@ DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 ZYGOTE = os.environ.get("BR_ZYGOTE", "1") == "1"
 UNITEST = os.environ.get("BR_UNITEST", "0") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
+FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
+LEANIMP = os.environ.get("BR_LEANIMP", "1") == "1"
 UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
@@ -402,7 +404,10 @@ def module_test_files(path, cov):
 
 def candidates_for(f, old_text, new_text, cov, notes):
     r = _candidates_for(f, old_text, new_text, cov, notes)
-    return r if isinstance(r, dict) else full(r)
+    r = r if isinstance(r, dict) else full(r)
+    if FIXLIST and f["path"].startswith("tests/") and not f["path"].endswith(".py"):
+        FORCE_LIST.update(n for n in r if n not in FRACTION_OK)
+    return r
 
 
 FRACTION_OK = set()
@@ -862,7 +867,7 @@ def rmtree(path):
     os.rmdir(path)
 
 
-def preimport():
+def preimport(libs=True):
     import concurrent.futures
     import unittest
     import unittest.mock
@@ -872,7 +877,7 @@ def preimport():
     import datetime
     import decimal
     import gc
-    for name in ("duckdb", "numpy", "pandas", "pandas.testing"):
+    for name in ("duckdb", "numpy", "pandas", "pandas.testing") if libs else ():
         try:
             __import__(name)
         except Exception:
@@ -1410,15 +1415,18 @@ def main():
             log(p["cid"], "collect", len(chosen))
     for p in plans:
         p["probe"] = p["collect"] is not None or (PROBE and "importtime" in p["notes"])
+    heavy_libs = ("tests/test_executor.py", "tests/test_optimizer.py")
+    needs_libs = any(num_to_id[n].startswith(heavy_libs) for p in plans for n in p["light"]) or any(m in ("tests.test_executor", "tests.test_optimizer") for p in plans for m in (p["collect"] or ()))
     if any(p["light"] or p.get("probe") for p in plans):
-        preimport()
+        preimport(needs_libs or not LEANIMP)
     log("preimported cpu=%.2f" % time.process_time())
     zyg = None
     if ZYGOTE and any(p["light"] or p.get("probe") for p in plans):
         import zygote
         install_futures()
         warm_ids = sorted({num_to_id[n] for p in plans for n in p["light"]})
-        zygote.warm(SRC, warm_ids, any(t.startswith("tests/test_executor.py::TestExecutor::") for t in warm_ids))
+        exec_commits = sum(1 for p in plans if any(num_to_id[n].startswith("tests/test_executor.py::TestExecutor::") for n in p["light"]))
+        zygote.warm(SRC, warm_ids, exec_commits >= (2 if LEANIMP else 1))
         warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
         code_idx = zygote.code_index()
         zyg = (zygote, warm_lines, code_idx)
@@ -1508,6 +1516,8 @@ def main():
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
         WRITTEN.add(cid)
     sys.stdout.flush()
+    import resource
+    log("end self=%.2f children=%.2f" % (time.process_time(), sum(resource.getrusage(resource.RUSAGE_CHILDREN)[:2])))
 
 
 WRITTEN = set()
@@ -1528,3 +1538,6 @@ if __name__ == "__main__":
     except BaseException as e:
         log("main failed", repr(e))
         fallback()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

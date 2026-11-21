@@ -16,18 +16,19 @@ def warm(src, ids, prewarm=True):
     os.chdir(src)
     import sqlglot
 
-    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
-        try:
-            importlib.import_module(m.name)
-        except Exception:
-            pass
-    from sqlglot.dialects.dialect import Dialect, Dialects
+    if os.environ.get("BR_WARMALL", "1") == "1":
+        for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+            try:
+                importlib.import_module(m.name)
+            except Exception:
+                pass
+        from sqlglot.dialects.dialect import Dialect, Dialects
 
-    for d in Dialects:
-        try:
-            Dialect.get_or_raise(d.value)
-        except Exception:
-            pass
+        for d in Dialects:
+            try:
+                Dialect.get_or_raise(d.value)
+            except Exception:
+                pass
     for mod in sorted({t.split("::")[0][:-3].replace("/", ".") for t in ids}):
         try:
             importlib.import_module(mod)
