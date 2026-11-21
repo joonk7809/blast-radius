@@ -24,6 +24,7 @@ UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
+COLLECT = os.environ.get("BR_COLLECT", "1") == "1"
 IMPORTT = os.environ.get("BR_IMPORTT", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
 T0 = time.monotonic()
@@ -731,6 +732,16 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
         raise Timeout()
 
     signal.signal(signal.SIGALRM, on_alarm)
+    if mode is not None and mode[0] == "reimport" and len(mode) > 1 and mode[1]:
+        for modname, tids in mode[1].items():
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 20.0, 0.5)
+                importlib.import_module(modname)
+            except BaseException:
+                for tid in tids:
+                    emit("F", tid)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
     case_to_id = {}
     failed = set()
     cases = []
@@ -1067,9 +1078,20 @@ def main():
         zyg = (zygote, warm_lines, code_idx)
         log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
     results = {}
-    pending = [p for p in plans if p["light"]]
+    warm_all = {k: set(v) for k, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
+    collect_map = {}
+    for n, tid in num_to_id.items():
+        collect_map.setdefault(tid.split("::")[0][:-3].replace("/", "."), []).append(tid)
     for p in plans:
-        if not p["light"]:
+        p["collect"] = COLLECT and any(
+            rel.endswith(".py") and rel.startswith("sqlglot/") and (content is None or p["old"].get(rel) is None or rel not in warm_all or (lambda r, a: (r | a) & warm_all[rel])(*changed_old_lines(p["hunks"][rel])))
+            for rel, content in p["patched"].items()
+        )
+        if p["collect"]:
+            log(p["cid"], "collect")
+    pending = [p for p in plans if p["light"] or p["collect"]]
+    for p in plans:
+        if not p["light"] and not p["collect"]:
             results[p["cid"]] = set(p["heavy"])
     pending.sort(key=lambda p: -sum(ms[n] for n in p["light"]))
     running = []
@@ -1089,7 +1111,7 @@ def main():
             budget = sum(timeouts.values()) + 30
             mode = None
             if zyg is not None:
-                mode = ("reimport",)
+                mode = ("reimport", collect_map if p["collect"] else None)
                 zmod, warm_lines, code_idx = zyg
                 swaps, nonpy, ok = [], [], True
                 for rel, content in p["patched"].items():
