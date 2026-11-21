@@ -11,6 +11,7 @@ import select
 import signal
 import sys
 import time
+import types
 
 DATA = os.environ.get("BR_DATA", "/data")
 SRC = os.environ.get("BR_SRC", "/sqlglot")
@@ -25,6 +26,8 @@ UNITEST = os.environ.get("BR_UNITEST", "0") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
 FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
+LAZYPANDAS = os.environ.get("BR_LAZYPANDAS", "1") == "1"
+STMTSEL = os.environ.get("BR_STMTSEL", "1") == "1"
 LAZYTABLES = os.environ.get("BR_LAZYTABLES", "1") == "1"
 TPCQ2 = os.environ.get("BR_TPCQ2", "1") == "1"
 GCFREEZE = os.environ.get("BR_GCFREEZE", "0") == "1"
@@ -364,6 +367,7 @@ class CovMap:
         self.nunits = {self.idx_to_num[int(t)]: c for t, c in m.get("nunits", {}).items()}
         self.files = m["files"]
         self.fixtures = m["fixtures"]
+        STMT_OF.update((m["tests"][int(t)], v) for t, v in m.get("stmt_of", {}).items())
         self.by_file = {}
         self.ids = {}
         for i, t in enumerate(m["tests"]):
@@ -925,6 +929,21 @@ def rmtree(path):
     os.rmdir(path)
 
 
+class _LazyPandasTesting(types.ModuleType):
+    def _real(self):
+        if sys.modules.get("pandas.testing") is self:
+            del sys.modules["pandas.testing"]
+        return importlib.import_module("pandas.testing")
+
+    def assert_frame_equal(self, *a, **k):
+        return self._real().assert_frame_equal(*a, **k)
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self._real(), name)
+
+
 def preimport(libs=True):
     import concurrent.futures
     import unittest
@@ -1018,6 +1037,64 @@ def install_futures():
 
 
 CHILD_LAZY = False
+CHILD_PATCHED = []
+STMT_OF = {}
+_STMT_TREES = {}
+
+
+def _stmt_tree(path):
+    t = _STMT_TREES.get(path)
+    if t is None:
+        with open(path, encoding="utf-8") as fh:
+            t = _STMT_TREES[path] = ast.parse(fh.read())
+    return t
+
+
+def _skippable(st, local):
+    if not isinstance(st, ast.Expr) or not isinstance(st.value, ast.Call):
+        return False
+    f = st.value.func
+    if not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "self"):
+        return False
+    return not any(isinstance(n, ast.Name) and n.id in local for n in ast.walk(st))
+
+
+def stmt_filter(case, tid, allowed, patched):
+    smap = STMT_OF.get(tid)
+    if smap is None or "" in allowed or any(k.startswith("f:") or "#" in k for k in allowed):
+        return False
+    path, cls, meth = tid.split("::")
+    if path in patched:
+        return False
+    fn = getattr(type(case), meth, None)
+    code = getattr(fn, "__code__", None)
+    if code is None or code.co_freevars or "super" in code.co_names or "__class__" in code.co_names:
+        return False
+    tree = _stmt_tree(os.path.join(SRC, path))
+    node = None
+    for c in tree.body:
+        if isinstance(c, ast.ClassDef) and c.name == cls:
+            for f in c.body:
+                if isinstance(f, ast.FunctionDef) and f.name == meth and not f.decorator_list and f.lineno == code.co_firstlineno:
+                    node = f
+    if node is None:
+        return False
+    need = {int(k[2:]) for k in allowed if k.startswith("t:")} | {smap[k] for k in allowed if k in smap}
+    local = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del))} | {a.arg for a in ast.walk(node.args) if isinstance(a, ast.arg)}
+    body = []
+    for i, st in enumerate(node.body):
+        if i in need or not _skippable(st, local):
+            body.append(st)
+        else:
+            body.append(ast.copy_location(ast.Pass(), st))
+    new = ast.FunctionDef(name=node.name, args=node.args, body=body, decorator_list=[], returns=node.returns, type_comment=None, type_params=[])
+    ast.copy_location(new, node)
+    mod = ast.Module(body=[new], type_ignores=[])
+    ast.fix_missing_locations(mod)
+    ns = {}
+    exec(compile(mod, code.co_filename, "exec"), sys.modules[type(case).__module__].__dict__, ns)
+    setattr(case, meth, types.MethodType(ns[meth], case))
+    return True
 
 
 _TPC_CACHE = {}
@@ -1359,6 +1436,15 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             orig_add_subtest(self, test, sub, err)
 
         Result.addSubTest = add_subtest
+    if STMTSEL:
+        patched_rel = set(CHILD_PATCHED)
+        for c in cases:
+            tid = case_to_id.get(id(c))
+            if sel.get(tid):
+                try:
+                    stmt_filter(c, tid, sel[tid], patched_rel)
+                except Exception:
+                    pass
     if CHILD_LAZY:
         for k in {type(c) for c in cases}:
             if k.__name__ == "TestExecutor" and k.__module__ == "tests.test_executor" and not vars(k).get("_prewarmed") and "setUpClass" in vars(k):
@@ -1581,6 +1667,15 @@ def main():
         p["probe"] = p["collect"] is not None or (PROBE and "importtime" in p["notes"])
     heavy_libs = ("tests/test_executor.py", "tests/test_optimizer.py")
     needs_libs = any(num_to_id[n].startswith(heavy_libs) for p in plans for n in p["light"]) or any(m in ("tests.test_executor", "tests.test_optimizer") for p in plans for m in (p["collect"] or ()))
+    if LAZYPANDAS:
+        needs_exec = any(num_to_id[n].startswith("tests/test_executor.py") for p in plans for n in p["light"]) or any(m == "tests.test_executor" for p in plans for m in (p["collect"] or ()))
+        if not needs_exec:
+            sys.modules["pandas.testing"] = _LazyPandasTesting("pandas.testing")
+            needs_libs = False
+            try:
+                import duckdb
+            except Exception:
+                pass
     if any(p["light"] or p.get("probe") for p in plans):
         preimport(needs_libs or not LEANIMP)
     log("preimported cpu=%.2f" % time.process_time())
@@ -1660,7 +1755,8 @@ def main():
                 if ok:
                     mode = ("swap", swaps, code_idx, nonpy)
                 log(p["cid"], "mode", mode[0])
-            global CHILD_LAZY
+            global CHILD_LAZY, CHILD_PATCHED
+            CHILD_PATCHED = list(p["patched"])
             CHILD_LAZY = LAZYEXEC and not any(r in ("tests/helpers.py", "sqlglot/executor/table.py", "tests/test_executor.py") or "/tpc-" in r and not (LAZYTABLES and r.endswith(".sql") and fixture_loads(r, c)) for r, c in p["patched"].items())
             p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode)
             p["root"] = root
