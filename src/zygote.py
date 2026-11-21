@@ -2,7 +2,9 @@ import ast
 import builtins
 import gc
 import importlib
+import importlib.util
 import io
+import marshal
 import os
 import pkgutil
 import sys
@@ -68,12 +70,26 @@ def code_index():
     return idx
 
 
-def body_spans(tree):
-    spans = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            spans.append((node.body[0].lineno, node.end_lineno))
-    return spans
+def in_body(nodes, ln):
+    for node in nodes:
+        if getattr(node, "lineno", ln + 1) <= ln <= getattr(node, "end_lineno", -1):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.body[0].lineno <= ln:
+                return True
+            return in_body(ast.iter_child_nodes(node), ln)
+    return False
+
+
+def old_code(fn, old_text):
+    pyc = importlib.util.cache_from_source(fn)
+    try:
+        with open(pyc, "rb") as fh:
+            data = fh.read()
+        st = os.stat(fn)
+    except OSError:
+        data = b""
+    if len(data) > 16 and int.from_bytes(data[4:8], "little") == 0 and int.from_bytes(data[8:12], "little") == int(st.st_mtime) & 0xFFFFFFFF and int.from_bytes(data[12:16], "little") == len(old_text.encode("utf-8")) == st.st_size:
+        return marshal.loads(data[16:])
+    return compile(old_text, fn, "exec")
 
 
 def _pair(old, new, out):
@@ -87,7 +103,7 @@ def _pair(old, new, out):
     return all(_pair(a, b, out) for a, b in zip(oc, nc))
 
 
-def swap_plan(src, path, old_text, new_text, changed, warm_lines):
+def swap_plan(src, path, old_text, new_text, changed, warm_lines, tree):
     name = path[:-3].replace("/", ".")
     if name.endswith(".__init__"):
         name = name[:-9]
@@ -95,23 +111,18 @@ def swap_plan(src, path, old_text, new_text, changed, warm_lines):
         return None
     if changed & warm_lines.get(path, set()):
         return None
-    try:
-        tree = ast.parse(old_text)
-    except SyntaxError:
-        return None
-    spans = body_spans(tree)
-    if not all(any(a <= ln <= b for a, b in spans) for ln in changed):
+    if not all(in_body(tree.body, ln) for ln in changed):
         return None
     fn = os.path.join(src, path)
     try:
-        oldc = compile(old_text, fn, "exec")
+        oldc = old_code(fn, old_text)
         newc = compile(new_text, fn, "exec")
     except SyntaxError:
         return None
     pairs = []
     if not _pair(oldc, newc, pairs):
         return None
-    return [(o, n) for o, n in pairs[1:] if not (o.co_code == n.co_code and _key(o.co_consts) == _key(n.co_consts) and o.co_names == n.co_names)]
+    return [((fn, o.co_qualname, o.co_firstlineno), n) for o, n in pairs[1:] if not (o.co_code == n.co_code and _key(o.co_consts) == _key(n.co_consts) and o.co_names == n.co_names)]
 
 
 def _key(c):
@@ -125,8 +136,8 @@ def _key(c):
 def apply_swaps(plans, idx):
     n = 0
     for pairs in plans:
-        for o, new in pairs:
-            for f in idx.get((o.co_filename, o.co_qualname, o.co_firstlineno), []):
+        for key, new in pairs:
+            for f in idx.get(key, []):
                 f.__code__ = new
                 n += 1
     return n

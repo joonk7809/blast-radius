@@ -1306,8 +1306,7 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
         import builtins
         import io
         import zygote
-        plans = [zygote.swap_plan(SRC, rel, old, new, changed, {}) for rel, old, new, changed in mode[1]]
-        zygote.apply_swaps(plans, mode[2])
+        zygote.apply_swaps(mode[1], mode[2])
         for m in list(sys.modules.values()):
             for v in list(vars(m).values()) if m is not None and getattr(m, "__name__", "").startswith("tests") else []:
                 if isinstance(v, type) and vars(v).get("_prewarmed"):
@@ -1430,7 +1429,7 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             self._fail(test)
 
         def _dbg(self, test, err):
-            if DEBUG:
+            if DEBUG and os.environ.get("BR_TB") == "1":
                 import traceback
                 sys.stderr.write("DBG %s\n%s\n" % (test, "".join(traceback.format_exception(*err))[-1500:]))
 
@@ -1850,11 +1849,14 @@ def main():
                         ok = False
                     elif rel.endswith(".py"):
                         removed, anchors = changed_old_lines(p["hunks"][rel])
-                        plan = zmod.swap_plan(SRC, rel, p["old"][rel], content, removed | anchors, warm_lines)
+                        try:
+                            plan = zmod.swap_plan(SRC, rel, p["old"][rel], content, removed | anchors, warm_lines, parse_cached(p["old"][rel]))
+                        except SyntaxError:
+                            plan = None
                         if plan is None:
                             ok = False
                         else:
-                            swaps.append((rel, p["old"][rel], content, removed | anchors))
+                            swaps.append(plan)
                     else:
                         if rel in zmod.WARM_OPENED:
                             ok = False
