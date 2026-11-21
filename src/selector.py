@@ -343,6 +343,112 @@ def class_setup_readers(path, cov):
     return out
 
 
+def modname_of(path):
+    name = path[:-3].replace("/", ".")
+    return name[:-9] if name.endswith(".__init__") else name
+
+
+def top_names(tree):
+    out = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out[node.name] = (node.lineno, node.end_lineno)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for t in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                for n in ast.walk(t):
+                    if isinstance(n, ast.Name):
+                        out[n.id] = (node.lineno, node.end_lineno)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for a in node.names:
+                out[(a.asname or a.name).split(".")[0]] = (node.lineno, node.end_lineno)
+    return out
+
+
+_SRC_CACHE = {}
+
+
+def _read_tree(full_path):
+    r = _SRC_CACHE.get(full_path)
+    if r is None:
+        try:
+            with open(full_path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            text = ""
+        r = _SRC_CACHE[full_path] = [text, None]
+    return r
+
+
+def importers(mod, names, root_dir):
+    leaf = mod.rsplit(".", 1)[-1]
+    out = {}
+    for dp, dns, fns in os.walk(os.path.join(SRC, root_dir)):
+        dns[:] = [d for d in dns if d != "__pycache__"]
+        for fn in fns:
+            if not fn.endswith(".py"):
+                continue
+            full_path = os.path.join(dp, fn)
+            rel = os.path.relpath(full_path, SRC)
+            entry = _read_tree(full_path)
+            text = entry[0]
+            if leaf not in text or (names is not None and not any(n in text for n in names)):
+                continue
+            if entry[1] is None:
+                try:
+                    entry[1] = ast.parse(text)
+                except SyntaxError:
+                    entry[1] = False
+            tree = entry[1]
+            if tree is False:
+                continue
+            pkg = modname_of(rel).split(".")
+            if not rel.endswith("__init__.py"):
+                pkg = pkg[:-1]
+            used = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    base = pkg[: len(pkg) - node.level + 1] if node.level else []
+                    m = ".".join(base + ([node.module] if node.module else []))
+                    for a in node.names:
+                        if m == mod:
+                            used.add(a.name)
+                        elif m + "." + a.name == mod:
+                            used.add("*")
+                elif isinstance(node, ast.Import):
+                    for a in node.names:
+                        if a.name == mod or a.name.startswith(mod + "."):
+                            used.add("*")
+            if used and (names is None or "*" in used or used & names):
+                out[rel] = used
+    return out
+
+
+def test_dependents(path, f, old_text, new_text):
+    first = importers(modname_of(path), None, "tests")
+    if not first:
+        return set()
+    try:
+        names = top_names(ast.parse(old_text)) if old_text is not None else {}
+        newn = set(top_names(ast.parse(new_text))) if new_text is not None else set()
+    except SyntaxError:
+        names, newn = {}, set()
+    removed, anchors = changed_old_lines(f["hunks"])
+    changed = removed | anchors
+    touched = {n for n, (a, b) in names.items() if any(a <= ln <= b for ln in changed)} | (set(names) - newn)
+    covered = set().union(*[range(a, b + 1) for a, b in names.values()]) if names else set()
+    loose = any(ln not in covered for ln in changed)
+    hit = {tf for tf, used in first.items() if loose or "*" in used or used & touched or not names}
+    todo = list(hit)
+    while todo:
+        tf = todo.pop()
+        for g in importers(modname_of(tf), None, "tests"):
+            if g not in hit:
+                hit.add(g)
+                todo.append(g)
+    hit.discard(path)
+    return hit
+
+
 def _candidates_for(f, old_text, new_text, cov, notes):
     path = f["path"]
     if path.startswith("sqlglot/") and path.endswith(".py"):
@@ -355,12 +461,27 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             except SyntaxError:
                 notes.append("new-unparsable")
                 return full(n for n in cov.idx_to_num if n is not None)
+        extra = {}
+        if old_text is not None and new_text is not None:
+            try:
+                gone = set(top_names(ast.parse(old_text))) - set(top_names(ast.parse(new_text)))
+            except SyntaxError:
+                gone = set()
+            if gone:
+                mod = modname_of(path)
+                if importers(mod, gone, "sqlglot"):
+                    notes.append("toplevel-gone-internal")
+                    return full(n for n in cov.idx_to_num if n is not None)
+                hit = importers(mod, gone, "tests")
+                if hit:
+                    notes.append("toplevel-gone:%d" % len(hit))
+                    extra = full(n for tf in hit for n in cov.by_file.get(tf, []))
         if old_text is not None and new_text is not None:
             res = module_resolver(path)
             a, b = strip_ast(old_text, res), strip_ast(new_text, res)
             if a is not None and a == b:
                 notes.append("ast-noop")
-                return set()
+                return extra
         if old_text is None:
             notes.append("newfile")
             return merge(cov.tests_touching_file(path), full(module_test_files(path, cov)))
@@ -369,7 +490,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             units = Units(old_text)
         except SyntaxError:
             notes.append("old-unparsable")
-            return cov.tests_touching_file(path)
+            return merge(cov.tests_touching_file(path), extra)
         out = {}
         importtime = False
         for ln in sorted(removed | anchors):
@@ -385,11 +506,16 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             if not IMPORTT:
                 merge(out, cov.tests_touching_file(path))
                 merge(out, full(module_test_files(path, cov)))
-        return out
+        return merge(out, extra)
     if path.startswith("tests/") and path.endswith(".py"):
         if os.path.basename(path).startswith("test_"):
             notes.append("testfile")
-            return set(cov.by_file.get(path, []))
+            out = set(cov.by_file.get(path, []))
+            hit = test_dependents(path, f, old_text, new_text)
+            if hit:
+                notes.append("test-dependents:%d" % len(hit))
+                out.update(n for tf in hit for n in cov.by_file.get(tf, []))
+            return out
         notes.append("test-support")
         return {n for p, ns in cov.by_file.items() for n in ns}
     if path.startswith("tests/"):
