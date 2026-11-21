@@ -25,6 +25,10 @@ UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
+RUN_K = float(os.environ.get("BR_RUN_K", "1.0"))
+RUN_O = float(os.environ.get("BR_RUN_O", "0.0"))
+RUN_O_RE = float(os.environ.get("BR_RUN_O_RE", "0.0"))
+STATIC = os.environ.get("BR_STATIC", "0") == "1"
 ITF_UNITS = os.environ.get("BR_ITF_UNITS", "1") == "1"
 FRAC_K = float(os.environ.get("BR_FRAC_K", "1.33"))
 FRAC_C = float(os.environ.get("BR_FRAC_C", "0.5"))
@@ -1310,7 +1314,8 @@ def main():
         light = sorted(set(cands) - heavy)
         blind = split_cost(sorted(cands), ms)
         cap = blind - split_cost(sorted(heavy), ms)
-        if light and sum(est(n) for n in light) * 1000 >= cap:
+        over = RUN_O_RE if ("importtime" in notes or any(not r.endswith(".py") for r in patched)) else RUN_O
+        if light and (RUN_K * sum(est(n) for n in light) + over) * 1000 >= cap:
             notes.insert(0, "blind")
             heavy, light = set(cands), []
         sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}
@@ -1318,12 +1323,18 @@ def main():
         log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4])
 
     log("planned cpu=%.2f" % time.process_time())
+    if STATIC:
+        for p in plans:
+            sys.stdout.write(json.dumps({"commit": p["cid"], "workers": split(sorted(set(p["light"]) | set(p["heavy"])), ms)}) + "\n")
+        sys.stdout.flush()
+        return
     if os.environ.get("BR_PLANONLY"):
         return
-    preimport()
+    if any(p["light"] for p in plans):
+        preimport()
     log("preimported cpu=%.2f" % time.process_time())
     zyg = None
-    if ZYGOTE:
+    if ZYGOTE and any(p["light"] for p in plans):
         import zygote
         install_futures()
         warm_ids = sorted({num_to_id[n] for p in plans for n in p["light"]})
