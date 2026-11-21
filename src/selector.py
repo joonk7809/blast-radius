@@ -1080,7 +1080,7 @@ def stmt_filter(case, tid, allowed, patched):
     if node is None:
         return False
     need = {int(k[2:]) for k in allowed if k.startswith("t:")} | {smap[k] for k in allowed if k in smap}
-    local = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del))} | {a.arg for a in ast.walk(node.args) if isinstance(a, ast.arg)}
+    local = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del))} | {a.arg for a in ast.walk(node.args) if isinstance(a, ast.arg) and a.arg != "self"}
     body = []
     for i, st in enumerate(node.body):
         if i in need or not _skippable(st, local):
@@ -1436,15 +1436,21 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             orig_add_subtest(self, test, sub, err)
 
         Result.addSubTest = add_subtest
-    if STMTSEL:
+    if STMT_OF:
         patched_rel = set(CHILD_PATCHED)
         for c in cases:
             tid = case_to_id.get(id(c))
             if sel.get(tid):
+                smap = STMT_OF.get(tid) or {}
+                whole = {int(k[2:]) for k in sel[tid] if k.startswith("t:")}
+                sel[tid].update(k for k, i in smap.items() if i in whole)
                 try:
-                    stmt_filter(c, tid, sel[tid], patched_rel)
-                except Exception:
-                    pass
+                    r = STMTSEL and stmt_filter(c, tid, sel[tid], patched_rel)
+                    if DEBUG:
+                        print("stmt", tid, r, file=sys.stderr)
+                except Exception as e:
+                    if DEBUG:
+                        print("stmt err", tid, repr(e), file=sys.stderr)
     if CHILD_LAZY:
         for k in {type(c) for c in cases}:
             if k.__name__ == "TestExecutor" and k.__module__ == "tests.test_executor" and not vars(k).get("_prewarmed") and "setUpClass" in vars(k):
@@ -1609,7 +1615,7 @@ def main():
                 notes.append(f"itf-error:{type(e).__name__}")
                 cands = full(num_to_id)
         if DEBUG_N in cands:
-            log(cid, "dbg", DEBUG_N, "keys", None if cands[DEBUG_N] is None else len(cands[DEBUG_N]), "fracok", DEBUG_N in FRACTION_OK)
+            log(cid, "dbg", DEBUG_N, "keys", None if cands[DEBUG_N] is None else len(cands[DEBUG_N]), "fracok", DEBUG_N in FRACTION_OK, None if cands[DEBUG_N] is None else sorted(cands[DEBUG_N])[:5])
         def est(n):
             c = runcpu.get(num_to_id[n], 0)
             if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
