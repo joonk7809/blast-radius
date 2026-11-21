@@ -25,6 +25,7 @@ UNITEST = os.environ.get("BR_UNITEST", "0") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
 FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
+LAZYEXEC = os.environ.get("BR_LAZYEXEC", "1") == "1"
 LAZYUNITS = os.environ.get("BR_LAZYUNITS", "1") == "1"
 DEBUG_N = int(os.environ.get("BR_DEBUG_N", "-1"))
 UNITS = os.environ.get("BR_UNITS", "1") == "1"
@@ -994,6 +995,39 @@ def install_futures():
     concurrent.futures.as_completed = lazy_as_completed
 
 
+CHILD_LAZY = False
+
+
+def _lazy_class_setup(klass, names):
+    real = vars(klass)["setUpClass"].__func__
+    real_down = vars(klass)["tearDownClass"].__func__ if "tearDownClass" in vars(klass) else None
+    loaded = []
+
+    class Attr:
+        def __init__(self, name):
+            self.name = name
+
+        def __get__(self, obj, owner):
+            if not loaded:
+                loaded.append(1)
+                for n in names:
+                    if isinstance(vars(klass).get(n), Attr):
+                        delattr(klass, n)
+                real(klass)
+            return getattr(klass, self.name)
+
+    def setup(cls):
+        for n in names:
+            setattr(cls, n, Attr(n))
+
+    def teardown(cls):
+        if loaded and real_down:
+            real_down(cls)
+
+    klass.setUpClass = classmethod(setup)
+    klass.tearDownClass = classmethod(teardown)
+
+
 def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
     if DEBUG:
         import faulthandler
@@ -1236,6 +1270,10 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             orig_add_subtest(self, test, sub, err)
 
         Result.addSubTest = add_subtest
+    if CHILD_LAZY:
+        for k in {type(c) for c in cases}:
+            if k.__name__ == "TestExecutor" and k.__module__ == "tests.test_executor" and not vars(k).get("_prewarmed") and "setUpClass" in vars(k):
+                _lazy_class_setup(k, ("tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls"))
     suite = unittest.TestSuite(cases)
     try:
         suite.run(Result())
@@ -1462,8 +1500,20 @@ def main():
         import zygote
         install_futures()
         warm_ids = sorted({num_to_id[n] for p in plans for n in p["light"]})
-        exec_commits = sum(1 for p in plans if any(num_to_id[n].startswith("tests/test_executor.py::TestExecutor::") for n in p["light"]))
-        zygote.warm(SRC, warm_ids, exec_commits >= (2 if LEANIMP else 1))
+        table_attrs = {"tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls", "cached_execute", "subtestHelper", "_mp_execute"}
+        reach = {}
+        for _, _, classes in _setup_index(cov):
+            for _, _, tattrs in classes:
+                reach.update(tattrs)
+
+        def needs_tables(n):
+            if not num_to_id[n].startswith("tests/test_executor.py::TestExecutor::"):
+                return False
+            r = reach.get(n)
+            return not LAZYEXEC or r is None or bool(r & table_attrs)
+
+        exec_commits = sum(1 for p in plans if any(needs_tables(n) for n in p["light"]))
+        zygote.warm(SRC, warm_ids, exec_commits >= (2 if LAZYEXEC or LEANIMP else 1))
         warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
         code_idx = zygote.code_index()
         zyg = (zygote, warm_lines, code_idx)
@@ -1516,6 +1566,8 @@ def main():
                 if ok:
                     mode = ("swap", swaps, code_idx, nonpy)
                 log(p["cid"], "mode", mode[0])
+            global CHILD_LAZY
+            CHILD_LAZY = LAZYEXEC and not any(r in ("tests/helpers.py", "sqlglot/executor/table.py", "tests/test_executor.py") or "/tpc-" in r for r in p["patched"])
             p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode)
             p["root"] = root
             running.append(p)
