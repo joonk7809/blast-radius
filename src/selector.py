@@ -38,7 +38,8 @@ TPCQ2 = os.environ.get("BR_TPCQ2", "1") == "1"
 TPCREF = os.environ.get("BR_TPCREF", "1") == "1"
 TPCWARM = os.environ.get("BR_TPCWARM", "0") == "1"
 TPCPARSE = os.environ.get("BR_TPCPARSE", "1") == "1"
-UNITCOST = os.environ.get("BR_UNITCOST", "0") == "1"
+UNITCOST = os.environ.get("BR_UNITCOST", "1") == "1"
+UNIT_K = float(os.environ.get("BR_UNIT_K", "2.0"))
 GCFREEZE = os.environ.get("BR_GCFREEZE", "0") == "1"
 LAZYEXEC = os.environ.get("BR_LAZYEXEC", "1") == "1"
 LAZYUNITS = os.environ.get("BR_LAZYUNITS", "1") == "1"
@@ -1961,7 +1962,7 @@ def main():
     cov = CovMap(MAP_PATH, id_to_num)
     log("map loaded cpu=%.2f" % time.process_time())
     runcpu = json.load(open(os.path.join(HERE, "runcpu.json")))
-    unitcpu = json.load(open(os.path.join(HERE, "unitcpu.json"))) if UNITCOST else {"full": {}, "units": {}}
+    unitcpu = json.load(open(os.path.join(HERE, "unitcpu.json"))) if UNITCOST else {"units": {}}
     sys.path.insert(0, HERE)
     from split import split, cost as split_cost
 
@@ -2029,12 +2030,12 @@ def main():
         cached = TPCREF and LAZYTABLES and tpc_lazy(patched)
 
         def est(n):
-            c = unitcpu["full"].get(num_to_id[n], runcpu.get(num_to_id[n], 0)) if cached else runcpu.get(num_to_id[n], 0)
+            c = runcpu.get(num_to_id[n], 0)
             if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
                 return c
             u = cached and unitcpu["units"].get(num_to_id[n])
             if u:
-                return min(c, FRAC_K * sum(u.get(k, 0) for k in cands[n]) + FRAC_C)
+                return min(c, UNIT_K * sum(u.get(k, 0) for k in cands[n]) + FRAC_C)
             return min(c, c * FRAC_K * len(cands[n]) / cov.nunits[n] + FRAC_C)
 
         heavy = {n for n in cands if n in FORCE_LIST or ms[n] >= HEAVY_MS or (LISTRULE and est(n) * 1000 > ms[n] + 2000)}
