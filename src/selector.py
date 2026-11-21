@@ -24,6 +24,7 @@ UNITEST = os.environ.get("BR_UNITEST", "0") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
 FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "1") == "1"
+DEBUG_N = int(os.environ.get("BR_DEBUG_N", "-1"))
 UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
@@ -1360,6 +1361,8 @@ def main():
             except Exception as e:
                 notes.append(f"itf-error:{type(e).__name__}")
                 cands = full(num_to_id)
+        if DEBUG_N in cands:
+            log(cid, "dbg", DEBUG_N, "keys", None if cands[DEBUG_N] is None else len(cands[DEBUG_N]), "fracok", DEBUG_N in FRACTION_OK)
         def est(n):
             c = runcpu.get(num_to_id[n], 0)
             if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
