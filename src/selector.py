@@ -25,6 +25,11 @@ UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
+FASTNOOP = os.environ.get("BR_FASTNOOP", "1") == "1"
+SETUP_ATTRS = os.environ.get("BR_SETUP_ATTRS", "1") == "1"
+NEWTOP = os.environ.get("BR_NEWTOP", "1") == "1"
+TPCQ = os.environ.get("BR_TPCQ", "1") == "1"
+PROBE = os.environ.get("BR_PROBE", "1") == "1"
 COLLECT = os.environ.get("BR_COLLECT", "1") == "1"
 IMPORTT = os.environ.get("BR_IMPORTT", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
@@ -176,6 +181,71 @@ def module_resolver(path):
     return resolve
 
 
+_PARSED = {}
+
+
+def parse_cached(text):
+    t = _PARSED.get(text)
+    if t is None:
+        t = _PARSED[text] = ast.parse(text)
+    return t
+
+
+def _canon_dump(node, resolve):
+    import copy
+    node = copy.deepcopy(node)
+    if CANON:
+        node = _Canon(resolve).visit(node)
+    return ast.dump(node, annotate_fields=False, include_attributes=False)
+
+
+def _class_head(node, resolve):
+    return (node.name, [_canon_dump(b, resolve) for b in node.bases], [_canon_dump(k, resolve) for k in node.keywords], [_canon_dump(d, resolve) for d in node.decorator_list])
+
+
+def _same_body(a_body, b_body, oc, nc, resolve):
+    if len(a_body) != len(b_body):
+        return False
+    for x, y in zip(a_body, b_body):
+        tx = any(x.lineno <= ln <= x.end_lineno for ln in oc)
+        ty = any(y.lineno <= ln <= y.end_lineno for ln in nc)
+        if not tx and not ty:
+            continue
+        if type(x) is not type(y):
+            return False
+        if isinstance(x, ast.ClassDef):
+            if _class_head(x, resolve) != _class_head(y, resolve) or not _same_body(x.body, y.body, oc, nc, resolve):
+                return False
+        elif _canon_dump(x, resolve) != _canon_dump(y, resolve):
+            return False
+    return True
+
+
+def ast_noop(old_text, new_text, hunks, resolve):
+    try:
+        a, b = parse_cached(old_text), parse_cached(new_text)
+    except SyntaxError:
+        return False
+    removed, anchors = changed_old_lines(hunks)
+    return _same_body(a.body, b.body, removed | anchors, new_side_lines(hunks), resolve)
+
+
+def new_side_lines(hunks):
+    out = set()
+    for h in hunks:
+        ln = h["new_start"]
+        for tag, _ in h["lines"]:
+            if tag == "+":
+                out.add(ln)
+                ln += 1
+            elif tag == "-":
+                out.add(ln)
+                out.add(ln - 1)
+            else:
+                ln += 1
+    return out
+
+
 def strip_ast(text, resolve=None):
     try:
         tree = ast.parse(text)
@@ -188,7 +258,7 @@ def strip_ast(text, resolve=None):
 
 class Units:
     def __init__(self, text):
-        self.tree = ast.parse(text)
+        self.tree = parse_cached(text)
         self.spans = []
         self._walk(self.tree, False, [])
 
@@ -405,14 +475,38 @@ def _setup_index(cov):
         for node in tree.body:
             if not isinstance(node, ast.ClassDef):
                 continue
-            for fn in node.body:
-                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name == "setUpClass":
-                    strs = [n.value for n in ast.walk(fn) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-                    for n in ast.walk(fn):
-                        if isinstance(n, ast.Name) and n.id in consts:
-                            strs.extend(consts[n.id])
-                    prefix = "%s::%s::" % (tf, node.name)
-                    classes.append(([x for x in nums if cov.num_id(x).startswith(prefix)], strs))
+            methods = {fn.name: fn for fn in node.body if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            setup = methods.get("setUpClass")
+            if setup is None:
+                continue
+            stmts = []
+            for st in setup.body:
+                strs = [n.value for n in ast.walk(st) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+                for n in ast.walk(st):
+                    if isinstance(n, ast.Name) and n.id in consts:
+                        strs.extend(consts[n.id])
+                attrs = {n.attr for n in ast.walk(st) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "cls"}
+                stmts.append((strs, attrs))
+            direct = {}
+            for name, fn in methods.items():
+                direct[name] = (
+                    {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self"},
+                )
+            reach = {}
+            for name in methods:
+                seen, todo, acc = {name}, [name], set()
+                while todo:
+                    m = todo.pop()
+                    for a in direct[m][0]:
+                        acc.add(a)
+                        if a in methods and a not in seen:
+                            seen.add(a)
+                            todo.append(a)
+                reach[name] = acc
+            prefix = "%s::%s::" % (tf, node.name)
+            cnums = [x for x in nums if cov.num_id(x).startswith(prefix)]
+            tattrs = {x: reach.get(cov.num_id(x)[len(prefix):], None) for x in cnums}
+            classes.append((cnums, stmts, tattrs))
         _SETUP_INDEX.append((nums, loose, classes))
     return _SETUP_INDEX
 
@@ -431,9 +525,18 @@ def class_setup_readers(path, cov):
     for nums, loose, classes in _setup_index(cov):
         if hit(loose):
             out.update(nums)
-        for cnums, strs in classes:
-            if hit(strs):
+        for cnums, stmts, tattrs in classes:
+            attrs, any_hit = set(), False
+            for strs, st_attrs in stmts:
+                if hit(strs):
+                    any_hit = True
+                    attrs |= st_attrs
+            if not any_hit:
+                continue
+            if not attrs or not SETUP_ATTRS:
                 out.update(cnums)
+                continue
+            out.update(x for x in cnums if tattrs[x] is None or tattrs[x] & attrs)
     return out
 
 
@@ -522,8 +625,8 @@ def test_dependents(path, f, old_text, new_text):
     if not first:
         return set()
     try:
-        names = top_names(ast.parse(old_text)) if old_text is not None else {}
-        newn = set(top_names(ast.parse(new_text))) if new_text is not None else set()
+        names = top_names(parse_cached(old_text)) if old_text is not None else {}
+        newn = set(top_names(parse_cached(new_text))) if new_text is not None else set()
     except SyntaxError:
         names, newn = {}, set()
     removed, anchors = changed_old_lines(f["hunks"])
@@ -551,14 +654,14 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             return full(n for n in cov.idx_to_num if n is not None)
         if new_text is not None:
             try:
-                ast.parse(new_text)
+                parse_cached(new_text)
             except SyntaxError:
                 notes.append("new-unparsable")
                 return full(n for n in cov.idx_to_num if n is not None)
         extra = {}
         if old_text is not None and new_text is not None:
             try:
-                gone = set(top_names(ast.parse(old_text))) - set(top_names(ast.parse(new_text)))
+                gone = set(top_names(parse_cached(old_text))) - set(top_names(parse_cached(new_text)))
             except SyntaxError:
                 gone = set()
             if gone:
@@ -572,8 +675,12 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                     extra = full(n for tf in hit for n in cov.by_file.get(tf, []))
         if old_text is not None and new_text is not None:
             res = module_resolver(path)
-            a, b = strip_ast(old_text, res), strip_ast(new_text, res)
-            if a is not None and a == b:
+            if FASTNOOP:
+                same = ast_noop(old_text, new_text, f["hunks"], res)
+            else:
+                a, b = strip_ast(old_text, res), strip_ast(new_text, res)
+                same = a is not None and a == b
+            if same:
                 notes.append("ast-noop")
                 notes.append("noop:" + path)
                 return extra
@@ -635,7 +742,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             if extra - out:
                 notes.append("setupclass")
             res = full(out | extra)
-            idx = changed_query_indices(path, old_text, new_text)
+            idx = changed_query_indices(path, old_text, new_text) if TPCQ else None
             if idx is not None:
                 for n in extra - out:
                     keys = query_unit_keys(cov, n, idx, os.path.basename(os.path.dirname(path)))
@@ -910,6 +1017,9 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
                 failed.add(tid)
                 return
             desc = str(test)
+            m = re.match(r"setUpClass \(([\w.]+)\)", desc)
+            if m:
+                emit("K", m.group(1))
             for c in cases:
                 ctid = case_to_id[id(c)]
                 cname = type(c).__module__ + "." + type(c).__qualname__
@@ -1086,6 +1196,8 @@ class Job:
                 self.tcpu[t] = float(c)
             elif tag == "X":
                 self.broken = True
+            elif tag == "K":
+                self.klass_fail = getattr(self, "klass_fail", set()) | {tid}
             elif tag == "D":
                 pass
 
@@ -1194,6 +1306,8 @@ def main():
         log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4])
 
     log("planned cpu=%.2f" % time.process_time())
+    if os.environ.get("BR_PLANONLY"):
+        return
     preimport()
     log("preimported cpu=%.2f" % time.process_time())
     zyg = None
@@ -1225,7 +1339,7 @@ def main():
             removed, anchors = changed_old_lines(p["hunks"][rel])
             for ln in removed | anchors:
                 mask |= fm.get(str(ln), 0)
-            if "newtop:" + rel in p["notes"]:
+            if NEWTOP and "newtop:" + rel in p["notes"]:
                 for v in fm.values():
                     mask |= v
         mods = imap["modules"]
@@ -1234,7 +1348,7 @@ def main():
         if p["collect"]:
             log(p["cid"], "collect", len(chosen))
     for p in plans:
-        p["probe"] = p["collect"] is not None or "importtime" in p["notes"]
+        p["probe"] = p["collect"] is not None or (PROBE and "importtime" in p["notes"])
     pending = [p for p in plans if p["light"] or p["probe"]]
     for p in plans:
         if not p["light"] and not p["probe"]:
@@ -1292,6 +1406,10 @@ def main():
             if job.done:
                 running.remove(p)
                 fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
+                for kq in getattr(job, "klass_fail", ()):
+                    mod, _, cname = kq.rpartition(".")
+                    pre = "%s.py::%s::" % (mod.replace(".", "/"), cname)
+                    fail |= {n for n, t in num_to_id.items() if t.startswith(pre)}
                 if getattr(job, "broken", False):
                     log(p["cid"], "patched module does not import")
                     fail = set(num_to_id)
