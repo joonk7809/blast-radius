@@ -28,6 +28,7 @@ FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
 LAZYPANDAS = os.environ.get("BR_LAZYPANDAS", "1") == "1"
 STMTSEL = os.environ.get("BR_STMTSEL", "1") == "1"
+SHARED = os.environ.get("BR_SHARED", "1") == "1"
 LAZYTABLES = os.environ.get("BR_LAZYTABLES", "1") == "1"
 TPCQ2 = os.environ.get("BR_TPCQ2", "1") == "1"
 GCFREEZE = os.environ.get("BR_GCFREEZE", "0") == "1"
@@ -653,6 +654,48 @@ def top_names(tree):
     return out
 
 
+_MUTATORS = {"clear", "pop", "popitem", "update", "append", "extend", "setdefault", "add", "remove", "discard", "insert", "__setitem__"}
+
+
+def _shared_base(e, mod_names, local):
+    while isinstance(e, (ast.Attribute, ast.Subscript)):
+        if isinstance(e, ast.Attribute) and e.attr in ("__class__", "dialect") and isinstance(e.value, ast.Name) and e.value.id == "self":
+            return True
+        e = e.value
+    if isinstance(e, ast.Call):
+        return isinstance(e.func, ast.Name) and e.func.id == "type"
+    return isinstance(e, ast.Name) and (e.id == "cls" or e.id in mod_names and e.id not in local)
+
+
+def shared_writes(tree, lines):
+    mod_names = set(top_names(tree))
+    todo = [(n, None) for n in tree.body]
+    while todo:
+        n, fn = todo.pop()
+        if not isinstance(n, ast.stmt) or not any(n.lineno <= ln <= n.end_lineno for ln in lines):
+            continue
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            local = {a.arg for a in ast.walk(n.args) if isinstance(a, ast.arg)}
+            local.update(x.id for x in ast.walk(n) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store))
+            todo.extend((c, local) for c in n.body)
+            continue
+        if isinstance(n, ast.ClassDef) or fn is None:
+            todo.extend((c, fn) for c in ast.iter_child_nodes(n) if isinstance(c, ast.stmt))
+            continue
+        if isinstance(n, ast.Global):
+            return True
+        for c in ast.iter_child_nodes(n):
+            if isinstance(c, ast.stmt):
+                todo.append((c, fn))
+        targets = n.targets if isinstance(n, (ast.Assign, ast.Delete)) else [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
+        if any(isinstance(t, (ast.Attribute, ast.Subscript)) and _shared_base(t.value, mod_names, fn) for t in targets):
+            return True
+        for x in ast.walk(n) if not isinstance(n, (ast.If, ast.For, ast.While, ast.With, ast.Try, ast.Match)) else ():
+            if isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr in _MUTATORS and _shared_base(x.func.value, mod_names, fn):
+                return True
+    return False
+
+
 _SRC_CACHE = {}
 
 
@@ -838,6 +881,9 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                 notes.append("toplevel-exec")
                 merge(out, cov.tests_touching_file(path))
                 merge(out, full(module_test_files(path, cov)))
+        if SHARED and new_units is not None and shared_writes(parse_cached(new_text), set(added_new_lines(f["hunks"]))):
+            notes.append("shared-write")
+            return full(n for n in cov.idx_to_num if n is not None)
         if importtime:
             notes.append("importtime")
             if not IMPORTT:
