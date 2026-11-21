@@ -46,9 +46,9 @@ LAZYUNITS = os.environ.get("BR_LAZYUNITS", "1") == "1"
 DEBUG_N = int(os.environ.get("BR_DEBUG_N", "-1"))
 UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
-LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
+LISTRULE = os.environ.get("BR_LISTRULE", "0") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
-RUN_K = float(os.environ.get("BR_RUN_K", "1.0"))
+RUN_K = float(os.environ.get("BR_RUN_K", "0.0"))
 RUN_O = float(os.environ.get("BR_RUN_O", "0.0"))
 RUN_O_RE = float(os.environ.get("BR_RUN_O_RE", "0.0"))
 STATIC = os.environ.get("BR_STATIC", "0") == "1"
