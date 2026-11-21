@@ -37,6 +37,7 @@ LAZYTABLES = os.environ.get("BR_LAZYTABLES", "1") == "1"
 TPCQ2 = os.environ.get("BR_TPCQ2", "1") == "1"
 TPCREF = os.environ.get("BR_TPCREF", "1") == "1"
 TPCWARM = os.environ.get("BR_TPCWARM", "0") == "1"
+TPCPARSE = os.environ.get("BR_TPCPARSE", "1") == "1"
 GCFREEZE = os.environ.get("BR_GCFREEZE", "0") == "1"
 LAZYEXEC = os.environ.get("BR_LAZYEXEC", "1") == "1"
 LAZYUNITS = os.environ.get("BR_LAZYUNITS", "1") == "1"
@@ -1483,6 +1484,34 @@ def _lazy_tpc_setup(cls):
     cls.tpcds_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
 
 
+class DeferredParse:
+    def __init__(self, real, args, kwargs):
+        self.real, self.args, self.kwargs = real, args, kwargs
+
+    def parse(self):
+        return self.real(*self.args, **self.kwargs)
+
+
+def resolve_parses(args):
+    return tuple(a.parse() if type(a) is DeferredParse else a for a in args)
+
+
+def defer_mp_parse(klass, ustate):
+    real_mp = klass._mp_execute
+
+    def mp_execute(self, *a, **kw):
+        te = sys.modules[klass.__module__]
+        real = te.parse_one
+        if ustate["allowed"] is not None:
+            te.parse_one = lambda *pa, **pk: DeferredParse(real, pa, pk)
+        try:
+            return real_mp(self, *a, **kw)
+        finally:
+            te.parse_one = real
+
+    klass._mp_execute = mp_execute
+
+
 def _lazy_class_setup(klass, names):
     real = _lazy_tpc_setup if LAZYTABLES else vars(klass)["setUpClass"].__func__
     real_down = vars(klass)["tearDownClass"].__func__ if "tearDownClass" in vars(klass) else None
@@ -1722,9 +1751,11 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
     def lazy_submit(self, fn, *args, **kwargs):
         k = ustate["fut"]
         ustate["fut"] += 1
+        skip = ustate["allowed"] is not None and ("f:%d" % k) not in ustate["allowed"]
+        if not skip:
+            args = resolve_parses(args)
         f = LazyFuture(fn, args, kwargs)
-        if ustate["allowed"] is not None and ("f:%d" % k) not in ustate["allowed"]:
-            f.skip_outer = True
+        f.skip_outer = skip
         return f
 
     SyncExecutor.submit = lazy_submit
@@ -1733,6 +1764,8 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
     def force(self):
         if getattr(self, "skip_outer", False) and not ustate["stack"] and self.state is None:
             self.state = (True, None)
+        if self.state is None:
+            self.args = resolve_parses(self.args)
         return orig_force(self)
 
     LazyFuture._force = force
@@ -1777,6 +1810,8 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
         for k in {type(c) for c in cases}:
             if k.__name__ == "TestExecutor" and k.__module__ == "tests.test_executor" and not vars(k).get("_prewarmed") and "setUpClass" in vars(k):
                 _lazy_class_setup(k, ("tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls"))
+                if UNITS and TPCPARSE:
+                    defer_mp_parse(k, ustate)
     suite = unittest.TestSuite(cases)
     try:
         suite.run(Result())
