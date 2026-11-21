@@ -1352,7 +1352,9 @@ def partial_purge(root):
     ours = {n for n, m in sys.modules.items() if m is not None and (n == "sqlglot" or n.startswith(("sqlglot.", "tests")))}
     if ours - nodes:
         return None
-    gone = {modname_of(r) for r in rels if not os.path.exists(os.path.join(root, r))}
+    if not all(os.path.exists(os.path.join(root, r)) and os.path.exists(os.path.join(SRC, r)) for r in rels):
+        return None
+    gone = set()
     dead = {modname_of(r) for r in rels}
     todo = list(dead)
     while todo:
@@ -1697,11 +1699,11 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             try:
                 importlib.import_module(n)
             except BaseException:
-                pass
+                break
         if fresh:
             for n, m in list(sys.modules.items()):
                 base, _, leaf = n.rpartition(".")
-                if base in fresh and m is not None and not hasattr(sys.modules.get(base), leaf):
+                if base in fresh and m is not None and base in sys.modules and not hasattr(sys.modules[base], leaf):
                     setattr(sys.modules[base], leaf, m)
     out = os.fdopen(wfd, "w", buffering=1)
 
