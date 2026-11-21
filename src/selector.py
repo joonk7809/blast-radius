@@ -660,9 +660,21 @@ _MUTATORS = {"clear", "pop", "popitem", "update", "append", "extend", "setdefaul
 _SELF_SHARED = {"__class__", "__dict__", "dialect", "_dispatch", "tokenizer", "parser_class", "generator_class", "tokenizer_class"}
 
 
+_SELF_ALIAS = re.compile(r"self\.(\w+)\s*(?::[^=\n]*)?=\s*(?:self\.(?:[A-Z_][A-Z0-9_]*\b|_dispatch|dialect|__class__|__dict__|\w+_class)|\w*\(\s*self\.dialect|cls\b|vars\()")
+
+
 class _Shared:
-    def __init__(self, tree):
+    def fname(self, f):
+        if isinstance(f, ast.Name):
+            return self.bi.get(f.id, f.id)
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "builtins":
+            return f.attr
+        return None
+
+    def __init__(self, tree, text):
         self.mod = set(top_names(tree))
+        self.bi = {a.asname or a.name: a.name for st in tree.body if isinstance(st, ast.ImportFrom) and st.module == "builtins" for a in st.names}
+        self.sattrs = set(_SELF_ALIAS.findall(text))
         self.cattrs = set()
         todo = [c for c in tree.body if isinstance(c, ast.ClassDef)]
         while todo:
@@ -677,28 +689,30 @@ class _Shared:
             return e.id in alias or e.id == "cls" or e.id in self.mod and e.id not in local
         if isinstance(e, ast.Attribute):
             if isinstance(e.value, ast.Name) and e.value.id == "self":
-                return e.attr in _SELF_SHARED or e.attr in self.cattrs or e.attr.isupper()
+                return e.attr in _SELF_SHARED or e.attr in self.cattrs or e.attr in self.sattrs or e.attr.isupper()
             return self.base(e.value, local, alias)
         if isinstance(e, ast.Subscript):
             return self.base(e.value, local, alias)
-        if isinstance(e, ast.Call) and isinstance(e.func, ast.Name):
-            if e.func.id in ("type", "vars"):
+        if isinstance(e, ast.Call):
+            fn = self.fname(e.func)
+            if fn in ("type", "vars"):
                 return True
-            if e.func.id == "getattr" and e.args:
+            if fn == "getattr" and e.args:
                 return self.base(e.args[0], local, alias)
         return False
 
     def scope(self, fn, outer):
-        local = {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)}
+        params = {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)}
+        local = set(params)
         local.update(x.id for x in ast.walk(fn) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store))
         alias = set(outer)
         while True:
             more = {t.id for st in ast.walk(fn) if isinstance(st, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and st.value is not None and self.base(st.value, local, alias) for t in (st.targets if isinstance(st, ast.Assign) else [st.target]) if isinstance(t, ast.Name)} - alias
             if not more:
-                return local, alias
+                return local, alias, params - {"self"}
             alias |= more
 
-    def writes(self, n, local, alias):
+    def writes(self, n, local, alias, params):
         if isinstance(n, ast.Global):
             return True
         targets = n.targets if isinstance(n, (ast.Assign, ast.Delete)) else [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
@@ -710,30 +724,30 @@ class _Shared:
             f = x.func
             if isinstance(f, ast.Attribute) and f.attr in _MUTATORS and self.base(f.value, local, alias):
                 return True
-            if (isinstance(f, ast.Name) and f.id in ("setattr", "delattr") or isinstance(f, ast.Attribute) and f.attr in ("__setattr__", "__delattr__") and isinstance(f.value, ast.Name) and f.value.id in ("object", "type")) and x.args:
-                obj = x.args[0] if isinstance(f, ast.Name) else x.args[0]
-                if not (isinstance(obj, ast.Name) and obj.id == "self") and (self.base(obj, local, alias) or not isinstance(obj, ast.Name) or obj.id not in local):
+            if (self.fname(f) in ("setattr", "delattr") or isinstance(f, ast.Attribute) and f.attr in ("__setattr__", "__delattr__") and isinstance(f.value, ast.Name) and f.value.id in ("object", "type")) and x.args:
+                obj = x.args[0]
+                if not (isinstance(obj, ast.Name) and obj.id == "self") and (self.base(obj, local, alias) or not isinstance(obj, ast.Name) or obj.id in params or obj.id not in local):
                     return True
         return False
 
 
-def shared_writes(tree, lines):
-    sh = _Shared(tree)
-    todo = [(n, None, None) for n in tree.body]
+def shared_writes(tree, lines, text):
+    sh = _Shared(tree, text)
+    todo = [(n, None, None, None) for n in tree.body]
     while todo:
-        n, local, alias = todo.pop()
+        n, local, alias, params = todo.pop()
         if not isinstance(n, ast.stmt) or not any(n.lineno <= ln <= n.end_lineno for ln in lines):
             continue
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            l2, a2 = sh.scope(n, alias or ())
-            todo.extend((c, l2, a2) for c in n.body)
+            l2, a2, p2 = sh.scope(n, alias or ())
+            todo.extend((c, l2, a2, p2) for c in n.body)
             continue
         if isinstance(n, ast.ClassDef) or local is None:
-            todo.extend((c, local, alias) for c in ast.iter_child_nodes(n) if isinstance(c, ast.stmt))
+            todo.extend((c, local, alias, params) for c in ast.iter_child_nodes(n) if isinstance(c, ast.stmt))
             continue
-        if sh.writes(n, local, alias):
+        if sh.writes(n, local, alias, params):
             return True
-        todo.extend((c, local, alias) for c in ast.iter_child_nodes(n) if isinstance(c, ast.stmt))
+        todo.extend((c, local, alias, params) for c in ast.iter_child_nodes(n) if isinstance(c, ast.stmt))
     return False
 
 
@@ -922,7 +936,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                 notes.append("toplevel-exec")
                 merge(out, cov.tests_touching_file(path))
                 merge(out, full(module_test_files(path, cov)))
-        if SHARED and new_units is not None and shared_writes(parse_cached(new_text), set(added_new_lines(f["hunks"]))):
+        if SHARED and new_units is not None and shared_writes(parse_cached(new_text), set(added_new_lines(f["hunks"])), new_text):
             notes.append("shared-write")
             return full(n for n in cov.idx_to_num if n is not None)
         if importtime:
