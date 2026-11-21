@@ -24,6 +24,7 @@ UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
+IMPORTT = os.environ.get("BR_IMPORTT", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
 T0 = time.monotonic()
 
@@ -237,10 +238,15 @@ class CovMap:
         self.files = m["files"]
         self.fixtures = m["fixtures"]
         self.by_file = {}
+        self.ids = {}
         for i, t in enumerate(m["tests"]):
             n = self.idx_to_num[i]
             if n is not None:
                 self.by_file.setdefault(t.split("::")[0], []).append(n)
+                self.ids[n] = t
+
+    def num_id(self, n):
+        return self.ids.get(n, "")
 
     def set(self, i):
         r = self._cache.get(i)
@@ -295,12 +301,60 @@ def candidates_for(f, old_text, new_text, cov, notes):
     return r if isinstance(r, dict) else full(r)
 
 
+def class_setup_readers(path, cov):
+    base = os.path.basename(path)
+    folder = os.path.dirname(path)
+
+    def hit(node):
+        for n in ast.walk(node):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                c = n.value.strip("/")
+                if c and (path.endswith("/" + c) or folder.endswith("/" + c)):
+                    return True
+        return False
+
+    out = set()
+    for tf, nums in cov.by_file.items():
+        try:
+            with open(os.path.join(SRC, tf), encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        if base not in text and os.path.basename(folder) not in text:
+            continue
+        tree = ast.parse(text)
+        consts = set()
+        for node in tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Import, ast.ImportFrom)) or not hit(node):
+                continue
+            if isinstance(node, ast.Assign):
+                consts.update(t.id for t in node.targets if isinstance(t, ast.Name))
+            else:
+                out.update(nums)
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for fn in node.body:
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name == "setUpClass":
+                    names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+                    if hit(fn) or names & consts:
+                        prefix = "%s::%s::" % (tf, node.name)
+                        out.update(n for n in nums if cov.num_id(n).startswith(prefix))
+    return out
+
+
 def _candidates_for(f, old_text, new_text, cov, notes):
     path = f["path"]
     if path.startswith("sqlglot/") and path.endswith(".py"):
         if f["deleted"] or (f["old"] and f["old"] != path):
             notes.append("deleted-or-renamed")
             return full(n for n in cov.idx_to_num if n is not None)
+        if new_text is not None:
+            try:
+                ast.parse(new_text)
+            except SyntaxError:
+                notes.append("new-unparsable")
+                return full(n for n in cov.idx_to_num if n is not None)
         if old_text is not None and new_text is not None:
             res = module_resolver(path)
             a, b = strip_ast(old_text, res), strip_ast(new_text, res)
@@ -328,8 +382,9 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                 importtime = True
         if importtime:
             notes.append("importtime")
-            merge(out, cov.tests_touching_file(path))
-            merge(out, full(module_test_files(path, cov)))
+            if not IMPORTT:
+                merge(out, cov.tests_touching_file(path))
+                merge(out, full(module_test_files(path, cov)))
         return out
     if path.startswith("tests/") and path.endswith(".py"):
         if os.path.basename(path).startswith("test_"):
@@ -340,7 +395,11 @@ def _candidates_for(f, old_text, new_text, cov, notes):
     if path.startswith("tests/"):
         if path in cov.fixtures:
             notes.append("fixture")
-            return {cov.idx_to_num[i] for i in cov.fixtures[path] if cov.idx_to_num[i] is not None}
+            out = {cov.idx_to_num[i] for i in cov.fixtures[path] if cov.idx_to_num[i] is not None}
+            extra = class_setup_readers(path, cov)
+            if extra - out:
+                notes.append("setupclass")
+            return out | extra
         notes.append("unmapped-fixture")
         base = os.path.basename(path)
         out = set()
@@ -841,6 +900,17 @@ def main():
             ok = False
             notes.append(f"error:{type(e).__name__}:{e}")
             cands = full(num_to_id)
+        if IMPORTT and "importtime" in notes:
+            try:
+                os.environ.setdefault("IMPORTTIME_SQLGLOT", SRC)
+                os.environ.setdefault("IMPORTTIME_MAPS", os.path.join(HERE, "itmaps"))
+                import importtime as itf
+                extra, info = itf.extra_candidates(text, root=SRC, with_info=True)
+                merge(cands, full(n for n in extra if n in num_to_id))
+                notes.append("itf:%d%s" % (len(extra), "" if info.get("confident", True) else ":unconfident"))
+            except Exception as e:
+                notes.append(f"itf-error:{type(e).__name__}")
+                cands = full(num_to_id)
         def est(n):
             c = runcpu.get(num_to_id[n], 0)
             if not UNITEST or cands[n] is None or not cov.nunits.get(n):

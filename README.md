@@ -6,8 +6,10 @@ Entry for the RWX Blast Radius track. For each sqlglot patch in `/data/commits`,
 
 - `src/covsets.bin.xz`, `src/covmeta.json.gz`: line to sub-test coverage of the pinned sqlglot test suite, recorded with coverage.py. The Docker build decompresses them into `/app`.
 - `src/selector.py`: reads each patch, maps changed lines to candidate tests (AST no-op detection, statement expansion, import-time fallback, fixtures), runs the candidates, and writes one JSON line per commit.
+- `src/importtime.py`, `src/itmaps/`: finds tests affected by import-time changes (class attributes, dict tables, constants, defaults) from a per-test attribute-read map and import fingerprints; escalates to importing the patched tree in a subprocess when unsure.
 - `src/zygote.py`: warms sqlglot once; a child either swaps changed function code objects in place or reimports sqlglot from a patched overlay.
 - `src/split.py`: splits the selected tests across up to 8 workers.
+- `tools/importtime/`: builds the import-time maps and the labelled mutants used to evaluate them.
 - `tools/`: offline scripts that build the maps and score a local run (`tools/measure.sh`).
 
 ## Third-party code and libraries
