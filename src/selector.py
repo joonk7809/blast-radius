@@ -28,6 +28,7 @@ FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
 LAZYPANDAS = os.environ.get("BR_LAZYPANDAS", "1") == "1"
 STMTSEL = os.environ.get("BR_STMTSEL", "1") == "1"
+ALPHA = os.environ.get("BR_ALPHA", "1") == "1"
 LAMBDAS = os.environ.get("BR_LAMBDAS", "1") == "1"
 SHARED = os.environ.get("BR_SHARED", "1") == "1"
 LAZYTABLES = os.environ.get("BR_LAZYTABLES", "1") == "1"
@@ -227,6 +228,52 @@ def _canon_dump(node, resolve):
             n.ops = ops
 
 
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_FRAME_CALLS = {"locals", "vars", "eval", "exec", "globals"}
+
+
+def _outer_binds(fn):
+    params = {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)}
+    order, nested = [], set()
+    todo = list(reversed(fn.body))
+    while todo:
+        n = todo.pop()
+        if isinstance(n, (ast.Global, ast.Nonlocal, ast.ClassDef)):
+            return None
+        if isinstance(n, ast.Call) and (isinstance(n.func, ast.Name) and n.func.id in _FRAME_CALLS or isinstance(n.func, ast.Attribute) and n.func.attr == "_getframe"):
+            return None
+        if isinstance(n, _SCOPES):
+            for x in ast.walk(n):
+                if isinstance(x, (ast.Global, ast.Nonlocal, ast.ClassDef)) and x is not n or isinstance(n, ast.ClassDef):
+                    return None
+                if isinstance(x, ast.arg):
+                    nested.add(x.arg)
+                elif isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):
+                    nested.add(x.id)
+            continue
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)) and n.id not in params and n.id not in order:
+            order.append(n.id)
+        todo.extend(reversed(list(ast.iter_child_nodes(n))))
+    if nested & set(order):
+        return None
+    return {name: "\0L%d" % i for i, name in enumerate(order)}
+
+
+def _alpha_dump(fn, resolve):
+    names = _outer_binds(fn)
+    if not names:
+        return None
+    hits = [n for st in fn.body for n in ast.walk(st) if isinstance(n, ast.Name) and n.id in names]
+    for n in hits:
+        n.id = names[n.id]
+    try:
+        return _canon_dump(fn, resolve)
+    finally:
+        back = {v: k for k, v in names.items()}
+        for n in hits:
+            n.id = back[n.id]
+
+
 def _class_head(node, resolve):
     return (node.name, [_canon_dump(b, resolve) for b in node.bases], [_canon_dump(k, resolve) for k in node.keywords], [_canon_dump(d, resolve) for d in node.decorator_list])
 
@@ -245,7 +292,11 @@ def _same_body(a_body, b_body, oc, nc, resolve):
             if _class_head(x, resolve) != _class_head(y, resolve) or not _same_body(x.body, y.body, oc, nc, resolve):
                 return False
         elif _canon_dump(x, resolve) != _canon_dump(y, resolve):
-            return False
+            if not (ALPHA and isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef))):
+                return False
+            ax = _alpha_dump(x, resolve)
+            if ax is None or ax != _alpha_dump(y, resolve):
+                return False
     return True
 
 
