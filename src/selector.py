@@ -25,6 +25,9 @@ UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
+ITF_UNITS = os.environ.get("BR_ITF_UNITS", "1") == "1"
+FRAC_K = float(os.environ.get("BR_FRAC_K", "1.33"))
+FRAC_C = float(os.environ.get("BR_FRAC_C", "0.5"))
 FASTNOOP = os.environ.get("BR_FASTNOOP", "1") == "1"
 SETUP_ATTRS = os.environ.get("BR_SETUP_ATTRS", "1") == "1"
 NEWTOP = os.environ.get("BR_NEWTOP", "1") == "1"
@@ -1252,6 +1255,7 @@ def main():
     plans = []
     for cid in commits:
         text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape").read()
+        FRACTION_OK.clear()
         notes = []
         cands = {}
         patched = {}
@@ -1282,8 +1286,16 @@ def main():
                 os.environ.setdefault("IMPORTTIME_SQLGLOT", SRC)
                 os.environ.setdefault("IMPORTTIME_MAPS", os.path.join(HERE, "itmaps"))
                 import importtime as itf
-                extra, info = itf.extra_candidates(text, root=SRC, with_info=True)
-                merge(cands, full(n for n in extra if n in num_to_id))
+                if ITF_UNITS:
+                    extra, info = itf.extra_candidates_units(text, root=SRC, with_info=True)
+                    for n, keys in extra.items():
+                        if n in num_to_id:
+                            if keys is not None:
+                                FRACTION_OK.add(n)
+                            merge(cands, {n: keys})
+                else:
+                    extra, info = itf.extra_candidates(text, root=SRC, with_info=True)
+                    merge(cands, full(n for n in extra if n in num_to_id))
                 notes.append("itf:%d%s" % (len(extra), "" if info.get("confident", True) else ":unconfident"))
             except Exception as e:
                 notes.append(f"itf-error:{type(e).__name__}")
@@ -1292,7 +1304,7 @@ def main():
             c = runcpu.get(num_to_id[n], 0)
             if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
                 return c
-            return c * min(1.0, len(cands[n]) / cov.nunits[n])
+            return c * min(1.0, FRAC_K * len(cands[n]) / cov.nunits[n]) + FRAC_C
 
         heavy = {n for n in cands if ms[n] >= HEAVY_MS or (LISTRULE and est(n) * 1000 > ms[n] + 2000)}
         light = sorted(set(cands) - heavy)

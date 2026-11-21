@@ -9,14 +9,37 @@ FP = json.load(gzip.open(fp_p, 'rt'))
 COV = json.load(gzip.open(cov_p, 'rt'))
 STAR = '\x01*'
 entries, per = (R['entries'], R['per'])
-ent_tests = [set() for _ in entries]
+UNITS = R.get('units')
+ent_tests = [dict() for _ in entries]
+
+def merge_hit(d, t, us):
+    if us is None:
+        d[t] = None
+    else:
+        cur = d.get(t, 0)
+        if cur is None:
+            return
+        if cur == 0:
+            d[t] = set(us)
+        else:
+            cur.update(us)
 for t, lst in enumerate(per):
-    for j in lst:
-        ent_tests[j].add(t)
+    for item in lst:
+        if UNITS is None:
+            ent_tests[item][t] = None
+        else:
+            j, us = item
+            merge_hit(ent_tests[j], t, None if us is None else [UNITS[u] for u in us])
 attr, recv, key, star = ({}, {}, {}, {})
 
 def add(d, k, ts):
-    d.setdefault(k, set()).update(ts)
+    dd = d.setdefault(k, {})
+    if isinstance(ts, dict):
+        for t, us in ts.items():
+            merge_hit(dd, t, us)
+    else:
+        for t in ts:
+            dd[t] = None
 aliases = R.get('tids', {})
 for e, ts in zip(entries, ent_tests):
     if not ts:
@@ -44,15 +67,30 @@ for m in modules:
     mod_file[m] = f
 file_mod = {f: m for m, f in mod_file.items()}
 
+def cov_hits(s):
+    v = COV['sets'][s]
+    if not isinstance(v, str):
+        return {t: None for t in v}
+    out = {}
+    for x in v.split(',') if v else []:
+        if ':' in x:
+            t, u = map(int, x.split(':'))
+            raw = COV['usets'][u]
+            out[t] = {COV['units'][int(i)] for i in raw.split(',')} if raw else set()
+        else:
+            out[int(x)] = None
+    return out
+
 def cov_lines(rel, lines):
     fm = COV['files'].get(rel)
-    out = set()
+    out = {}
     if not fm:
         return out
     for ln in lines:
         s = fm['lines'].get(str(ln))
         if s is not None:
-            out.update(COV['sets'][s])
+            for t, us in cov_hits(s).items():
+                merge_hit(out, t, us)
     return out
 globals_by_mod = {}
 for p in FP['fp']:
@@ -122,21 +160,42 @@ for (m, name), locs in refs.items():
     byfile = {}
     for rel, ln in locs:
         byfile.setdefault(rel, set()).add(ln)
-    ts = set()
+    ts = {}
     for rel, lns in byfile.items():
-        ts |= cov_lines(rel, lns)
+        for t, us in cov_lines(rel, lns).items():
+            merge_hit(ts, t, us)
     if ts:
         modglob[f'{m}|{name}'] = ts
 sets, idx = ([], {})
+unit_ids, unit_list = ({}, [])
+usets, uidx = ([], {})
+
+def uset(us):
+    ids = []
+    for u in us:
+        if u not in unit_ids:
+            unit_ids[u] = len(unit_list)
+            unit_list.append(u)
+        ids.append(unit_ids[u])
+    k = ','.join(map(str, sorted(ids)))
+    if k not in uidx:
+        uidx[k] = len(usets)
+        usets.append(k)
+    return uidx[k]
 
 def intern(ts):
-    k = tuple(sorted(ts))
+    if not isinstance(ts, dict):
+        ts = {t: None for t in ts}
+    k = ','.join((str(t) if ts[t] is None else '%d:%d' % (t, uset(ts[t])) for t in sorted(ts)))
     if k not in idx:
         idx[k] = len(sets)
-        sets.append(list(k))
+        sets.append(k)
     return idx[k]
 out = {'attr': {k: intern(v) for k, v in attr.items()}, 'recv': {k: intern(v) for k, v in recv.items()}, 'key': {k: intern(v) for k, v in key.items()}, 'star': {k: intern(v) for k, v in star.items()}, 'modglob': {k: intern(v) for k, v in modglob.items()}, 'mro': FP['mro'], 'owns': FP['owns']}
-out['sets'] = [','.join(map(str, x)) for x in sets]
+out['sets'] = sets
+if UNITS is not None:
+    out['usets'] = usets
+    out['units'] = unit_list
 with gzip.open(out_p, 'wt') as f:
     json.dump(out, f, separators=(',', ':'))
 print('attr', len(attr), 'recv', len(recv), 'key', len(key), 'star', len(star), 'modglob', len(modglob), 'sets', len(sets), file=sys.stderr)
