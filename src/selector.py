@@ -1,5 +1,6 @@
 import ast
 import enum
+import gzip
 import importlib
 import json
 import os
@@ -1078,17 +1079,27 @@ def main():
         zyg = (zygote, warm_lines, code_idx)
         log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
     results = {}
-    warm_all = {k: set(v) for k, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
-    collect_map = {}
+    imap = json.load(gzip.open(os.path.join(HERE, "importmap.json.gz"), "rt"))
+    mod_tids = {}
     for n, tid in num_to_id.items():
-        collect_map.setdefault(tid.split("::")[0][:-3].replace("/", "."), []).append(tid)
+        mod_tids.setdefault(tid.split("::")[0][:-3].replace("/", "."), []).append(tid)
     for p in plans:
-        p["collect"] = COLLECT and any(
-            rel.endswith(".py") and rel.startswith("sqlglot/") and (content is None or p["old"].get(rel) is None or rel not in warm_all or (lambda r, a: (r | a) & warm_all[rel])(*changed_old_lines(p["hunks"][rel])))
-            for rel, content in p["patched"].items()
-        )
+        mask = 0
+        for rel, content in p["patched"].items():
+            if not rel.endswith(".py") or not rel.startswith(("sqlglot/", "tests/")):
+                continue
+            if content is None or p["old"].get(rel) is None:
+                mask = -1
+                break
+            fm = imap["files"].get(rel, {})
+            removed, anchors = changed_old_lines(p["hunks"][rel])
+            for ln in removed | anchors:
+                mask |= fm.get(str(ln), 0)
+        mods = imap["modules"]
+        chosen = mods if mask == -1 else [m for i, m in enumerate(mods) if mask >> i & 1]
+        p["collect"] = {m: mod_tids.get(m, []) for m in chosen} if COLLECT and chosen else None
         if p["collect"]:
-            log(p["cid"], "collect")
+            log(p["cid"], "collect", len(chosen))
     pending = [p for p in plans if p["light"] or p["collect"]]
     for p in plans:
         if not p["light"] and not p["collect"]:
@@ -1111,7 +1122,7 @@ def main():
             budget = sum(timeouts.values()) + 30
             mode = None
             if zyg is not None:
-                mode = ("reimport", collect_map if p["collect"] else None)
+                mode = ("reimport", p["collect"])
                 zmod, warm_lines, code_idx = zyg
                 swaps, nonpy, ok = [], [], True
                 for rel, content in p["patched"].items():
