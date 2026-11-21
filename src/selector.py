@@ -657,42 +657,83 @@ def top_names(tree):
 _MUTATORS = {"clear", "pop", "popitem", "update", "append", "extend", "setdefault", "add", "remove", "discard", "insert", "__setitem__"}
 
 
-def _shared_base(e, mod_names, local):
-    while isinstance(e, (ast.Attribute, ast.Subscript)):
-        if isinstance(e, ast.Attribute) and e.attr in ("__class__", "dialect") and isinstance(e.value, ast.Name) and e.value.id == "self":
+_SELF_SHARED = {"__class__", "__dict__", "dialect", "_dispatch", "tokenizer", "parser_class", "generator_class", "tokenizer_class"}
+
+
+class _Shared:
+    def __init__(self, tree):
+        self.mod = set(top_names(tree))
+        self.cattrs = set()
+        todo = [c for c in tree.body if isinstance(c, ast.ClassDef)]
+        while todo:
+            for st in todo.pop().body:
+                if isinstance(st, ast.ClassDef):
+                    todo.append(st)
+                elif isinstance(st, ast.Assign) or isinstance(st, ast.AnnAssign) and st.value is not None:
+                    self.cattrs.update(t.id for t in (st.targets if isinstance(st, ast.Assign) else [st.target]) if isinstance(t, ast.Name))
+
+    def base(self, e, local, alias):
+        if isinstance(e, ast.Name):
+            return e.id in alias or e.id == "cls" or e.id in self.mod and e.id not in local
+        if isinstance(e, ast.Attribute):
+            if isinstance(e.value, ast.Name) and e.value.id == "self":
+                return e.attr in _SELF_SHARED or e.attr in self.cattrs or e.attr.isupper()
+            return self.base(e.value, local, alias)
+        if isinstance(e, ast.Subscript):
+            return self.base(e.value, local, alias)
+        if isinstance(e, ast.Call) and isinstance(e.func, ast.Name):
+            if e.func.id in ("type", "vars"):
+                return True
+            if e.func.id == "getattr" and e.args:
+                return self.base(e.args[0], local, alias)
+        return False
+
+    def scope(self, fn, outer):
+        local = {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)}
+        local.update(x.id for x in ast.walk(fn) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store))
+        alias = set(outer)
+        while True:
+            more = {t.id for st in ast.walk(fn) if isinstance(st, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and st.value is not None and self.base(st.value, local, alias) for t in (st.targets if isinstance(st, ast.Assign) else [st.target]) if isinstance(t, ast.Name)} - alias
+            if not more:
+                return local, alias
+            alias |= more
+
+    def writes(self, n, local, alias):
+        if isinstance(n, ast.Global):
             return True
-        e = e.value
-    if isinstance(e, ast.Call):
-        return isinstance(e.func, ast.Name) and e.func.id == "type"
-    return isinstance(e, ast.Name) and (e.id == "cls" or e.id in mod_names and e.id not in local)
+        targets = n.targets if isinstance(n, (ast.Assign, ast.Delete)) else [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
+        if any(isinstance(t, (ast.Attribute, ast.Subscript)) and self.base(t.value, local, alias) for t in targets):
+            return True
+        for x in ast.walk(n) if not isinstance(n, (ast.If, ast.For, ast.While, ast.With, ast.Try, ast.Match)) else ():
+            if not isinstance(x, ast.Call):
+                continue
+            f = x.func
+            if isinstance(f, ast.Attribute) and f.attr in _MUTATORS and self.base(f.value, local, alias):
+                return True
+            if (isinstance(f, ast.Name) and f.id in ("setattr", "delattr") or isinstance(f, ast.Attribute) and f.attr in ("__setattr__", "__delattr__") and isinstance(f.value, ast.Name) and f.value.id in ("object", "type")) and x.args:
+                obj = x.args[0] if isinstance(f, ast.Name) else x.args[0]
+                if not (isinstance(obj, ast.Name) and obj.id == "self") and (self.base(obj, local, alias) or not isinstance(obj, ast.Name) or obj.id not in local):
+                    return True
+        return False
 
 
 def shared_writes(tree, lines):
-    mod_names = set(top_names(tree))
-    todo = [(n, None) for n in tree.body]
+    sh = _Shared(tree)
+    todo = [(n, None, None) for n in tree.body]
     while todo:
-        n, fn = todo.pop()
+        n, local, alias = todo.pop()
         if not isinstance(n, ast.stmt) or not any(n.lineno <= ln <= n.end_lineno for ln in lines):
             continue
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            local = {a.arg for a in ast.walk(n.args) if isinstance(a, ast.arg)}
-            local.update(x.id for x in ast.walk(n) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store))
-            todo.extend((c, local) for c in n.body)
+            l2, a2 = sh.scope(n, alias or ())
+            todo.extend((c, l2, a2) for c in n.body)
             continue
-        if isinstance(n, ast.ClassDef) or fn is None:
-            todo.extend((c, fn) for c in ast.iter_child_nodes(n) if isinstance(c, ast.stmt))
+        if isinstance(n, ast.ClassDef) or local is None:
+            todo.extend((c, local, alias) for c in ast.iter_child_nodes(n) if isinstance(c, ast.stmt))
             continue
-        if isinstance(n, ast.Global):
+        if sh.writes(n, local, alias):
             return True
-        for c in ast.iter_child_nodes(n):
-            if isinstance(c, ast.stmt):
-                todo.append((c, fn))
-        targets = n.targets if isinstance(n, (ast.Assign, ast.Delete)) else [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
-        if any(isinstance(t, (ast.Attribute, ast.Subscript)) and _shared_base(t.value, mod_names, fn) for t in targets):
-            return True
-        for x in ast.walk(n) if not isinstance(n, (ast.If, ast.For, ast.While, ast.With, ast.Try, ast.Match)) else ():
-            if isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr in _MUTATORS and _shared_base(x.func.value, mod_names, fn):
-                return True
+        todo.extend((c, local, alias) for c in ast.iter_child_nodes(n) if isinstance(c, ast.stmt))
     return False
 
 
