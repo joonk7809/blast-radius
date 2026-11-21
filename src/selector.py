@@ -338,9 +338,13 @@ class Units:
         return out or [(0, enc[0], enc[1], enc[3], enc[4])]
 
 
-def _strip(node):
-    if isinstance(node, ast.Lambda):
+def _strip(node, called=False):
+    if isinstance(node, ast.Lambda) and not called:
         return ("Lambda", _strip(node.args))
+    if isinstance(node, ast.Call):
+        return ("Call", _strip(node.func, True), tuple(_strip(a, True) for a in node.args), tuple(_strip(k, True) for k in node.keywords))
+    if isinstance(node, ast.keyword):
+        return ("keyword", node.arg, _strip(node.value, called))
     if isinstance(node, ast.AST):
         return (type(node).__name__,) + tuple(_strip(getattr(node, k, None)) for k in node._fields)
     if isinstance(node, list):
