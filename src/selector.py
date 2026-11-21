@@ -745,6 +745,18 @@ def _cookie(text):
     return None
 
 
+def package_scanners(cov):
+    out = set()
+    for tf, nums in cov.by_file.items():
+        try:
+            text = _read_tree(os.path.join(SRC, tf))[0]
+        except OSError:
+            continue
+        if "iter_modules(" in text or "walk_packages(" in text:
+            out.update(nums)
+    return out
+
+
 def _candidates_for(f, old_text, new_text, cov, notes):
     path = f["path"]
     if path.startswith("sqlglot/") and path.endswith(".py"):
@@ -791,7 +803,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                 return extra
         if old_text is None:
             notes.append("newfile")
-            return merge(cov.tests_touching_file(path), full(module_test_files(path, cov)))
+            return merge(merge(cov.tests_touching_file(path), full(module_test_files(path, cov))), full(package_scanners(cov)))
         try:
             units = Units(old_text, {ln for h in f["hunks"] for part in changed_old_lines([h]) for ln in part})
         except SyntaxError:
