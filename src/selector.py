@@ -13,7 +13,7 @@ DATA = os.environ.get("BR_DATA", "/data")
 SRC = os.environ.get("BR_SRC", "/sqlglot")
 TMP = os.environ.get("BR_TMP", "/tmp")
 HERE = os.path.dirname(os.path.abspath(__file__))
-MAP_PATH = os.environ.get("BR_MAP", os.path.join(HERE, "covmap.json.gz"))
+MAP_PATH = os.environ.get("BR_MAP", os.path.join(HERE, "covmeta.json"))
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "1000000"))
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
@@ -192,11 +192,17 @@ def full(nums):
 
 class CovMap:
     def __init__(self, path, id_to_num):
-        m = json.load(gzip.open(path, "rt"))
+        with open(path) as fh:
+            m = json.load(fh)
+        with open(os.path.join(os.path.dirname(path), "covsets.bin"), "rb") as fh:
+            raw = fh.read()
+        n = int.from_bytes(raw[:4], "little")
+        self._offs = memoryview(raw)[4:4 + 4 * n].cast("I")
+        self._data = memoryview(raw)[4 + 4 * n:].cast("H")
+        self._cache = {}
         self.idx_to_num = [id_to_num.get(t) for t in m["tests"]]
         self.units = [(self.idx_to_num[t], k if UNITS else "") for t, k in m.get("units", [[i, ""] for i in range(len(m["tests"]))])]
         self.nunits = {self.idx_to_num[int(t)]: c for t, c in m.get("nunits", {}).items()}
-        self.sets = m["sets"]
         self.files = m["files"]
         self.fixtures = m["fixtures"]
         self.by_file = {}
@@ -204,6 +210,12 @@ class CovMap:
             n = self.idx_to_num[i]
             if n is not None:
                 self.by_file.setdefault(t.split("::")[0], []).append(n)
+
+    def set(self, i):
+        r = self._cache.get(i)
+        if r is None:
+            r = self._cache[i] = self._data[self._offs[i]:self._offs[i + 1]].tolist()
+        return r
 
     def _from_units(self, us):
         out = {}
@@ -226,7 +238,7 @@ class CovMap:
         for ln in lines:
             s = lm.get(str(ln))
             if s is not None:
-                us.update(self.sets[s])
+                us.update(self.set(s))
         return self._from_units(us)
 
     def tests_touching_file(self, path):
@@ -235,7 +247,7 @@ class CovMap:
             return {}
         us = set()
         for s in set(fm["lines"].values()):
-            us.update(self.sets[s])
+            us.update(self.set(s))
         return full(self._from_units(us))
 
 
@@ -746,6 +758,7 @@ def main():
     num_to_id = {t["number"]: t["id"] for t in tests}
     ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     cov = CovMap(MAP_PATH, id_to_num)
+    log("map loaded cpu=%.2f" % time.process_time())
     runcpu = json.load(open(os.path.join(HERE, "runcpu.json")))
     sys.path.insert(0, HERE)
     from split import split
@@ -791,7 +804,9 @@ def main():
         plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel})
         log(cid, "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4])
 
+    log("planned cpu=%.2f" % time.process_time())
     preimport()
+    log("preimported cpu=%.2f" % time.process_time())
     zyg = None
     if ZYGOTE:
         import zygote
@@ -800,7 +815,7 @@ def main():
         warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
         code_idx = zygote.code_index()
         zyg = (zygote, warm_lines, code_idx)
-        log("zygote warm done t=%.1f" % (time.monotonic() - T0))
+        log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
     results = {}
     pending = [p for p in plans if p["light"]]
     for p in plans:
