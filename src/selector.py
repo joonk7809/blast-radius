@@ -303,45 +303,68 @@ def candidates_for(f, old_text, new_text, cov, notes):
     return r if isinstance(r, dict) else full(r)
 
 
-def class_setup_readers(path, cov):
-    base = os.path.basename(path)
-    folder = os.path.dirname(path)
+_SETUP_INDEX = []
 
-    def hit(node):
-        for n in ast.walk(node):
-            if isinstance(n, ast.Constant) and isinstance(n.value, str):
-                c = n.value.strip("/")
-                if c and (path.endswith("/" + c) or folder.endswith("/" + c)):
-                    return True
-        return False
 
-    out = set()
+def _setup_index(cov):
+    if _SETUP_INDEX:
+        return _SETUP_INDEX
     for tf, nums in cov.by_file.items():
-        try:
-            with open(os.path.join(SRC, tf), encoding="utf-8") as fh:
-                text = fh.read()
-        except OSError:
+        entry = _read_tree(os.path.join(SRC, tf))
+        if entry[1] is None:
+            try:
+                entry[1] = ast.parse(entry[0])
+            except SyntaxError:
+                entry[1] = False
+        tree = entry[1]
+        if tree is False:
             continue
-        if base not in text and os.path.basename(folder) not in text:
-            continue
-        tree = ast.parse(text)
-        consts = set()
+        consts, loose = {}, []
         for node in tree.body:
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Import, ast.ImportFrom)) or not hit(node):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Import, ast.ImportFrom)):
+                continue
+            strs = [n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+            if not strs:
                 continue
             if isinstance(node, ast.Assign):
-                consts.update(t.id for t in node.targets if isinstance(t, ast.Name))
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        consts[t.id] = strs
             else:
-                out.update(nums)
+                loose.extend(strs)
+        classes = []
         for node in tree.body:
             if not isinstance(node, ast.ClassDef):
                 continue
             for fn in node.body:
                 if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name == "setUpClass":
-                    names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
-                    if hit(fn) or names & consts:
-                        prefix = "%s::%s::" % (tf, node.name)
-                        out.update(n for n in nums if cov.num_id(n).startswith(prefix))
+                    strs = [n.value for n in ast.walk(fn) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+                    for n in ast.walk(fn):
+                        if isinstance(n, ast.Name) and n.id in consts:
+                            strs.extend(consts[n.id])
+                    prefix = "%s::%s::" % (tf, node.name)
+                    classes.append(([x for x in nums if cov.num_id(x).startswith(prefix)], strs))
+        _SETUP_INDEX.append((nums, loose, classes))
+    return _SETUP_INDEX
+
+
+def class_setup_readers(path, cov):
+    folder = os.path.dirname(path)
+
+    def hit(strs):
+        for v in strs:
+            c = v.strip("/")
+            if c and (path.endswith("/" + c) or folder.endswith("/" + c)):
+                return True
+        return False
+
+    out = set()
+    for nums, loose, classes in _setup_index(cov):
+        if hit(loose):
+            out.update(nums)
+        for cnums, strs in classes:
+            if hit(strs):
+                out.update(cnums)
     return out
 
 
@@ -1064,7 +1087,7 @@ def main():
             heavy, light = set(cands), []
         sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}
         plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000})
-        log(cid, "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4])
+        log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4])
 
     log("planned cpu=%.2f" % time.process_time())
     preimport()
@@ -1073,7 +1096,8 @@ def main():
     if ZYGOTE:
         import zygote
         install_futures()
-        zygote.warm(SRC, sorted({num_to_id[n] for p in plans for n in p["light"]}))
+        warm_ids = sorted({num_to_id[n] for p in plans for n in p["light"]})
+        zygote.warm(SRC, warm_ids, any(t.startswith("tests/test_executor.py::TestExecutor::") for t in warm_ids))
         warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
         code_idx = zygote.code_index()
         zyg = (zygote, warm_lines, code_idx)
@@ -1166,6 +1190,7 @@ def main():
                 top = sorted(job.tcpu.items(), key=lambda kv: -kv[1])[:4]
                 log(p["cid"], "testcpu=%.2f" % sum(job.tcpu.values()), "top", " ".join("%s:%.2f" % (t.split("::")[-1], c) for t, c in top))
                 log(p["cid"], "fail", sorted(fail), "heavy", sorted(p["heavy"]), "cpu=%.2f" % job.cpu, "t=%.1f" % (time.monotonic() - T0))
+    log("loop done cpu=%.2f" % time.process_time())
     for cid in commits:
         workers = split(sorted(results.get(cid, set())), ms)
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")

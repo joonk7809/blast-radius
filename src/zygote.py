@@ -11,7 +11,7 @@ import types
 WARM_OPENED = set()
 
 
-def warm(src, ids):
+def warm(src, ids, prewarm=True):
     sys.path.insert(0, src)
     os.chdir(src)
     import sqlglot
@@ -33,6 +33,8 @@ def warm(src, ids):
             importlib.import_module(mod)
         except Exception:
             pass
+    if not prewarm:
+        return
     real_open = builtins.open
 
     def rec_open(file, *a, **k):
