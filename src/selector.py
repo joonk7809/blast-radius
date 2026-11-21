@@ -22,7 +22,7 @@ PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "1000000"))
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 ZYGOTE = os.environ.get("BR_ZYGOTE", "1") == "1"
-UNITEST = os.environ.get("BR_UNITEST", "0") == "1"
+UNITEST = os.environ.get("BR_UNITEST", "1") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
 FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
@@ -1816,7 +1816,7 @@ def main():
             c = runcpu.get(num_to_id[n], 0)
             if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
                 return c
-            return c * min(1.0, FRAC_K * len(cands[n]) / cov.nunits[n]) + FRAC_C
+            return min(c, c * FRAC_K * len(cands[n]) / cov.nunits[n] + FRAC_C)
 
         heavy = {n for n in cands if n in FORCE_LIST or ms[n] >= HEAVY_MS or (LISTRULE and est(n) * 1000 > ms[n] + 2000)}
         light = sorted(set(cands) - heavy)
