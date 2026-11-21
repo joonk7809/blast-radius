@@ -110,7 +110,15 @@ def swap_plan(src, path, old_text, new_text, changed, warm_lines):
     pairs = []
     if not _pair(oldc, newc, pairs):
         return None
-    return [(o, n) for o, n in pairs[1:] if not (o.co_code == n.co_code and o.co_consts == n.co_consts and o.co_names == n.co_names)]
+    return [(o, n) for o, n in pairs[1:] if not (o.co_code == n.co_code and _key(o.co_consts) == _key(n.co_consts) and o.co_names == n.co_names)]
+
+
+def _key(c):
+    if isinstance(c, types.CodeType):
+        return (c.co_code, _key(c.co_consts), c.co_names)
+    if isinstance(c, (tuple, frozenset)):
+        return (type(c).__name__, tuple(sorted(map(_key, c), key=repr)) if isinstance(c, frozenset) else tuple(map(_key, c)))
+    return (type(c).__name__, repr(c))
 
 
 def apply_swaps(plans, idx):

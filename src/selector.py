@@ -21,6 +21,7 @@ HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "1000000"))
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 ZYGOTE = os.environ.get("BR_ZYGOTE", "1") == "1"
 UNITEST = os.environ.get("BR_UNITEST", "0") == "1"
+GAPS = os.environ.get("BR_GAPS", "1") == "1"
 UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
@@ -297,6 +298,17 @@ class Units:
                     best = (size, first, head_end, runtime, node)
         return best
 
+    def gap_units(self, line):
+        enc = min((s for s in self.spans if s[0] <= line <= s[2]), key=lambda s: s[2] - s[0], default=None)
+        if enc is None or not (enc[3] or isinstance(enc[4], (ast.FunctionDef, ast.AsyncFunctionDef))):
+            return []
+        lo, hi = enc[0], enc[2]
+        inside = [s for s in self.spans if lo <= s[0] and s[2] <= hi and s is not enc]
+        prev = max((s for s in inside if s[2] < line), key=lambda s: s[2], default=None)
+        nxt = min((s for s in inside if s[0] > line), key=lambda s: s[0], default=None)
+        out = [(s[1] - s[0], s[0], s[1], s[3], s[4]) for s in (prev, nxt) if s]
+        return out or [(0, enc[0], enc[1], enc[3], enc[4])]
+
 
 def merge(a, b):
     for n, keys in b.items():
@@ -394,6 +406,7 @@ def candidates_for(f, old_text, new_text, cov, notes):
 
 
 FRACTION_OK = set()
+FORCE_LIST = set()
 _QKEY = re.compile(r"^s:\('(\S+) (\d+)', \[\]\)$")
 
 
@@ -670,6 +683,17 @@ def test_dependents(path, f, old_text, new_text):
     return hit
 
 
+COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+
+
+def _cookie(text):
+    for line in text.split("\n", 2)[:2]:
+        m = COOKIE.match(line)
+        if m:
+            return m[1]
+    return None
+
+
 def _candidates_for(f, old_text, new_text, cov, notes):
     path = f["path"]
     if path.startswith("sqlglot/") and path.endswith(".py"):
@@ -682,6 +706,12 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             except SyntaxError:
                 notes.append("new-unparsable")
                 return full(n for n in cov.idx_to_num if n is not None)
+            if _cookie(new_text) != _cookie(old_text or ""):
+                try:
+                    ast.parse(new_text.encode("utf-8", "surrogateescape"))
+                except (SyntaxError, LookupError, UnicodeError, ValueError):
+                    notes.append("bad-coding")
+                    return full(n for n in cov.idx_to_num if n is not None)
         extra = {}
         if old_text is not None and new_text is not None:
             try:
@@ -711,7 +741,6 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         if old_text is None:
             notes.append("newfile")
             return merge(cov.tests_touching_file(path), full(module_test_files(path, cov)))
-        removed, anchors = changed_old_lines(f["hunks"])
         try:
             units = Units(old_text)
         except SyntaxError:
@@ -719,14 +748,15 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             return merge(cov.tests_touching_file(path), extra)
         out = {}
         importtime = False
-        for ln in sorted(removed | anchors):
-            u = units.unit_for(ln)
-            if u is None:
-                continue
-            _, first, last, runtime, node = u
-            merge(out, cov.tests_for_lines(path, range(first, last + 1)))
-            if not runtime:
-                importtime = True
+        for h in f["hunks"]:
+            hr, ha = changed_old_lines([h])
+            found = {ln: units.unit_for(ln) for ln in sorted(hr | ha)}
+            gap = GAPS and not any(found.values())
+            for ln, u in found.items():
+                for _, first, last, runtime, node in [u] if u else units.gap_units(ln) if gap else ():
+                    merge(out, cov.tests_for_lines(path, range(first, last + 1)))
+                    if not runtime:
+                        importtime = True
         try:
             new_units = Units(new_text)
         except SyntaxError:
@@ -751,6 +781,9 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         if os.path.basename(path).startswith("test_"):
             notes.append("testfile")
             out = set(cov.by_file.get(path, []))
+            if any(tag == "+" and "xfail" in line for h in f["hunks"] for tag, line in h["lines"]):
+                notes.append("xfail")
+                FORCE_LIST.update(out)
             hit = test_dependents(path, f, old_text, new_text)
             if hit:
                 notes.append("test-dependents:%d" % len(hit))
@@ -1277,6 +1310,7 @@ def main():
     for cid in commits:
         text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape").read()
         FRACTION_OK.clear()
+        FORCE_LIST.clear()
         notes = []
         cands = {}
         patched = {}
@@ -1327,7 +1361,7 @@ def main():
                 return c
             return c * min(1.0, FRAC_K * len(cands[n]) / cov.nunits[n]) + FRAC_C
 
-        heavy = {n for n in cands if ms[n] >= HEAVY_MS or (LISTRULE and est(n) * 1000 > ms[n] + 2000)}
+        heavy = {n for n in cands if n in FORCE_LIST or ms[n] >= HEAVY_MS or (LISTRULE and est(n) * 1000 > ms[n] + 2000)}
         light = sorted(set(cands) - heavy)
         blind = split_cost(sorted(cands), ms)
         cap = blind - split_cost(sorted(heavy), ms)
