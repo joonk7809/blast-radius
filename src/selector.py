@@ -57,7 +57,7 @@ def parse_patch(text):
                 pass
         m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
         if m:
-            hunk = {"old_start": int(m.group(1)), "old_len": int(m.group(2) or 1), "lines": []}
+            hunk = {"old_start": int(m.group(1)), "old_len": int(m.group(2) or 1), "new_start": int(m.group(3)), "lines": []}
             cur["hunks"].append(hunk)
             continue
         if hunk is None:
@@ -93,6 +93,19 @@ def apply_file(old_text, hunks):
                 out.append(body)
     out.extend(old[pos:])
     return "".join(out)
+
+
+def added_new_lines(hunks):
+    out = []
+    for h in hunks:
+        ln = h["new_start"]
+        for tag, _ in h["lines"]:
+            if tag == "+":
+                out.append(ln)
+                ln += 1
+            elif tag == " ":
+                ln += 1
+    return out
 
 
 def changed_old_lines(hunks):
@@ -582,6 +595,20 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             merge(out, cov.tests_for_lines(path, range(first, last + 1)))
             if not runtime:
                 importtime = True
+        try:
+            new_units = Units(new_text)
+        except SyntaxError:
+            new_units = None
+        for ln in added_new_lines(f["hunks"]) if new_units is not None else ():
+            u = new_units.unit_for(ln)
+            if u is None or u[3]:
+                continue
+            importtime = True
+            notes.append("newtop:" + path)
+            if not isinstance(u[4], (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign, ast.Import, ast.ImportFrom)) or isinstance(u[4], ast.ClassDef) and u[4].decorator_list:
+                notes.append("toplevel-exec")
+                merge(out, cov.tests_touching_file(path))
+                merge(out, full(module_test_files(path, cov)))
         if importtime:
             notes.append("importtime")
             if not IMPORTT:
@@ -821,6 +848,15 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
         raise Timeout()
 
     signal.signal(signal.SIGALRM, on_alarm)
+    if mode is not None and mode[0] == "reimport" and len(mode) > 2:
+        for modname in mode[2]:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 20.0, 0.5)
+                importlib.import_module(modname)
+            except BaseException:
+                emit("X", modname)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
     if mode is not None and mode[0] == "reimport" and len(mode) > 1 and mode[1]:
         for modname, tids in mode[1].items():
             try:
@@ -1047,6 +1083,8 @@ class Job:
             elif tag == "C":
                 t, c = tid.rsplit(" ", 1)
                 self.tcpu[t] = float(c)
+            elif tag == "X":
+                self.broken = True
             elif tag == "D":
                 pass
 
@@ -1184,14 +1222,19 @@ def main():
             removed, anchors = changed_old_lines(p["hunks"][rel])
             for ln in removed | anchors:
                 mask |= fm.get(str(ln), 0)
+            if "newtop:" + rel in p["notes"]:
+                for v in fm.values():
+                    mask |= v
         mods = imap["modules"]
         chosen = mods if mask == -1 else [m for i, m in enumerate(mods) if mask >> i & 1]
         p["collect"] = {m: mod_tids.get(m, []) for m in chosen} if COLLECT and chosen else None
         if p["collect"]:
             log(p["cid"], "collect", len(chosen))
-    pending = [p for p in plans if p["light"] or p["collect"]]
     for p in plans:
-        if not p["light"] and not p["collect"]:
+        p["probe"] = p["collect"] is not None or "importtime" in p["notes"]
+    pending = [p for p in plans if p["light"] or p["probe"]]
+    for p in plans:
+        if not p["light"] and not p["probe"]:
             results[p["cid"]] = set(p["heavy"])
     pending.sort(key=lambda p: -sum(ms[n] for n in p["light"]))
     running = []
@@ -1211,7 +1254,7 @@ def main():
             budget = sum(timeouts.values()) + 30
             mode = None
             if zyg is not None:
-                mode = ("reimport", p["collect"])
+                mode = ("reimport", p["collect"], [modname_of(r) for r, c in p["patched"].items() if c is not None and p["old"].get(r) is not None and r.startswith("sqlglot/") and r.endswith(".py")])
                 zmod, warm_lines, code_idx = zyg
                 swaps, nonpy, ok = [], [], True
                 for rel, content in p["patched"].items():
@@ -1246,6 +1289,9 @@ def main():
             if job.done:
                 running.remove(p)
                 fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
+                if getattr(job, "broken", False):
+                    log(p["cid"], "patched module does not import")
+                    fail = set(num_to_id)
                 unresolved = job.unresolved()
                 if unresolved:
                     log(p["cid"], "unresolved", len(unresolved), "current", job.current, "exit", getattr(job, "exit", None))
