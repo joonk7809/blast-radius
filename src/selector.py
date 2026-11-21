@@ -24,7 +24,7 @@ UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
-BUDGET_S = float(os.environ.get("BR_BUDGET_S", "150"))
+BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
 T0 = time.monotonic()
 
 
@@ -298,14 +298,17 @@ def candidates_for(f, old_text, new_text, cov, notes):
 def _candidates_for(f, old_text, new_text, cov, notes):
     path = f["path"]
     if path.startswith("sqlglot/") and path.endswith(".py"):
+        if f["deleted"] or (f["old"] and f["old"] != path):
+            notes.append("deleted-or-renamed")
+            return full(n for n in cov.idx_to_num if n is not None)
         if old_text is not None and new_text is not None:
             res = module_resolver(path)
             a, b = strip_ast(old_text, res), strip_ast(new_text, res)
             if a is not None and a == b:
                 notes.append("ast-noop")
                 return set()
-        if old_text is None or f["deleted"]:
-            notes.append("newfile-or-deleted")
+        if old_text is None:
+            notes.append("newfile")
             return merge(cov.tests_touching_file(path), full(module_test_files(path, cov)))
         removed, anchors = changed_old_lines(f["hunks"])
         try:
@@ -762,6 +765,14 @@ class Job:
             elif tag == "D":
                 pass
 
+    def cpu_now(self):
+        try:
+            with open("/proc/%d/stat" % self.pid) as fh:
+                f = fh.read().rsplit(")", 1)[1].split()
+            return (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
+        except (OSError, IndexError, ValueError):
+            return 0.0
+
     def kill(self):
         try:
             os.kill(self.pid, signal.SIGKILL)
@@ -799,7 +810,7 @@ def main():
     log("map loaded cpu=%.2f" % time.process_time())
     runcpu = json.load(open(os.path.join(HERE, "runcpu.json")))
     sys.path.insert(0, HERE)
-    from split import split
+    from split import split, cost as split_cost
 
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
     plans = []
@@ -838,8 +849,13 @@ def main():
 
         heavy = {n for n in cands if ms[n] >= HEAVY_MS or (LISTRULE and est(n) * 1000 > ms[n] + 2000)}
         light = sorted(set(cands) - heavy)
+        blind = split_cost(sorted(cands), ms)
+        cap = blind - split_cost(sorted(heavy), ms)
+        if light and sum(est(n) for n in light) * 1000 >= cap:
+            notes.insert(0, "blind")
+            heavy, light = set(cands), []
         sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}
-        plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel})
+        plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000})
         log(cid, "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4])
 
     log("planned cpu=%.2f" % time.process_time())
@@ -862,10 +878,11 @@ def main():
     pending.sort(key=lambda p: -sum(ms[n] for n in p["light"]))
     running = []
     queue = list(pending)
+    end = T0 + BUDGET_FRAC * min(270.0, 180.0 * max(1.0, len(commits) / 40.0))
     while queue or running:
         while queue and len(running) < PARALLEL:
             p = queue.pop(0)
-            if time.monotonic() - T0 > BUDGET_S:
+            if time.monotonic() > end - 5:
                 results[p["cid"]] = set(p["heavy"]) | set(p["light"])
                 continue
             root = os.path.join(TMP, "ov", p["cid"])
@@ -905,7 +922,8 @@ def main():
             job = p["job"]
             if job.fd in r:
                 job.feed()
-            if not job.done and time.monotonic() > job.deadline:
+            if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
+                log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
                 job.kill()
             if job.done:
                 running.remove(p)

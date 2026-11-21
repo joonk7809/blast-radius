@@ -14,3 +14,8 @@ def split(nums, ms):
         if best is None or cost < best[0]:
             best = (cost, bins)
     return best[1]
+
+
+def cost(nums, ms):
+    bins = split(nums, ms)
+    return max(sum(ms[n] for n in b) for b in bins) + 2000 * len(bins) if bins else 0
