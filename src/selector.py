@@ -229,7 +229,7 @@ def _canon_dump(node, resolve):
 
 
 _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-_FRAME_CALLS = {"locals", "vars", "eval", "exec", "globals"}
+_FRAME_CALLS = {"locals", "vars", "eval", "exec", "globals", "dir", "currentframe"}
 
 
 def _outer_binds(fn):
@@ -254,7 +254,16 @@ def _outer_binds(fn):
         if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)) and n.id not in params and n.id not in order:
             order.append(n.id)
         todo.extend(reversed(list(ast.iter_child_nodes(n))))
-    if nested & set(order):
+    strb = set()
+    for st in fn.body:
+        for x in ast.walk(st):
+            if isinstance(x, (ast.ExceptHandler, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.MatchAs, ast.MatchStar)) and x.name:
+                strb.add(x.name)
+            elif isinstance(x, ast.MatchMapping) and x.rest:
+                strb.add(x.rest)
+            elif isinstance(x, ast.alias):
+                strb.add(x.asname or x.name.split(".")[0])
+    if (nested | strb) & set(order):
         return None
     return {name: "\0L%d" % i for i, name in enumerate(order)}
 
@@ -591,6 +600,9 @@ def query_unit_keys(cov, n, idx, word):
         elif k.startswith("f:") and int(k[2:]) + 1 in idx:
             out.add(k)
     return out
+
+
+_MP_TESTS = {"test_execute_tpcds": "tpc-ds", "test_execute_tpch": "tpc-h"}
 
 
 _SETUP_INDEX = []
@@ -1810,6 +1822,15 @@ def main():
             except Exception as e:
                 notes.append(f"itf-error:{type(e).__name__}")
                 cands = full(num_to_id)
+        for n, keys in cands.items():
+            word = _MP_TESTS.get(num_to_id[n].rsplit("::", 1)[-1])
+            if word and keys:
+                for k in list(keys):
+                    m = _QKEY.match(k)
+                    if k.startswith("f:"):
+                        keys.add("s:%r" % (("%s %d" % (word, int(k[2:]) + 1), []),))
+                    elif m and m.group(1) == word:
+                        keys.add("f:%d" % (int(m.group(2)) - 1))
         if DEBUG_N in cands:
             log(cid, "dbg", DEBUG_N, "keys", None if cands[DEBUG_N] is None else len(cands[DEBUG_N]), "fracok", DEBUG_N in FRACTION_OK, None if cands[DEBUG_N] is None else sorted(cands[DEBUG_N])[:5])
         def est(n):
