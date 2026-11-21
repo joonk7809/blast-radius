@@ -2,3 +2,4 @@ Dockerfile.local
 ca.crt
 output.jsonl
 __pycache__/
+out_*.jsonl*
