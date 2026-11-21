@@ -518,7 +518,24 @@ def _setup_index(cov):
     return _SETUP_INDEX
 
 
-def class_setup_readers(path, cov):
+def fixture_loads(path, text):
+    if text is None or not path.endswith(".sql"):
+        return False
+    try:
+        text.encode("utf-8")
+        if SRC not in sys.path:
+            sys.path.insert(0, SRC)
+        from tests import helpers
+        _pairs(text)
+        lines = []
+        for line in helpers._filter_comments(text).splitlines():
+            lines.append(line)
+        return True
+    except Exception:
+        return False
+
+
+def class_setup_readers(path, cov, narrow=True):
     folder = os.path.dirname(path)
 
     def hit(strs):
@@ -540,7 +557,7 @@ def class_setup_readers(path, cov):
                     attrs |= st_attrs
             if not any_hit:
                 continue
-            if not attrs or not SETUP_ATTRS:
+            if not attrs or not SETUP_ATTRS or not narrow:
                 out.update(cnums)
                 continue
             out.update(x for x in cnums if tattrs[x] is None or tattrs[x] & attrs)
@@ -745,7 +762,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         if path in cov.fixtures:
             notes.append("fixture")
             out = {cov.idx_to_num[i] for i in cov.fixtures[path] if cov.idx_to_num[i] is not None}
-            extra = class_setup_readers(path, cov)
+            extra = class_setup_readers(path, cov, fixture_loads(path, new_text))
             if extra - out:
                 notes.append("setupclass")
             res = full(out | extra)
@@ -797,7 +814,7 @@ def build_overlay(root, patched):
         if os.path.lexists(target):
             os.unlink(target)
         if content is not None:
-            with open(target, "w", encoding="utf-8", newline="") as fh:
+            with open(target, "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
                 fh.write(content)
 
 
@@ -1326,24 +1343,11 @@ def main():
     if STATIC:
         for p in plans:
             sys.stdout.write(json.dumps({"commit": p["cid"], "workers": split(sorted(set(p["light"]) | set(p["heavy"])), ms)}) + "\n")
+            WRITTEN.add(p["cid"])
         sys.stdout.flush()
         return
     if os.environ.get("BR_PLANONLY"):
         return
-    if any(p["light"] for p in plans):
-        preimport()
-    log("preimported cpu=%.2f" % time.process_time())
-    zyg = None
-    if ZYGOTE and any(p["light"] for p in plans):
-        import zygote
-        install_futures()
-        warm_ids = sorted({num_to_id[n] for p in plans for n in p["light"]})
-        zygote.warm(SRC, warm_ids, any(t.startswith("tests/test_executor.py::TestExecutor::") for t in warm_ids))
-        warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
-        code_idx = zygote.code_index()
-        zyg = (zygote, warm_lines, code_idx)
-        log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
-    results = {}
     imap = json.load(gzip.open(os.path.join(HERE, "importmap.json.gz"), "rt"))
     mod_tids = {}
     for n, tid in num_to_id.items():
@@ -1372,6 +1376,20 @@ def main():
             log(p["cid"], "collect", len(chosen))
     for p in plans:
         p["probe"] = p["collect"] is not None or (PROBE and "importtime" in p["notes"])
+    if any(p["light"] or p.get("probe") for p in plans):
+        preimport()
+    log("preimported cpu=%.2f" % time.process_time())
+    zyg = None
+    if ZYGOTE and any(p["light"] or p.get("probe") for p in plans):
+        import zygote
+        install_futures()
+        warm_ids = sorted({num_to_id[n] for p in plans for n in p["light"]})
+        zygote.warm(SRC, warm_ids, any(t.startswith("tests/test_executor.py::TestExecutor::") for t in warm_ids))
+        warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
+        code_idx = zygote.code_index()
+        zyg = (zygote, warm_lines, code_idx)
+        log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
+    results = {}
     pending = [p for p in plans if p["light"] or p["probe"]]
     for p in plans:
         if not p["light"] and not p["probe"]:
@@ -1387,8 +1405,13 @@ def main():
                 results[p["cid"]] = set(p["heavy"]) | set(p["light"])
                 continue
             root = os.path.join(TMP, "ov", p["cid"])
-            rmtree(root)
-            build_overlay(root, p["patched"])
+            try:
+                rmtree(root)
+                build_overlay(root, p["patched"])
+            except Exception as e:
+                log(p["cid"], "overlay failed", repr(e))
+                results[p["cid"]] = set(num_to_id)
+                continue
             ids = [num_to_id[n] for n in p["light"]]
             timeouts = {num_to_id[n]: max(3.0, ms[n] / 1000 * 10 + 2) for n in p["light"]}
             budget = sum(timeouts.values()) + 30
@@ -1449,8 +1472,25 @@ def main():
     for cid in commits:
         workers = split(sorted(results.get(cid, set())), ms)
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
+        WRITTEN.add(cid)
+    sys.stdout.flush()
+
+
+WRITTEN = set()
+
+
+def fallback():
+    tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
+    nums = [t["number"] for t in tests]
+    for p in sorted(os.listdir(os.path.join(DATA, "commits"))):
+        if p.endswith(".patch") and p[:-6] not in WRITTEN:
+            sys.stdout.write(json.dumps({"commit": p[:-6], "workers": [nums[i::8] for i in range(8)]}) + "\n")
     sys.stdout.flush()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as e:
+        log("main failed", repr(e))
+        fallback()
