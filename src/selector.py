@@ -16,6 +16,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MAP_PATH = os.environ.get("BR_MAP", os.path.join(HERE, "covmap.json.gz"))
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "1000000"))
+DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
+ZYGOTE = os.environ.get("BR_ZYGOTE", "1") == "1"
+UNITEST = os.environ.get("BR_UNITEST", "0") == "1"
+UNITS = os.environ.get("BR_UNITS", "1") == "1"
+CANON = os.environ.get("BR_CANON", "1") == "1"
+LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
 BUDGET_S = float(os.environ.get("BR_BUDGET_S", "150"))
 T0 = time.monotonic()
@@ -101,11 +107,35 @@ def changed_old_lines(hunks):
     return removed, anchors
 
 
+def _identity_safe(node):
+    if isinstance(node, ast.Constant) and node.value is None:
+        return True
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr.isupper()
+        and isinstance(node.value, (ast.Name, ast.Attribute))
+        and (node.value.id if isinstance(node.value, ast.Name) else node.value.attr)[:1].isupper()
+    )
+
+
+class _Canon(ast.NodeTransformer):
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and _identity_safe(node.comparators[0]):
+            if isinstance(node.ops[0], ast.Is):
+                node.ops = [ast.Eq()]
+            elif isinstance(node.ops[0], ast.IsNot):
+                node.ops = [ast.NotEq()]
+        return node
+
+
 def strip_ast(text):
     try:
         tree = ast.parse(text)
     except SyntaxError:
         return None
+    if CANON:
+        tree = _Canon().visit(tree)
     return ast.dump(tree, annotate_fields=False, include_attributes=False)
 
 
@@ -144,10 +174,28 @@ class Units:
         return best
 
 
+def merge(a, b):
+    for n, keys in b.items():
+        if n in a:
+            if a[n] is None or keys is None:
+                a[n] = None
+            else:
+                a[n] = a[n] | keys
+        else:
+            a[n] = None if keys is None else set(keys)
+    return a
+
+
+def full(nums):
+    return {n: None for n in nums}
+
+
 class CovMap:
     def __init__(self, path, id_to_num):
         m = json.load(gzip.open(path, "rt"))
         self.idx_to_num = [id_to_num.get(t) for t in m["tests"]]
+        self.units = [(self.idx_to_num[t], k if UNITS else "") for t, k in m.get("units", [[i, ""] for i in range(len(m["tests"]))])]
+        self.nunits = {self.idx_to_num[int(t)]: c for t, c in m.get("nunits", {}).items()}
         self.sets = m["sets"]
         self.files = m["files"]
         self.fixtures = m["fixtures"]
@@ -157,29 +205,38 @@ class CovMap:
             if n is not None:
                 self.by_file.setdefault(t.split("::")[0], []).append(n)
 
+    def _from_units(self, us):
+        out = {}
+        for u in us:
+            n, k = self.units[u]
+            if n is None:
+                continue
+            if not k:
+                out[n] = None
+            elif out.get(n, 0) is not None:
+                out.setdefault(n, set()).add(k)
+        return out
+
     def tests_for_lines(self, path, lines):
         fm = self.files.get(path)
-        out = set()
         if not fm:
-            return out
+            return {}
         lm = fm["lines"]
+        us = set()
         for ln in lines:
             s = lm.get(str(ln))
             if s is not None:
-                out.update(self.sets[s])
-        return {self.idx_to_num[i] for i in out if self.idx_to_num[i] is not None}
+                us.update(self.sets[s])
+        return self._from_units(us)
 
     def tests_touching_file(self, path):
         fm = self.files.get(path)
         if not fm:
-            return set()
-        out = set()
-        seen = set()
-        for s in fm["lines"].values():
-            if s not in seen:
-                seen.add(s)
-                out.update(self.sets[s])
-        return {self.idx_to_num[i] for i in out if self.idx_to_num[i] is not None}
+            return {}
+        us = set()
+        for s in set(fm["lines"].values()):
+            us.update(self.sets[s])
+        return full(self._from_units(us))
 
 
 def module_test_files(path, cov):
@@ -191,6 +248,11 @@ def module_test_files(path, cov):
 
 
 def candidates_for(f, old_text, new_text, cov, notes):
+    r = _candidates_for(f, old_text, new_text, cov, notes)
+    return r if isinstance(r, dict) else full(r)
+
+
+def _candidates_for(f, old_text, new_text, cov, notes):
     path = f["path"]
     if path.startswith("sqlglot/") and path.endswith(".py"):
         if old_text is not None and new_text is not None:
@@ -200,26 +262,27 @@ def candidates_for(f, old_text, new_text, cov, notes):
                 return set()
         if old_text is None or f["deleted"]:
             notes.append("newfile-or-deleted")
-            return cov.tests_touching_file(path) | module_test_files(path, cov)
+            return merge(cov.tests_touching_file(path), full(module_test_files(path, cov)))
         removed, anchors = changed_old_lines(f["hunks"])
         try:
             units = Units(old_text)
         except SyntaxError:
             notes.append("old-unparsable")
             return cov.tests_touching_file(path)
-        out = set()
+        out = {}
         importtime = False
         for ln in sorted(removed | anchors):
             u = units.unit_for(ln)
             if u is None:
                 continue
             _, first, last, runtime, node = u
-            out |= cov.tests_for_lines(path, range(first, last + 1))
+            merge(out, cov.tests_for_lines(path, range(first, last + 1)))
             if not runtime:
                 importtime = True
         if importtime:
             notes.append("importtime")
-            out |= cov.tests_touching_file(path) | module_test_files(path, cov)
+            merge(out, cov.tests_touching_file(path))
+            merge(out, full(module_test_files(path, cov)))
         return out
     if path.startswith("tests/") and path.endswith(".py"):
         if os.path.basename(path).startswith("test_"):
@@ -302,20 +365,50 @@ def preimport():
             pass
 
 
+class LazyFuture:
+    def __init__(self, fn, args, kwargs):
+        self.fn, self.args, self.kwargs = fn, args, kwargs
+        self.state = None
+
+    def _force(self):
+        if self.state is None:
+            try:
+                args, kwargs = pickle.loads(pickle.dumps((self.args, self.kwargs)))
+                self.state = (True, pickle.loads(pickle.dumps(self.fn(*args, **kwargs))))
+            except BaseException as e:
+                self.state = (False, e)
+        return self.state
+
+    def result(self, timeout=None):
+        ok, v = self._force()
+        if ok:
+            return v
+        raise v
+
+    def exception(self, timeout=None):
+        ok, v = self._force()
+        return None if ok else v
+
+    def done(self):
+        return True
+
+    def cancel(self):
+        return False
+
+    def cancelled(self):
+        return False
+
+    def add_done_callback(self, fn):
+        fn(self)
+
+
 class SyncExecutor:
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
         if initializer:
             initializer(*pickle.loads(pickle.dumps(initargs)))
 
     def submit(self, fn, *args, **kwargs):
-        import concurrent.futures
-        fut = concurrent.futures.Future()
-        try:
-            args, kwargs = pickle.loads(pickle.dumps((args, kwargs)))
-            fut.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
-        except BaseException as e:
-            fut.set_exception(e)
-        return fut
+        return LazyFuture(fn, args, kwargs)
 
     def map(self, fn, *iterables, **kw):
         return map(fn, *iterables)
@@ -331,16 +424,66 @@ class SyncExecutor:
         return False
 
 
-def child_run(root, test_ids, timeouts, wfd):
-    import unittest
+def lazy_wait(fs, timeout=None, return_when=None):
     import concurrent.futures
+    return concurrent.futures._base.DoneAndNotDoneFutures(set(fs), set())
+
+
+def lazy_as_completed(fs, timeout=None):
+    return iter(list(fs))
+
+
+def install_futures():
+    import concurrent.futures
+    concurrent.futures.ProcessPoolExecutor = SyncExecutor
+    concurrent.futures.wait = lazy_wait
+    concurrent.futures.as_completed = lazy_as_completed
+
+
+def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
+    if DEBUG:
+        import faulthandler
+        faulthandler.enable()
+    import unittest
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
-    os.dup2(devnull, 2)
-    os.chdir(root)
-    sys.path.insert(0, root)
+    if not DEBUG:
+        os.dup2(devnull, 2)
     os.environ["SKIP_INTEGRATION"] = "0"
-    concurrent.futures.ProcessPoolExecutor = SyncExecutor
+    install_futures()
+    if mode is not None and mode[0] == "swap":
+        import builtins
+        import io
+        import zygote
+        plans = [zygote.swap_plan(SRC, rel, old, new, changed, {}) for rel, old, new, changed in mode[1]]
+        zygote.apply_swaps(plans, mode[2])
+        for m in list(sys.modules.values()):
+            for v in list(vars(m).values()) if m is not None and getattr(m, "__name__", "").startswith("tests") else []:
+                if isinstance(v, type) and vars(v).get("_prewarmed"):
+                    v.setUpClass = classmethod(lambda cls: None)
+                    v.tearDownClass = classmethod(lambda cls: None)
+        redirect = {os.path.join(SRC, rel): os.path.join(root, rel) for rel in mode[3]}
+        if redirect:
+            real_open = builtins.open
+
+            def ropen(file, *a, **k):
+                try:
+                    key = os.path.abspath(os.fspath(file))
+                except TypeError:
+                    return real_open(file, *a, **k)
+                return real_open(redirect.get(key, file), *a, **k)
+
+            builtins.open = ropen
+            io.open = ropen
+        os.chdir(SRC)
+    else:
+        if mode is not None:
+            for m in [m for m in sys.modules if m == "sqlglot" or m.startswith(("sqlglot.", "tests"))]:
+                del sys.modules[m]
+            if SRC in sys.path:
+                sys.path.remove(SRC)
+        os.chdir(root)
+        sys.path.insert(0, root)
     out = os.fdopen(wfd, "w", buffering=1)
 
     def emit(tag, tid):
@@ -372,6 +515,7 @@ def child_run(root, test_ids, timeouts, wfd):
         def startTest(self, test):
             super().startTest(test)
             tid = case_to_id.get(id(test))
+            ustate.update(tid=tid, allowed=sel.get(tid), stack=[], seen={}, fut=0)
             if tid:
                 emit("S", tid)
                 self.t0 = time.process_time()
@@ -399,13 +543,21 @@ def child_run(root, test_ids, timeouts, wfd):
                     emit("F", ctid)
 
         def addError(self, test, err):
+            self._dbg(test, err)
             self._fail(test)
 
         def addFailure(self, test, err):
+            self._dbg(test, err)
             self._fail(test)
+
+        def _dbg(self, test, err):
+            if DEBUG:
+                import traceback
+                sys.stderr.write("DBG %s\n%s\n" % (test, "".join(traceback.format_exception(*err))[-1500:]))
 
         def addSubTest(self, test, subtest, err):
             if err is not None:
+                self._dbg(test, err)
                 self._fail(test)
 
         def addUnexpectedSuccess(self, test):
@@ -413,6 +565,73 @@ def child_run(root, test_ids, timeouts, wfd):
 
     orig_subtest = unittest.TestCase.subTest
     stop = {}
+    ustate = {"tid": None, "allowed": None, "stack": [], "seen": {}, "fut": 0}
+    for tid, keys in sel.items():
+        if keys is not None:
+            closed = set()
+            for k in keys:
+                parts = k.split(">")
+                for i in range(1, len(parts) + 1):
+                    closed.add(">".join(parts[:i]))
+            sel[tid] = closed
+
+    class SkipBody(Exception):
+        pass
+
+    class UnitSub:
+        def __init__(self, case, msg, params):
+            base = repr((None if msg is unittest.case._subtest_msg_sentinel else msg, sorted(params.items())))
+            fullk = ">".join(ustate["stack"] + [base])
+            n = ustate["seen"].get(fullk, 0)
+            ustate["seen"][fullk] = n + 1
+            self.key = "s:" + base + ("#%d" % n if n else "")
+            self.path = ">".join(ustate["stack"] + [self.key])
+            self.skip = ustate["allowed"] is not None and self.path not in ustate["allowed"]
+            self.inner = None if self.skip else orig_subtest(case, msg, **params)
+
+        def __enter__(self):
+            ustate["stack"].append(self.key)
+            if self.skip:
+                sys.settrace(lambda *a: None)
+                frame = sys._getframe(1)
+
+                def tracer(fr, ev, arg):
+                    raise SkipBody()
+
+                frame.f_trace = tracer
+                return None
+            return self.inner.__enter__()
+
+        def __exit__(self, et, ev, tb):
+            ustate["stack"].pop()
+            if self.skip:
+                sys.settrace(None)
+                sys._getframe(1).f_trace = None
+                return et is SkipBody
+            return self.inner.__exit__(et, ev, tb)
+
+    def unit_subtest(self, msg=unittest.case._subtest_msg_sentinel, **params):
+        if stop.get(id(self)):
+            raise StopTest()
+        return UnitSub(self, msg, params)
+
+    def lazy_submit(self, fn, *args, **kwargs):
+        k = ustate["fut"]
+        ustate["fut"] += 1
+        f = LazyFuture(fn, args, kwargs)
+        if ustate["allowed"] is not None and ("f:%d" % k) not in ustate["allowed"]:
+            f.skip_outer = True
+        return f
+
+    SyncExecutor.submit = lazy_submit
+    orig_force = LazyFuture._force
+
+    def force(self):
+        if getattr(self, "skip_outer", False) and not ustate["stack"] and self.state is None:
+            self.state = (True, None)
+        return orig_force(self)
+
+    LazyFuture._force = force
 
     class StopTest(Exception):
         pass
@@ -422,8 +641,11 @@ def child_run(root, test_ids, timeouts, wfd):
             raise StopTest()
         return orig_subtest(self, msg, **params)
 
-    if FAILFAST:
+    if UNITS:
+        unittest.TestCase.subTest = unit_subtest
+    elif FAILFAST:
         unittest.TestCase.subTest = subtest
+    if FAILFAST:
         orig_add_subtest = Result.addSubTest
 
         def add_subtest(self, test, sub, err):
@@ -443,7 +665,7 @@ def child_run(root, test_ids, timeouts, wfd):
 
 
 class Job:
-    def __init__(self, cid, root, tests, timeouts, deadline):
+    def __init__(self, cid, root, tests, timeouts, deadline, sel=None, mode=None):
         self.cid = cid
         self.root = root
         self.tests = tests
@@ -459,7 +681,11 @@ class Job:
         if pid == 0:
             os.close(r)
             try:
-                child_run(root, tests, timeouts, w)
+                child_run(root, tests, timeouts, w, sel or {}, mode)
+            except BaseException:
+                if DEBUG:
+                    import traceback
+                    traceback.print_exc()
             finally:
                 os._exit(1)
         os.close(w)
@@ -503,8 +729,9 @@ class Job:
             pass
         self.cpu = 0.0
         try:
-            _, _, ru = os.wait4(self.pid, 0)
+            _, st, ru = os.wait4(self.pid, 0)
             self.cpu = ru.ru_utime + ru.ru_stime
+            self.exit = st
         except ChildProcessError:
             pass
 
@@ -519,6 +746,7 @@ def main():
     num_to_id = {t["number"]: t["id"] for t in tests}
     ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     cov = CovMap(MAP_PATH, id_to_num)
+    runcpu = json.load(open(os.path.join(HERE, "runcpu.json")))
     sys.path.insert(0, HERE)
     from split import split
 
@@ -527,8 +755,10 @@ def main():
     for cid in commits:
         text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape").read()
         notes = []
-        cands = set()
+        cands = {}
         patched = {}
+        hunks_by = {}
+        old_by = {}
         ok = True
         try:
             files = parse_patch(text)
@@ -540,19 +770,37 @@ def main():
                         old_text = fh.read()
                 new_text = None if f["deleted"] else apply_file(old_text or "", f["hunks"])
                 patched[f["path"]] = new_text
+                hunks_by[f["path"]] = f["hunks"]
+                old_by[f["path"]] = old_text
                 if f["old"] != f["path"]:
                     patched[f["old"]] = None
-                cands |= candidates_for(f, old_text, new_text, cov, notes)
+                merge(cands, candidates_for(f, old_text, new_text, cov, notes))
         except Exception as e:
             ok = False
             notes.append(f"error:{type(e).__name__}:{e}")
-            cands = set(num_to_id)
-        heavy = {n for n in cands if ms[n] >= HEAVY_MS}
-        light = sorted(cands - heavy)
-        plans.append({"cid": cid, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok})
-        log(cid, "cands", len(cands), "heavy", sorted(heavy), "light_ms", sum(ms[n] for n in light), notes[:4])
+            cands = full(num_to_id)
+        def est(n):
+            c = runcpu.get(num_to_id[n], 0)
+            if not UNITEST or cands[n] is None or not cov.nunits.get(n):
+                return c
+            return c * min(1.0, len(cands[n]) / cov.nunits[n])
+
+        heavy = {n for n in cands if ms[n] >= HEAVY_MS or (LISTRULE and est(n) * 1000 > ms[n] + 2000)}
+        light = sorted(set(cands) - heavy)
+        sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}
+        plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel})
+        log(cid, "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4])
 
     preimport()
+    zyg = None
+    if ZYGOTE:
+        import zygote
+        install_futures()
+        zygote.warm(SRC, [t["id"] for t in tests])
+        warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
+        code_idx = zygote.code_index()
+        zyg = (zygote, warm_lines, code_idx)
+        log("zygote warm done t=%.1f" % (time.monotonic() - T0))
     results = {}
     pending = [p for p in plans if p["light"]]
     for p in plans:
@@ -573,7 +821,29 @@ def main():
             ids = [num_to_id[n] for n in p["light"]]
             timeouts = {num_to_id[n]: max(3.0, ms[n] / 1000 * 10 + 2) for n in p["light"]}
             budget = sum(timeouts.values()) + 30
-            p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget)
+            mode = None
+            if zyg is not None:
+                mode = ("reimport",)
+                zmod, warm_lines, code_idx = zyg
+                swaps, nonpy, ok = [], [], True
+                for rel, content in p["patched"].items():
+                    if content is None or p["old"].get(rel) is None:
+                        ok = False
+                    elif rel.endswith(".py"):
+                        removed, anchors = changed_old_lines(p["hunks"][rel])
+                        plan = zmod.swap_plan(SRC, rel, p["old"][rel], content, removed | anchors, warm_lines)
+                        if plan is None:
+                            ok = False
+                        else:
+                            swaps.append((rel, p["old"][rel], content, removed | anchors))
+                    else:
+                        if rel in zmod.WARM_OPENED:
+                            ok = False
+                        nonpy.append(rel)
+                if ok:
+                    mode = ("swap", swaps, code_idx, nonpy)
+                log(p["cid"], "mode", mode[0])
+            p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode)
             p["root"] = root
             running.append(p)
         fds = [p["job"].fd for p in running]
@@ -589,7 +859,7 @@ def main():
                 fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
                 unresolved = job.unresolved()
                 if unresolved:
-                    log(p["cid"], "unresolved", len(unresolved), "current", job.current)
+                    log(p["cid"], "unresolved", len(unresolved), "current", job.current, "exit", getattr(job, "exit", None))
                     fail |= {id_to_num[t] for t in unresolved}
                 results[p["cid"]] = fail | set(p["heavy"])
                 rmtree(p["root"])
