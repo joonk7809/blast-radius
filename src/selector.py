@@ -29,6 +29,7 @@ LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
 LAZYPANDAS = os.environ.get("BR_LAZYPANDAS", "1") == "1"
 STMTSEL = os.environ.get("BR_STMTSEL", "1") == "1"
 ALPHA = os.environ.get("BR_ALPHA", "1") == "1"
+NESTALPHA = os.environ.get("BR_NESTALPHA", "1") == "1"
 LAMBDAS = os.environ.get("BR_LAMBDAS", "1") == "1"
 SHARED = os.environ.get("BR_SHARED", "1") == "1"
 LAZYTABLES = os.environ.get("BR_LAZYTABLES", "1") == "1"
@@ -232,21 +233,28 @@ _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.
 _FRAME_CALLS = {"locals", "vars", "eval", "exec", "globals", "dir", "currentframe"}
 
 
+def _frame_call(n):
+    return isinstance(n, ast.Call) and (isinstance(n.func, ast.Name) and n.func.id in _FRAME_CALLS or isinstance(n.func, ast.Attribute) and n.func.attr == "_getframe")
+
+
 def _outer_binds(fn):
     params = {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)}
-    order, nested = [], set()
+    order, nested, decl = [], set(), set()
     todo = list(reversed(fn.body))
     while todo:
         n = todo.pop()
-        if isinstance(n, (ast.Global, ast.Nonlocal, ast.ClassDef)):
-            return None
-        if isinstance(n, ast.Call) and (isinstance(n.func, ast.Name) and n.func.id in _FRAME_CALLS or isinstance(n.func, ast.Attribute) and n.func.attr == "_getframe"):
+        if isinstance(n, (ast.Global, ast.Nonlocal)) and NESTALPHA:
+            decl.update(n.names)
+            continue
+        if isinstance(n, (ast.Global, ast.Nonlocal, ast.ClassDef)) or _frame_call(n):
             return None
         if isinstance(n, _SCOPES):
             for x in ast.walk(n):
-                if isinstance(x, (ast.Global, ast.Nonlocal, ast.ClassDef)) and x is not n or isinstance(n, ast.ClassDef):
+                if isinstance(x, (ast.Global, ast.Nonlocal)) and NESTALPHA:
+                    decl.update(x.names)
+                elif isinstance(x, (ast.Global, ast.Nonlocal, ast.ClassDef)) and x is not n or isinstance(n, ast.ClassDef) or NESTALPHA and _frame_call(x):
                     return None
-                if isinstance(x, ast.arg):
+                elif isinstance(x, ast.arg):
                     nested.add(x.arg)
                 elif isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):
                     nested.add(x.id)
@@ -254,8 +262,15 @@ def _outer_binds(fn):
         if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)) and n.id not in params and n.id not in order:
             order.append(n.id)
         todo.extend(reversed(list(ast.iter_child_nodes(n))))
+    order = [x for x in order if x not in decl]
+    if (nested | _string_binds(fn.body)) & set(order):
+        return None
+    return {name: "\0L%d" % i for i, name in enumerate(order)}, decl
+
+
+def _string_binds(body):
     strb = set()
-    for st in fn.body:
+    for st in body:
         for x in ast.walk(st):
             if isinstance(x, (ast.ExceptHandler, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.MatchAs, ast.MatchStar)) and x.name:
                 strb.add(x.name)
@@ -263,24 +278,47 @@ def _outer_binds(fn):
                 strb.add(x.rest)
             elif isinstance(x, ast.alias):
                 strb.add(x.asname or x.name.split(".")[0])
-    if (nested | strb) & set(order):
-        return None
-    return {name: "\0L%d" % i for i, name in enumerate(order)}
+    return strb
+
+
+def _inner_hits(g, k, decl):
+    params = {a.arg for a in ast.walk(g.args) if isinstance(a, ast.arg)}
+    order, inner, own = [], set(), []
+    todo = list(reversed(g.body))
+    while todo:
+        n = todo.pop()
+        if isinstance(n, _SCOPES):
+            inner.update(x.id if isinstance(x, ast.Name) else x.arg for x in ast.walk(n) if isinstance(x, (ast.Name, ast.arg)))
+            continue
+        if isinstance(n, ast.Name):
+            own.append(n)
+            if isinstance(n.ctx, (ast.Store, ast.Del)) and n.id not in params and n.id not in order:
+                order.append(n.id)
+        todo.extend(reversed(list(ast.iter_child_nodes(n))))
+    blocked = inner | decl | _string_binds(g.body)
+    ren = {x: "\0N%d_%d" % (k, i) for i, x in enumerate(x for x in order if x not in blocked)}
+    return [(n, ren[n.id]) for n in own if n.id in ren]
 
 
 def _alpha_dump(fn, resolve):
-    names = _outer_binds(fn)
-    if not names:
+    binds = _outer_binds(fn)
+    if binds is None:
         return None
-    hits = [n for st in fn.body for n in ast.walk(st) if isinstance(n, ast.Name) and n.id in names]
-    for n in hits:
-        n.id = names[n.id]
+    names, decl = binds
+    hits = [(n, names[n.id]) for st in fn.body for n in ast.walk(st) if isinstance(n, ast.Name) and n.id in names]
+    if NESTALPHA:
+        for k, g in enumerate(x for st in fn.body for x in ast.walk(st) if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            hits += _inner_hits(g, k, decl)
+    if not hits:
+        return None
+    back = [n.id for n, _ in hits]
+    for n, new in hits:
+        n.id = new
     try:
         return _canon_dump(fn, resolve)
     finally:
-        back = {v: k for k, v in names.items()}
-        for n in hits:
-            n.id = back[n.id]
+        for (n, _), b in zip(hits, back):
+            n.id = b
 
 
 def _class_head(node, resolve):
