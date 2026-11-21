@@ -4,6 +4,7 @@ import enum
 import gzip
 import importlib
 import json
+import marshal
 import os
 import pickle
 import re
@@ -34,6 +35,8 @@ LAMBDAS = os.environ.get("BR_LAMBDAS", "1") == "1"
 SHARED = os.environ.get("BR_SHARED", "1") == "1"
 LAZYTABLES = os.environ.get("BR_LAZYTABLES", "1") == "1"
 TPCQ2 = os.environ.get("BR_TPCQ2", "1") == "1"
+TPCREF = os.environ.get("BR_TPCREF", "1") == "1"
+TPCWARM = os.environ.get("BR_TPCWARM", "0") == "1"
 GCFREEZE = os.environ.get("BR_GCFREEZE", "0") == "1"
 LAZYEXEC = os.environ.get("BR_LAZYEXEC", "1") == "1"
 LAZYUNITS = os.environ.get("BR_LAZYUNITS", "1") == "1"
@@ -1368,8 +1371,41 @@ class LazyTables(dict):
         return (LazyTables, (self.kind, None, None, list(self.items())))
 
 
+def build_tpc_cache(path):
+    sys.path.insert(0, SRC)
+    os.chdir(SRC)
+    import tests.test_executor as te
+    te.TestExecutor.setUpClass()
+    k = te.TestExecutor
+    ref = {}
+    for kind, conn, sqls, tables in (("h", k.tpch_conn, k.tpch_sqls, k.tpch_tables), ("ds", k.tpcds_conn, k.tpcds_sqls, k.tpcds_tables)):
+        for name, table in tables.items():
+            with open(os.path.join(path, "%s.%s.m" % (kind, name)), "wb") as fh:
+                marshal.dump(table.rows, fh)
+        out = ref[kind] = {}
+        for _, sql, optimized in sqls:
+            for q in (sql, optimized) if kind == "h" else (sql,):
+                d = te.transpile(q, write="duckdb")[0]
+                try:
+                    a, b = conn.execute(d).fetchdf(), conn.execute(d).fetchdf()
+                except Exception:
+                    continue
+                blob = pickle.dumps(a)
+                if a.equals(b) and blob == pickle.dumps(b):
+                    out[d] = blob
+    with open(os.path.join(path, "ref.pkl"), "wb") as fh:
+        pickle.dump(ref, fh)
+
+
 def _tpc_table(directory, table, columns):
     te = sys.modules["tests.test_executor"]
+    kind = "h" if directory == te.DIR_TPCH else "ds"
+    if TPCREF:
+        try:
+            with open(os.path.join(HERE, "tpc", "%s.%s.m" % (kind, table)), "rb") as fh:
+                return te.Table(columns=columns, rows=marshal.loads(fh.read()))
+        except OSError:
+            pass
     file_name = f"{directory}{table}.csv.gz"
     reader = te.csv.reader(te.open_file(file_name), delimiter="|")
     rows = []
@@ -1386,20 +1422,60 @@ def _tpc_table(directory, table, columns):
     return te.Table(columns=columns, rows=rows)
 
 
+class RefConn:
+    def __init__(self, kind, directory, schema):
+        self.kind, self.directory, self.schema = kind, directory, schema
+        self.conn = None
+
+    def execute(self, sql, *a):
+        if TPCREF and not a:
+            blob = _tpc_ref().get(self.kind, {}).get(sql)
+            if blob is not None:
+                return RefResult(blob)
+        if self.conn is None:
+            te = sys.modules["tests.test_executor"]
+            self.conn = te.duckdb.connect()
+            for table, columns in self.schema.items():
+                file_name = f"{self.directory}{table}.csv.gz"
+                self.conn.execute(
+                    f"""
+                    CREATE VIEW {table} AS
+                    SELECT *
+                    FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                    """
+                )
+        return self.conn.execute(sql, *a)
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+
+
+class RefResult:
+    def __init__(self, blob):
+        self.blob = blob
+
+    def fetchdf(self):
+        return pickle.loads(self.blob)
+
+
+_REF = []
+
+
+def _tpc_ref():
+    if not _REF:
+        try:
+            with open(os.path.join(HERE, "tpc", "ref.pkl"), "rb") as fh:
+                _REF.append(pickle.load(fh))
+        except OSError:
+            _REF.append({})
+    return _REF[0]
+
+
 def _lazy_tpc_setup(cls):
     te = sys.modules[cls.__module__]
-    cls.tpch_conn = te.duckdb.connect()
-    cls.tpcds_conn = te.duckdb.connect()
-    for conn, directory, schema in ((cls.tpch_conn, te.DIR_TPCH, te.TPCH_SCHEMA), (cls.tpcds_conn, te.DIR_TPCDS, te.TPCDS_SCHEMA)):
-        for table, columns in schema.items():
-            file_name = f"{directory}{table}.csv.gz"
-            conn.execute(
-                f"""
-                CREATE VIEW {table} AS
-                SELECT *
-                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
-                """
-            )
+    cls.tpch_conn = RefConn("h", te.DIR_TPCH, te.TPCH_SCHEMA)
+    cls.tpcds_conn = RefConn("ds", te.DIR_TPCDS, te.TPCDS_SCHEMA)
     cls.tpch_tables = LazyTables("h", te.DIR_TPCH, te.TPCH_SCHEMA)
     cls.tpcds_tables = LazyTables("ds", te.DIR_TPCDS, te.TPCDS_SCHEMA)
     cls.cache = {}
@@ -1958,7 +2034,7 @@ def main():
             return not LAZYEXEC or r is None or bool(r & table_attrs)
 
         exec_commits = sum(1 for p in plans if any(needs_tables(n) for n in p["light"]))
-        zygote.warm(SRC, warm_ids, exec_commits >= (3 if LAZYTABLES else 2 if LAZYEXEC or LEANIMP else 1))
+        zygote.warm(SRC, warm_ids, (TPCWARM or not (TPCREF and LAZYTABLES)) and exec_commits >= (3 if LAZYTABLES else 2 if LAZYEXEC or LEANIMP else 1))
         warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
         code_idx = zygote.code_index({os.path.join(SRC, r) for p in plans for r in p["patched"] if r.endswith(".py")})
         zyg = (zygote, warm_lines, code_idx)
