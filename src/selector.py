@@ -28,6 +28,7 @@ FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
 LAZYPANDAS = os.environ.get("BR_LAZYPANDAS", "1") == "1"
 STMTSEL = os.environ.get("BR_STMTSEL", "1") == "1"
+LAMBDAS = os.environ.get("BR_LAMBDAS", "1") == "1"
 SHARED = os.environ.get("BR_SHARED", "1") == "1"
 LAZYTABLES = os.environ.get("BR_LAZYTABLES", "1") == "1"
 TPCQ2 = os.environ.get("BR_TPCQ2", "1") == "1"
@@ -335,6 +336,40 @@ class Units:
         nxt = min((s for s in inside if s[0] > line), key=lambda s: s[0], default=None)
         out = [(s[1] - s[0], s[0], s[1], s[3], s[4]) for s in (prev, nxt) if s]
         return out or [(0, enc[0], enc[1], enc[3], enc[4])]
+
+
+def _strip(node):
+    if isinstance(node, ast.Lambda):
+        return ("Lambda", _strip(node.args))
+    if isinstance(node, ast.AST):
+        return (type(node).__name__,) + tuple(_strip(getattr(node, k, None)) for k in node._fields)
+    if isinstance(node, list):
+        return tuple(map(_strip, node))
+    return (type(node).__name__, node)
+
+
+def _enclosing_stmt(units, ln):
+    return min((sp for sp in units.spans if isinstance(sp[4], ast.stmt) and sp[0] <= ln <= sp[2]), key=lambda sp: sp[2] - sp[0], default=(0, 0, 0, 0, None))[4]
+
+
+def lambda_only(old_units, new_units, hunks):
+    olds, news = {}, {}
+    for h in hunks:
+        hr, ha = changed_old_lines([h])
+        for units, lines, acc in ((old_units, hr or ha, olds), (new_units, added_new_lines([h]), news)):
+            for ln in lines:
+                u = units.unit_for(ln)
+                if u is None or u[3]:
+                    continue
+                if not isinstance(u[4], ast.Lambda):
+                    return False
+                st = _enclosing_stmt(units, ln)
+                if st is None:
+                    return False
+                acc[id(st)] = st
+    if not olds or len(olds) != len(news):
+        return False
+    return all(_strip(a) == _strip(b) for a, b in zip(sorted(olds.values(), key=lambda n: n.lineno), sorted(news.values(), key=lambda n: n.lineno)))
 
 
 def merge(a, b):
@@ -913,6 +948,13 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             return merge(cov.tests_touching_file(path), extra)
         out = {}
         importtime = False
+        try:
+            new_units = Units(new_text, added_new_lines(f["hunks"]))
+        except SyntaxError:
+            new_units = None
+        lam = LAMBDAS and new_units is not None and lambda_only(units, new_units, f["hunks"])
+        if lam:
+            notes.append("lambda-only")
         for h in f["hunks"]:
             hr, ha = changed_old_lines([h])
             found = {ln: units.unit_for(ln) for ln in sorted(hr | ha)}
@@ -920,15 +962,11 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             for ln, u in found.items():
                 for _, first, last, runtime, node in [u] if u else units.gap_units(ln) if gap else ():
                     merge(out, cov.tests_for_lines(path, range(first, last + 1)))
-                    if not runtime:
+                    if not runtime and not (lam and isinstance(node, ast.Lambda)):
                         importtime = True
-        try:
-            new_units = Units(new_text, added_new_lines(f["hunks"]))
-        except SyntaxError:
-            new_units = None
         for ln in added_new_lines(f["hunks"]) if new_units is not None else ():
             u = new_units.unit_for(ln)
-            if u is None or u[3]:
+            if u is None or u[3] or lam and isinstance(u[4], ast.Lambda):
                 continue
             importtime = True
             notes.append("newtop:" + path)
