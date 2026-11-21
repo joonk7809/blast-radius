@@ -6,6 +6,8 @@ RUN python -c "import io,tarfile,urllib.request;tarfile.open(fileobj=io.BytesIO(
  && cd /sqlglot && python -m compileall -q sqlglot tests >/dev/null \
  && chmod -R a+rX /sqlglot
 COPY src /app
-RUN chmod -R a+rX /app
+RUN python -c "import gzip,lzma,shutil;shutil.copyfileobj(lzma.open('/app/covsets.bin.xz'),open('/app/covsets.bin','wb'));shutil.copyfileobj(gzip.open('/app/covmeta.json.gz'),open('/app/covmeta.json','wb'))" \
+ && rm /app/covsets.bin.xz /app/covmeta.json.gz \
+ && chmod -R a+rX /app
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector.py"]

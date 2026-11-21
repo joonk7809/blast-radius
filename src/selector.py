@@ -533,10 +533,13 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
     def emit(tag, tid):
         out.write(f"{tag} {tid}\n")
 
-    class Timeout(Exception):
+    class Timeout(BaseException):
         pass
 
+    hung = []
+
     def on_alarm(signum, frame):
+        hung.append(1)
         raise Timeout()
 
     signal.signal(signal.SIGALRM, on_alarm)
@@ -563,7 +566,7 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             if tid:
                 emit("S", tid)
                 self.t0 = time.process_time()
-                signal.setitimer(signal.ITIMER_REAL, timeouts.get(tid, 10.0))
+                signal.setitimer(signal.ITIMER_REAL, timeouts.get(tid, 10.0), 0.5)
 
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -571,6 +574,9 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             if tid:
                 emit("F" if tid in failed else "P", tid)
                 emit("C", "%s %.3f" % (tid, time.process_time() - getattr(self, "t0", time.process_time())))
+                if hung:
+                    out.flush()
+                    os._exit(0)
             super().stopTest(test)
 
         def _fail(self, test):

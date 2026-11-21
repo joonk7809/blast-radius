@@ -3,3 +3,6 @@ ca.crt
 output.jsonl
 __pycache__/
 out_*.jsonl*
+maps/
+src/covsets.bin
+src/covmeta.json
