@@ -38,6 +38,7 @@ TPCQ2 = os.environ.get("BR_TPCQ2", "1") == "1"
 TPCREF = os.environ.get("BR_TPCREF", "1") == "1"
 TPCWARM = os.environ.get("BR_TPCWARM", "0") == "1"
 TPCPARSE = os.environ.get("BR_TPCPARSE", "1") == "1"
+UNITCOST = os.environ.get("BR_UNITCOST", "1") == "1"
 GCFREEZE = os.environ.get("BR_GCFREEZE", "0") == "1"
 LAZYEXEC = os.environ.get("BR_LAZYEXEC", "1") == "1"
 LAZYUNITS = os.environ.get("BR_LAZYUNITS", "1") == "1"
@@ -732,6 +733,10 @@ def _setup_index(cov):
             classes.append((cnums, stmts, tattrs))
         _SETUP_INDEX.append((nums, loose, classes))
     return _SETUP_INDEX
+
+
+def tpc_lazy(patched):
+    return LAZYEXEC and not any(r in ("tests/helpers.py", "sqlglot/executor/table.py", "tests/test_executor.py") or "/tpc-" in r and not (LAZYTABLES and r.endswith(".sql") and fixture_loads(r, c)) for r, c in patched.items())
 
 
 def fixture_loads(path, text):
@@ -1956,6 +1961,7 @@ def main():
     cov = CovMap(MAP_PATH, id_to_num)
     log("map loaded cpu=%.2f" % time.process_time())
     runcpu = json.load(open(os.path.join(HERE, "runcpu.json")))
+    unitcpu = json.load(open(os.path.join(HERE, "unitcpu.json"))) if UNITCOST else {"full": {}, "units": {}}
     sys.path.insert(0, HERE)
     from split import split, cost as split_cost
 
@@ -2020,10 +2026,15 @@ def main():
                         keys.add("f:%d" % (int(m.group(2)) - 1))
         if DEBUG_N in cands:
             log(cid, "dbg", DEBUG_N, "keys", None if cands[DEBUG_N] is None else len(cands[DEBUG_N]), "fracok", DEBUG_N in FRACTION_OK, None if cands[DEBUG_N] is None else sorted(cands[DEBUG_N])[:5])
+        cached = TPCREF and LAZYTABLES and tpc_lazy(patched)
+
         def est(n):
-            c = runcpu.get(num_to_id[n], 0)
+            c = unitcpu["full"].get(num_to_id[n], runcpu.get(num_to_id[n], 0)) if cached else runcpu.get(num_to_id[n], 0)
             if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
                 return c
+            u = cached and unitcpu["units"].get(num_to_id[n])
+            if u:
+                return min(c, FRAC_K * sum(u.get(k, 0) for k in cands[n]) + FRAC_C)
             return min(c, c * FRAC_K * len(cands[n]) / cov.nunits[n] + FRAC_C)
 
         heavy = {n for n in cands if n in FORCE_LIST or ms[n] >= HEAVY_MS or (LISTRULE and est(n) * 1000 > ms[n] + 2000)}
@@ -2170,7 +2181,7 @@ def main():
                 log(p["cid"], "mode", mode[0])
             global CHILD_LAZY, CHILD_PATCHED
             CHILD_PATCHED = list(p["patched"])
-            CHILD_LAZY = LAZYEXEC and not any(r in ("tests/helpers.py", "sqlglot/executor/table.py", "tests/test_executor.py") or "/tpc-" in r and not (LAZYTABLES and r.endswith(".sql") and fixture_loads(r, c)) for r, c in p["patched"].items())
+            CHILD_LAZY = tpc_lazy(p["patched"])
             p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode)
             p["root"] = root
             running.append(p)
