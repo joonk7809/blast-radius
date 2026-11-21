@@ -1,5 +1,6 @@
 import ast
-import gzip
+import enum
+import importlib
 import json
 import os
 import pickle
@@ -107,35 +108,65 @@ def changed_old_lines(hunks):
     return removed, anchors
 
 
-def _identity_safe(node):
+def _dotted(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return parts[::-1]
+
+
+def _identity_safe(node, resolve):
     if isinstance(node, ast.Constant) and node.value is None:
         return True
-    return (
-        isinstance(node, ast.Attribute)
-        and node.attr.isupper()
-        and isinstance(node.value, (ast.Name, ast.Attribute))
-        and (node.value.id if isinstance(node.value, ast.Name) else node.value.attr)[:1].isupper()
-    )
+    names = _dotted(node) if isinstance(node, ast.Attribute) else None
+    if not names or resolve is None:
+        return False
+    obj = resolve(names)
+    return isinstance(obj, enum.Enum) and type(obj).__eq__ is object.__eq__
 
 
 class _Canon(ast.NodeTransformer):
+    def __init__(self, resolve):
+        self.resolve = resolve
+
     def visit_Compare(self, node):
         self.generic_visit(node)
-        if len(node.ops) == 1 and _identity_safe(node.comparators[0]):
-            if isinstance(node.ops[0], ast.Is):
-                node.ops = [ast.Eq()]
-            elif isinstance(node.ops[0], ast.IsNot):
-                node.ops = [ast.NotEq()]
+        if len(node.ops) == 1 and isinstance(node.ops[0], (ast.Is, ast.IsNot)) and _identity_safe(node.comparators[0], self.resolve):
+            node.ops = [ast.Eq() if isinstance(node.ops[0], ast.Is) else ast.NotEq()]
         return node
 
 
-def strip_ast(text):
+def module_resolver(path):
+    name = path[:-3].replace("/", ".")
+    if name.endswith(".__init__"):
+        name = name[:-9]
+    miss = object()
+
+    def resolve(names):
+        if SRC not in sys.path:
+            sys.path.insert(0, SRC)
+        try:
+            obj = vars(importlib.import_module(name)).get(names[0], miss)
+            for a in names[1:]:
+                obj = getattr(obj, a, miss)
+            return obj
+        except Exception:
+            return miss
+
+    return resolve
+
+
+def strip_ast(text, resolve=None):
     try:
         tree = ast.parse(text)
     except SyntaxError:
         return None
     if CANON:
-        tree = _Canon().visit(tree)
+        tree = _Canon(resolve).visit(tree)
     return ast.dump(tree, annotate_fields=False, include_attributes=False)
 
 
@@ -268,7 +299,8 @@ def _candidates_for(f, old_text, new_text, cov, notes):
     path = f["path"]
     if path.startswith("sqlglot/") and path.endswith(".py"):
         if old_text is not None and new_text is not None:
-            a, b = strip_ast(old_text), strip_ast(new_text)
+            res = module_resolver(path)
+            a, b = strip_ast(old_text, res), strip_ast(new_text, res)
             if a is not None and a == b:
                 notes.append("ast-noop")
                 return set()
