@@ -61,10 +61,11 @@ def warm(src, ids, prewarm=True):
         io.open = real_open
 
 
-def code_index():
+def code_index(files):
     idx = {}
+    fn_type = types.FunctionType
     for o in gc.get_objects():
-        if isinstance(o, types.FunctionType):
+        if type(o) is fn_type and o.__code__.co_filename in files:
             c = o.__code__
             idx.setdefault((c.co_filename, c.co_qualname, c.co_firstlineno), []).append(o)
     return idx

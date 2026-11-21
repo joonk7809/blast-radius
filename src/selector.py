@@ -1850,7 +1850,7 @@ def main():
         exec_commits = sum(1 for p in plans if any(needs_tables(n) for n in p["light"]))
         zygote.warm(SRC, warm_ids, exec_commits >= (3 if LAZYTABLES else 2 if LAZYEXEC or LEANIMP else 1))
         warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
-        code_idx = zygote.code_index()
+        code_idx = zygote.code_index({os.path.join(SRC, r) for p in plans for r in p["patched"] if r.endswith(".py")})
         zyg = (zygote, warm_lines, code_idx)
         if GCFREEZE:
             import gc
