@@ -796,7 +796,7 @@ def main():
     if ZYGOTE:
         import zygote
         install_futures()
-        zygote.warm(SRC, [t["id"] for t in tests])
+        zygote.warm(SRC, sorted({num_to_id[n] for p in plans for n in p["light"]}))
         warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
         code_idx = zygote.code_index()
         zyg = (zygote, warm_lines, code_idx)
