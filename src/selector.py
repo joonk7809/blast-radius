@@ -1,4 +1,5 @@
 import ast
+import bisect
 import enum
 import gzip
 import importlib
@@ -23,7 +24,8 @@ ZYGOTE = os.environ.get("BR_ZYGOTE", "1") == "1"
 UNITEST = os.environ.get("BR_UNITEST", "0") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
 FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
-LEANIMP = os.environ.get("BR_LEANIMP", "1") == "1"
+LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
+LAZYUNITS = os.environ.get("BR_LAZYUNITS", "1") == "1"
 DEBUG_N = int(os.environ.get("BR_DEBUG_N", "-1"))
 UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
@@ -164,10 +166,12 @@ def _identity_safe(node, resolve):
 class _Canon(ast.NodeTransformer):
     def __init__(self, resolve):
         self.resolve = resolve
+        self.undo = []
 
     def visit_Compare(self, node):
         self.generic_visit(node)
         if len(node.ops) == 1 and isinstance(node.ops[0], (ast.Is, ast.IsNot)) and _identity_safe(node.comparators[0], self.resolve):
+            self.undo.append((node, node.ops))
             node.ops = [ast.Eq() if isinstance(node.ops[0], ast.Is) else ast.NotEq()]
         return node
 
@@ -203,11 +207,15 @@ def parse_cached(text):
 
 
 def _canon_dump(node, resolve):
-    import copy
-    node = copy.deepcopy(node)
-    if CANON:
-        node = _Canon(resolve).visit(node)
-    return ast.dump(node, annotate_fields=False, include_attributes=False)
+    if not CANON:
+        return ast.dump(node, annotate_fields=False, include_attributes=False)
+    canon = _Canon(resolve)
+    try:
+        canon.visit(node)
+        return ast.dump(node, annotate_fields=False, include_attributes=False)
+    finally:
+        for n, ops in reversed(canon.undo):
+            n.ops = ops
 
 
 def _class_head(node, resolve):
@@ -268,10 +276,17 @@ def strip_ast(text, resolve=None):
 
 
 class Units:
-    def __init__(self, text):
+    def __init__(self, text, lines=None):
         self.tree = parse_cached(text)
         self.spans = []
+        self.lines = None if lines is None or not LAZYUNITS else sorted(lines)
         self._walk(self.tree, False, [])
+
+    def _wanted(self, first, last):
+        if self.lines is None:
+            return True
+        i = bisect.bisect_left(self.lines, first)
+        return i < len(self.lines) and self.lines[i] <= last
 
     def _walk(self, node, runtime, stack):
         for child in ast.iter_child_nodes(node):
@@ -279,16 +294,17 @@ class Units:
                 is_fn = isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
                 head_end = child.end_lineno
                 body = getattr(child, "body", None)
+                first = child.lineno
                 if isinstance(body, list) and body and isinstance(child, ast.stmt):
                     head_end = max(child.lineno, body[0].lineno - 1)
-                    first = child.lineno
                     for d in getattr(child, "decorator_list", []):
                         first = min(first, d.lineno)
                     self.spans.append((first, head_end, child.end_lineno, runtime, child))
                 else:
                     self.spans.append((child.lineno, child.end_lineno, child.end_lineno, runtime, child))
-                self._walk(child, runtime or is_fn, stack)
-            else:
+                if self._wanted(first, child.end_lineno):
+                    self._walk(child, runtime or is_fn, stack)
+            elif self.lines is None or not hasattr(child, "lineno") or self._wanted(child.lineno, child.end_lineno or child.lineno):
                 self._walk(child, runtime, stack)
 
     def unit_for(self, line):
@@ -406,7 +422,7 @@ def module_test_files(path, cov):
 def candidates_for(f, old_text, new_text, cov, notes):
     r = _candidates_for(f, old_text, new_text, cov, notes)
     r = r if isinstance(r, dict) else full(r)
-    if FIXLIST and f["path"].startswith("tests/") and not f["path"].endswith(".py"):
+    if FIXLIST and f["path"].startswith("tests/") and not f["path"].endswith(".py") and "/tpc-" not in f["path"]:
         FORCE_LIST.update(n for n in r if n not in FRACTION_OK)
     return r
 
@@ -471,65 +487,83 @@ def query_unit_keys(cov, n, idx, word):
 _SETUP_INDEX = []
 
 
+def _setup_raw(tf):
+    entry = _read_tree(os.path.join(SRC, tf))
+    if entry[1] is None:
+        try:
+            entry[1] = ast.parse(entry[0])
+        except SyntaxError:
+            entry[1] = False
+    tree = entry[1]
+    if tree is False:
+        return None
+    consts, loose = {}, []
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Import, ast.ImportFrom)):
+            continue
+        strs = [n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+        if not strs:
+            continue
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    consts[t.id] = strs
+        else:
+            loose.extend(strs)
+    classes = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        methods = {fn.name: fn for fn in node.body if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        setup = methods.get("setUpClass")
+        if setup is None:
+            continue
+        stmts = []
+        for st in setup.body:
+            strs = [n.value for n in ast.walk(st) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+            for n in ast.walk(st):
+                if isinstance(n, ast.Name) and n.id in consts:
+                    strs.extend(consts[n.id])
+            attrs = {n.attr for n in ast.walk(st) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "cls"}
+            stmts.append((strs, attrs))
+        direct = {name: {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self"} for name, fn in methods.items()}
+        reach = {}
+        for name in methods:
+            seen, todo, acc = {name}, [name], set()
+            while todo:
+                m = todo.pop()
+                for a in direct[m]:
+                    acc.add(a)
+                    if a in methods and a not in seen:
+                        seen.add(a)
+                        todo.append(a)
+            reach[name] = acc
+        classes.append((node.name, stmts, reach))
+    return loose, classes
+
+
+def build_setup_cache(path, files):
+    with open(path, "wb") as fh:
+        pickle.dump({tf: _setup_raw(tf) for tf in files}, fh)
+
+
 def _setup_index(cov):
     if _SETUP_INDEX:
         return _SETUP_INDEX
+    cache = {}
+    try:
+        with open(os.path.join(HERE, "setupidx.pkl"), "rb") as fh:
+            cache = pickle.load(fh)
+    except OSError:
+        pass
     for tf, nums in cov.by_file.items():
-        entry = _read_tree(os.path.join(SRC, tf))
-        if entry[1] is None:
-            try:
-                entry[1] = ast.parse(entry[0])
-            except SyntaxError:
-                entry[1] = False
-        tree = entry[1]
-        if tree is False:
+        raw = cache[tf] if tf in cache else _setup_raw(tf)
+        if raw is None:
             continue
-        consts, loose = {}, []
-        for node in tree.body:
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Import, ast.ImportFrom)):
-                continue
-            strs = [n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-            if not strs:
-                continue
-            if isinstance(node, ast.Assign):
-                for t in node.targets:
-                    if isinstance(t, ast.Name):
-                        consts[t.id] = strs
-            else:
-                loose.extend(strs)
+        loose, raw_classes = raw
         classes = []
-        for node in tree.body:
-            if not isinstance(node, ast.ClassDef):
-                continue
-            methods = {fn.name: fn for fn in node.body if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))}
-            setup = methods.get("setUpClass")
-            if setup is None:
-                continue
-            stmts = []
-            for st in setup.body:
-                strs = [n.value for n in ast.walk(st) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-                for n in ast.walk(st):
-                    if isinstance(n, ast.Name) and n.id in consts:
-                        strs.extend(consts[n.id])
-                attrs = {n.attr for n in ast.walk(st) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "cls"}
-                stmts.append((strs, attrs))
-            direct = {}
-            for name, fn in methods.items():
-                direct[name] = (
-                    {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self"},
-                )
-            reach = {}
-            for name in methods:
-                seen, todo, acc = {name}, [name], set()
-                while todo:
-                    m = todo.pop()
-                    for a in direct[m][0]:
-                        acc.add(a)
-                        if a in methods and a not in seen:
-                            seen.add(a)
-                            todo.append(a)
-                reach[name] = acc
-            prefix = "%s::%s::" % (tf, node.name)
+        for cname, stmts, reach in raw_classes:
+            prefix = "%s::%s::" % (tf, cname)
             cnums = [x for x in nums if cov.num_id(x).startswith(prefix)]
             tattrs = {x: reach.get(cov.num_id(x)[len(prefix):], None) for x in cnums}
             classes.append((cnums, stmts, tattrs))
@@ -748,7 +782,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             notes.append("newfile")
             return merge(cov.tests_touching_file(path), full(module_test_files(path, cov)))
         try:
-            units = Units(old_text)
+            units = Units(old_text, {ln for h in f["hunks"] for part in changed_old_lines([h]) for ln in part})
         except SyntaxError:
             notes.append("old-unparsable")
             return merge(cov.tests_touching_file(path), extra)
@@ -764,7 +798,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                     if not runtime:
                         importtime = True
         try:
-            new_units = Units(new_text)
+            new_units = Units(new_text, added_new_lines(f["hunks"]))
         except SyntaxError:
             new_units = None
         for ln in added_new_lines(f["hunks"]) if new_units is not None else ():
