@@ -24,6 +24,7 @@ HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "1000000"))
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 ZYGOTE = os.environ.get("BR_ZYGOTE", "1") == "1"
 UNITEST = os.environ.get("BR_UNITEST", "1") == "1"
+PARTIAL = os.environ.get("BR_PARTIAL", "1") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
 FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
@@ -1328,6 +1329,71 @@ def install_futures():
 
 CHILD_LAZY = False
 CHILD_PATCHED = []
+_EDGES = []
+
+
+def load_edges():
+    if not _EDGES:
+        try:
+            with open(os.path.join(HERE, "edges.json")) as fh:
+                e = json.load(fh)
+            _EDGES.append((set(e["nodes"]), e["rev"]))
+        except Exception:
+            _EDGES.append(None)
+    return _EDGES[0]
+
+
+def partial_purge(root):
+    edges = load_edges()
+    rels = CHILD_PATCHED
+    if edges is None or not rels or not all(r.endswith(".py") and r.startswith(("sqlglot/", "tests/")) for r in rels):
+        return None
+    nodes, rev = edges
+    ours = {n for n, m in sys.modules.items() if m is not None and (n == "sqlglot" or n.startswith(("sqlglot.", "tests")))}
+    if ours - nodes:
+        return None
+    gone = {modname_of(r) for r in rels if not os.path.exists(os.path.join(root, r))}
+    dead = {modname_of(r) for r in rels}
+    todo = list(dead)
+    while todo:
+        for h in rev.get(todo.pop(), ()):
+            if h not in dead:
+                dead.add(h)
+                todo.append(h)
+    mods = {id(sys.modules[n]): n for n in ours}
+    fns = (type, types.FunctionType)
+    cut = []
+    for n in ours - dead:
+        g = vars(sys.modules[n])
+        lazy = "__getattr__" in g
+        for k, v in g.items():
+            w = mods.get(id(v)) or (getattr(v, "__module__", None) if isinstance(v, fns) else None)
+            if w in dead:
+                if not (w == n + "." + k and w not in gone and isinstance(v, types.ModuleType)) and not lazy:
+                    return None
+                cut.append((g, k))
+    for g, k in cut:
+        del g[k]
+    dd = sys.modules.get("sqlglot.dialects.dialect")
+    if dd is not None and "sqlglot.dialects.dialect" not in dead:
+        reg = dd._Dialect._classes
+        for k in [k for k, v in reg.items() if getattr(v, "__module__", None) in dead]:
+            del reg[k]
+    pre = SRC + "/"
+    for n in ours - dead:
+        m = sys.modules[n]
+        path = getattr(m, "__path__", None)
+        if path is not None:
+            m.__path__ = [os.path.join(root, x[len(pre):]) if x.startswith(pre) else x for x in path]
+            if m.__spec__ is not None and m.__spec__.submodule_search_locations is not None:
+                m.__spec__.submodule_search_locations = m.__path__
+        for v in list(vars(m).values()) if n.startswith("tests") else ():
+            if isinstance(v, type) and vars(v).get("_prewarmed"):
+                v.setUpClass = classmethod(lambda cls: None)
+                v.tearDownClass = classmethod(lambda cls: None)
+    for n in dead & ours:
+        del sys.modules[n]
+    return sorted((dead & ours) - gone - {n for n in dead if n.startswith("tests")}, key=lambda n: n.count("."))
 STMT_OF = {}
 _STMT_TREES = {}
 
@@ -1617,13 +1683,26 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             io.open = ropen
         os.chdir(SRC)
     else:
+        fresh = None
         if mode is not None:
-            for m in [m for m in sys.modules if m == "sqlglot" or m.startswith(("sqlglot.", "tests"))]:
-                del sys.modules[m]
+            fresh = partial_purge(root) if PARTIAL else None
+            if fresh is None:
+                for m in [m for m in sys.modules if m == "sqlglot" or m.startswith(("sqlglot.", "tests"))]:
+                    del sys.modules[m]
             if SRC in sys.path:
                 sys.path.remove(SRC)
         os.chdir(root)
         sys.path.insert(0, root)
+        for n in fresh or ():
+            try:
+                importlib.import_module(n)
+            except BaseException:
+                pass
+        if fresh:
+            for n, m in list(sys.modules.items()):
+                base, _, leaf = n.rpartition(".")
+                if base in fresh and m is not None and not hasattr(sys.modules.get(base), leaf):
+                    setattr(sys.modules[base], leaf, m)
     out = os.fdopen(wfd, "w", buffering=1)
 
     def emit(tag, tid):
@@ -2153,6 +2232,8 @@ def main():
 
         exec_commits = sum(1 for p in plans if any(needs_tables(n) for n in p["light"]))
         zygote.warm(SRC, warm_ids, (TPCWARM or not (TPCREF and LAZYTABLES)) and exec_commits >= (3 if LAZYTABLES else 2 if LAZYEXEC or LEANIMP else 1))
+        if PARTIAL:
+            load_edges()
         warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
         code_idx = zygote.code_index({os.path.join(SRC, r) for p in plans for r in p["patched"] if r.endswith(".py")})
         zyg = (zygote, warm_lines, code_idx)
