@@ -2194,6 +2194,8 @@ def main():
             if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
                 log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
                 job.kill()
+                if p["probe"]:
+                    job.broken = True
             if job.done:
                 running.remove(p)
                 fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
