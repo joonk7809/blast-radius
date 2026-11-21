@@ -1621,6 +1621,9 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
                 signal.setitimer(signal.ITIMER_REAL, 0)
     case_to_id = {}
     failed = set()
+    subfailed = set()
+    recheck = []
+    filtered = set()
     cases = []
     for tid in test_ids:
         path, cls, meth = tid.split("::")
@@ -1638,7 +1641,7 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
         def startTest(self, test):
             super().startTest(test)
             tid = case_to_id.get(id(test))
-            ustate.update(tid=tid, allowed=sel.get(tid), stack=[], seen={}, fut=0)
+            ustate.update(tid=tid, allowed=sel.get(tid), stack=[], seen={}, fut=0, guard=0, skipped=tid in filtered)
             if tid:
                 emit("S", tid)
                 self.t0 = time.process_time()
@@ -1647,7 +1650,10 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_REAL, 0)
             tid = case_to_id.get(id(test))
-            if tid:
+            if tid in failed and tid not in subfailed and ustate["skipped"] and not hung:
+                failed.discard(tid)
+                recheck.append(tid)
+            elif tid:
                 emit("F" if tid in failed else "P", tid)
                 emit("C", "%s %.3f" % (tid, time.process_time() - getattr(self, "t0", time.process_time())))
                 if hung:
@@ -1686,6 +1692,7 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
 
         def addSubTest(self, test, subtest, err):
             if err is not None:
+                subfailed.add(case_to_id.get(id(test)))
                 self._dbg(test, err)
                 self._fail(test)
 
@@ -1694,7 +1701,19 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
 
     orig_subtest = unittest.TestCase.subTest
     stop = {}
-    ustate = {"tid": None, "allowed": None, "stack": [], "seen": {}, "fut": 0}
+    ustate = {"tid": None, "allowed": None, "stack": [], "seen": {}, "fut": 0, "guard": 0}
+    import unittest._log
+    for ctx in (unittest.case._AssertRaisesContext, unittest.case._AssertWarnsContext, unittest._log._AssertLogsContext):
+        def guard_enter(self, _enter=ctx.__enter__):
+            ustate["guard"] += 1
+            return _enter(self)
+
+        def guard_exit(self, *a, _exit=ctx.__exit__):
+            ustate["guard"] -= 1
+            return _exit(self, *a)
+
+        ctx.__enter__ = guard_enter
+        ctx.__exit__ = guard_exit
     for tid, keys in sel.items():
         if keys is not None:
             closed = set()
@@ -1715,12 +1734,14 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             ustate["seen"][fullk] = n + 1
             self.key = "s:" + base + ("#%d" % n if n else "")
             self.path = ">".join(ustate["stack"] + [self.key])
-            self.skip = ustate["allowed"] is not None and self.path not in ustate["allowed"]
+            self.skip = ustate["allowed"] is not None and self.path not in ustate["allowed"] and not ustate["guard"]
             if self.skip and not ustate["stack"]:
                 q = _QKEY2.match(self.key)
                 if q and "q:" + q.group(2) in ustate["allowed"]:
                     self.skip = False
             self.inner = None if self.skip else orig_subtest(case, msg, **params)
+            if self.skip:
+                ustate["skipped"] = True
 
         def __enter__(self):
             ustate["stack"].append(self.key)
@@ -1756,6 +1777,8 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             args = resolve_parses(args)
         f = LazyFuture(fn, args, kwargs)
         f.skip_outer = skip
+        if skip:
+            ustate["skipped"] = True
         return f
 
     SyncExecutor.submit = lazy_submit
@@ -1801,6 +1824,8 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
                 sel[tid].update(k for k, i in smap.items() if i in whole)
                 try:
                     r = STMTSEL and stmt_filter(c, tid, sel[tid], patched_rel)
+                    if r:
+                        filtered.add(tid)
                     if DEBUG:
                         print("stmt", tid, r, file=sys.stderr)
                 except Exception as e:
@@ -1817,6 +1842,19 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
         suite.run(Result())
     except BaseException:
         pass
+    if recheck:
+        again = []
+        for tid in recheck:
+            path, cls, meth = tid.split("::")
+            c = getattr(sys.modules[path[:-3].replace("/", ".")], cls)(meth)
+            case_to_id[id(c)] = tid
+            sel[tid] = None
+            filtered.discard(tid)
+            again.append(c)
+        try:
+            unittest.TestSuite(again).run(Result())
+        except BaseException:
+            pass
     emit("D", "-")
     out.flush()
     os._exit(0)
