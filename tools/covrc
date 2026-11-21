@@ -1,0 +1,4 @@
+[run]
+source = sqlglot
+dynamic_context = test_function
+data_file = /out/.coverage
