@@ -126,7 +126,7 @@ def _identity_safe(node, resolve):
     if not names or resolve is None:
         return False
     obj = resolve(names)
-    return isinstance(obj, enum.Enum) and type(obj).__eq__ is object.__eq__
+    return isinstance(obj, enum.Enum)
 
 
 class _Canon(ast.NodeTransformer):
