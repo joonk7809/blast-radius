@@ -87,7 +87,7 @@ IMPORTT = os.environ.get("BR_IMPORTT", "1") == "1"
 CLOSURE = os.environ.get("BR_CLOSURE", "1") == "1"
 IMPORTBODY = os.environ.get("BR_IMPORTBODY", "1") == "1"
 CACHESITE = os.environ.get("BR_CACHESITE", "1") == "1"
-HELPERS = os.environ.get("BR_HELPERS", "1") == "1"
+HELPERS = os.environ.get("BR_HELPERS", "0") == "1"
 LEANHDR = os.environ.get("BR_LEANHDR", "1") == "1"
 HELPERS2 = os.environ.get("BR_HELPERS2", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
