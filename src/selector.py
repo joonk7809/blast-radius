@@ -3323,8 +3323,6 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None, token=""
         k = ustate["fut"]
         ustate["fut"] += 1
         skip = ustate["allowed"] is not None and ("f:%d" % k) not in ustate["allowed"]
-        if not skip:
-            args = resolve_parses(args)
         f = LazyFuture(fn, args, kwargs)
         f.skip_outer = skip
         if skip:
