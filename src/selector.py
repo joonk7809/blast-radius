@@ -85,6 +85,7 @@ BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
 PLAN_FRAC = float(os.environ.get("BR_PLAN_FRAC", "0.35"))
 WATCHDOG = float(os.environ.get("BR_WATCHDOG", "0.94"))
 DOCFN = os.environ.get("BR_DOCFN", "1") == "1"
+SRCREAD = os.environ.get("BR_SRCREAD", "1") == "1"
 DEBUGLOG = os.environ.get("BR_DEBUGLOG", "1") == "1"
 LEAN = os.environ.get("BR_LEAN", "1") == "1"
 CANARY_K = int(os.environ.get("BR_CANARY_K", "0"))
@@ -822,9 +823,28 @@ def module_test_files(path, cov):
     return out
 
 
+def bytes_observed(old_text, new_text):
+    if old_text is None or new_text is None:
+        return True
+    try:
+        new_text.encode("utf-8")
+        return source_encoding(_SOURCE_HEADER.match(old_text)[0]) != source_encoding(_SOURCE_HEADER.match(new_text)[0])
+    except (UnicodeError, SyntaxError, LookupError):
+        return True
+
+
+SOURCE_READERS = {"sqlglot/typing/": ("tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata",)}
+
+
 def candidates_for(f, old_text, new_text, cov, notes):
     r = _candidates_for(f, old_text, new_text, cov, notes)
     r = r if isinstance(r, dict) else full(r)
+    for pre, readers in SOURCE_READERS.items() if SRCREAD and bytes_observed(old_text, new_text) else ():
+        if any(p.startswith(pre) and p.endswith(".py") for p in (f["old"], f["path"])):
+            notes.append("source-read:" + pre)
+            hit = full(n for n, tid in cov.ids.items() if tid in readers)
+            FORCE_LIST.update(hit)
+            merge(r, hit)
     if FIXLIST and f["path"].startswith("tests/") and not f["path"].endswith(".py") and "/tpc-" not in f["path"]:
         FORCE_LIST.update(n for n in r if n not in FRACTION_OK)
     return r
