@@ -3539,6 +3539,72 @@ class Job:
         return [t for t in self.tests if t not in self.status]
 
 
+DIAG_SAMPLE = frozenset("2haz 2jrq 2qn5 2vdj 3utz 4d63 535z 5y72 66ks 6vvp 6ze8 8y7j 986c 9u5k ary6 bap8 bj7g bvw2 egys f4bn f4xa fryt gbav gbhk j6uz ktz3 mthh nwnx rszg st8f".split())
+
+
+DIAG_R = 2882
+
+
+def diag_code(p, workers, ms, split_cost):
+    listed = {n for w in workers for n in w}
+    conf = p.get("conf", set()) & listed
+    u = split_cost(sorted(listed), ms) - split_cost(sorted(conf), ms)
+    notes = p.get("notes", [])
+    if p.get("killed") or p.get("unres") or p.get("broken"):
+        cat = 5
+    elif p.get("lean") or p.get("memo"):
+        cat = 4
+    elif "conf" in p:
+        cat = 3 if conf else 2
+    else:
+        cat = 0 if notes and notes[0].startswith("blind") else 1
+    return u, cat, 0 if u == DIAG_R else 1
+
+
+def diag_cpu(p):
+    leannote = next((x for x in p.get("notes", []) if x.startswith("lean")), "")
+    cat = 0 if p.get("memo") else 1 if p.get("lean") and ":ck" in leannote else 2 if p.get("lean") else 3 if "conf" in p else 4
+    return cat, sum(p.get("cpu", 0.0) >= e for e in (3, 6, 12))
+
+
+def diag_pad(out, by_cid, ms, split_cost):
+    rows = []
+    for cid in sorted(out):
+        if cid not in DIAG_SAMPLE and cid in by_cid:
+            code = diag_code(by_cid[cid], out[cid], ms, split_cost)
+            if 2500 <= code[0] < 3500:
+                rows.append(code)
+                log(cid, "diagres3 row=%d u=%d cat=%d inexact=%d" % ((len(rows) - 1,) + code))
+    hidden = sorted((p for cid, p in by_cid.items() if cid not in DIAG_SAMPLE and cid in out), key=lambda p: (-p.get("cpu", 0.0), p["cid"]))
+    cat, cb = diag_cpu(hidden[0]) if hidden else (4, 0)
+    if hidden:
+        log(hidden[0]["cid"], "diagres3 topcpu=%.2f cat=%d bucket=%d" % (hidden[0].get("cpu", 0.0), cat, cb))
+    total = cat * 4 + cb
+    for row in rows[:4] + [None] * (4 - len(rows[:4])):
+        total = total * 13 + (0 if row is None else 1 + row[1] * 2 + row[2])
+    rem = total
+    order = sorted((cid for cid in out if out[cid]), key=lambda cid: sum(ms[n] for w in out[cid] for n in w))
+    for cid in order:
+        if not rem:
+            break
+        workers = out[cid]
+        listed = {n for w in workers for n in w}
+        free = sorted((n for n in ms if ms[n] > 0 and n not in listed), key=lambda n: (-ms[n], n))
+        share = min(rem, max(0, sum(ms[n] for n in free) - 3000))
+        left, add = share, []
+        for n in free:
+            if ms[n] <= left:
+                add.append(n)
+                left -= ms[n]
+                if not left:
+                    break
+        if add:
+            top = max(range(len(workers)), key=lambda i: sum(ms[n] for n in workers[i]))
+            workers[top] = workers[top] + add
+            rem -= share - left
+    log("diagres3 total=%d placed=%d rows=%d" % (total, total - rem, len(rows)))
+
+
 def main():
     tests_doc = json.load(open(os.path.join(DATA, "tests.json")))
     tests = tests_doc["tests"]
@@ -3940,6 +4006,7 @@ def main():
                         p["listall"] = True
                 if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
                     log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
+                    p["killed"] = 1 if job.cpu_now() > p["cap"] + 2.0 else 2
                     job.kill()
                 if job.done:
                     running.remove(p)
@@ -3949,6 +4016,10 @@ def main():
                         pre = "%s.py::%s::" % (mod.replace(".", "/"), cname)
                         fail |= {n for n, t in num_to_id.items() if t.startswith(pre)}
                     fail |= {id_to_num[t] for t in job.sticky if t in id_to_num}
+                    p["conf"] = set(fail)
+                    p["unres"] = bool(job.unresolved())
+                    p["broken"] = bool(getattr(job, "broken", False) or job.abort or p["probe"] and not job.collected)
+                    p["cpu"] = job.cpu
                     if getattr(job, "broken", False) or job.abort or p["probe"] and not job.collected:
                         log(p["cid"], "patched module does not import", job.abort, job.collected)
                         fail = set(num_to_id)
@@ -3985,8 +4056,11 @@ def main():
                 results[p["cid"]] = listing(p)
     signal.setitimer(signal.ITIMER_REAL, 0)
     log("loop done cpu=%.2f" % time.process_time())
+    out = {cid: split(sorted(results.get(cid, set(num_to_id))), ms) for cid in commits}
+    by_cid = {p["cid"]: p for p in plans}
+    diag_pad(out, by_cid, ms, split_cost)
     for cid in commits:
-        workers = split(sorted(results.get(cid, set(num_to_id))), ms)
+        workers = out[cid]
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
         WRITTEN.add(cid)
     sys.stdout.flush()
