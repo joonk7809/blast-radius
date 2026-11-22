@@ -60,6 +60,7 @@ SETUP_ATTRS = os.environ.get("BR_SETUP_ATTRS", "1") == "1"
 NEWTOP = os.environ.get("BR_NEWTOP", "1") == "1"
 TPCQ = os.environ.get("BR_TPCQ", "1") == "1"
 MEMO = os.environ.get("BR_MEMO", "1") == "1"
+MEMO_K = float(os.environ.get("BR_MEMO_K", "2.0"))
 MEMO_MISS = float(os.environ.get("BR_MEMO_MISS", "0.8"))
 PROBE = os.environ.get("BR_PROBE", "1") == "1"
 COLLECT = os.environ.get("BR_COLLECT", "1") == "1"
@@ -2236,6 +2237,11 @@ def main():
         if light and (RUN_K * sum(est(n) for n in light) + over) * 1000 >= cap:
             notes.insert(0, "blind")
             heavy, light = set(cands), []
+        elif light and memo_n in light and est(memo_n, False) * 1000 > ms[memo_n] + 2000 and (RUN_K * sum(est(n) for n in light if n != memo_n) + over) * 1000 >= blind - split_cost(sorted(heavy | {memo_n}), ms):
+            spend = RUN_K * sum(est(n) * (1 if n == memo_n else MEMO_K) for n in light) + over
+            if spend * 1000 >= cap:
+                notes.insert(0, "blind:memo")
+                heavy, light = set(cands), []
         sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}
         plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000, "memo": use_memo if memo_n in light else False, "touched": touched, "strict": use_memo and memo_n in light and est(memo_n, False) * 1000 > ms[memo_n] + 2000})
         log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4], "memo:%s:%d" % (use_memo, len(touched)) if use_memo else "")
