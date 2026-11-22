@@ -16,7 +16,9 @@ import signal
 import sys
 import time
 import types
+from codecs import lookup
 from io import StringIO
+from tokenize import detect_encoding
 
 DATA = os.environ.get("BR_DATA", "/data")
 SRC = os.environ.get("BR_SRC", "/sqlglot")
@@ -325,6 +327,28 @@ def parse_cached(text):
     if t is None:
         t = _PARSED[text] = parse_src(text)
     return t
+
+
+_SOURCE_HEADER = re.compile(r"(?:[^\r\n]*(?:\r\n?|\n|$)){2}")
+
+
+def source_encoding(header):
+    stream = StringIO(header, newline=None)
+    name, _ = detect_encoding(lambda: stream.readline().encode("utf-8", "replace"))
+    return lookup(name).name
+
+
+def encoding_changes_ast(old_text, new_text):
+    old_header = _SOURCE_HEADER.match(old_text)[0]
+    new_header = _SOURCE_HEADER.match(new_text)[0]
+    if old_header == new_header:
+        return False
+    try:
+        if source_encoding(old_header) == source_encoding(new_header):
+            return False
+        return ast.dump(parse_cached(old_text)) != ast.dump(parse_cached(new_text))
+    except SyntaxError:
+        return False
 
 
 def _isdoc(st):
@@ -1372,6 +1396,9 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         every = full(n for n in cov.idx_to_num if n is not None)
         FORCE_LIST.update(every)
         return every
+    if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")) and not (path.startswith("tests/") and os.path.basename(path).startswith("test_")) and old_text is not None and new_text is not None and encoding_changes_ast(old_text, new_text):
+        notes.append("source-encoding-changed")
+        return full(n for n in cov.idx_to_num if n is not None)
     if path.startswith("sqlglot/") and path.endswith(".py") or CLOSURE and f["old"].startswith("sqlglot/") and f["old"].endswith(".py"):
         if f["deleted"] or (f["old"] and f["old"] != path):
             gone = gone_dependents(f["old"], cov) if CLOSURE else None
@@ -3112,6 +3139,9 @@ def main():
                 ok = False
                 notes.append(f"error:{type(e).__name__}:{e}")
                 cands = full(num_to_id)
+            encoding_fallback = "source-encoding-changed" in notes
+            if encoding_fallback:
+                cands = full(num_to_id)
             if IMPORTT and "importtime" in notes:
                 try:
                     os.environ.setdefault("IMPORTTIME_SQLGLOT", SRC)
@@ -3200,7 +3230,7 @@ def main():
                 whole = split_cost(sorted(cands), ms)
                 cap = whole - split_cost(sorted(heavy), ms)
                 over = RUN_O_RE if ("importtime" in notes or any(not r.endswith(".py") for r in patched)) else RUN_O
-                if light and (RUN_K * sum(cost(n) for n in light) + over) * 1000 >= cap:
+                if light and (encoding_fallback or (RUN_K * sum(cost(n) for n in light) + over) * 1000 >= cap):
                     return set(cands), [], cap, "blind"
                 if price is None and light and memo_n in light and est(memo_n, False) * 1000 > ms[memo_n] + 2000 and (RUN_K * sum(est(n) for n in light if n != memo_n) + over) * 1000 >= whole - split_cost(sorted(heavy | {memo_n}), ms):
                     spend = RUN_K * sum(est(n) * (1 if n == memo_n else MEMO_K) for n in light) + over
