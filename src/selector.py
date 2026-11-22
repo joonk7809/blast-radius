@@ -37,6 +37,7 @@ DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 ZYGOTE = os.environ.get("BR_ZYGOTE", "1") == "1"
 UNITEST = os.environ.get("BR_UNITEST", "1") == "1"
 PARTIAL = os.environ.get("BR_PARTIAL", "1") == "1"
+LAZYRE = os.environ.get("BR_LAZYRE", "1") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
 FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "1") == "1"
@@ -2315,6 +2316,33 @@ def partial_purge(root):
     return sorted((dead & ours) - gone - {n for n in dead if n.startswith("tests")}, key=lambda n: n.count("."))
 
 
+class FreshFinder:
+    def __init__(self, names):
+        self.names = set(names)
+
+    def find_spec(self, name, path=None, target=None):
+        if name not in self.names:
+            return None
+        for f in sys.meta_path:
+            spec = None if f is self or not hasattr(f, "find_spec") else f.find_spec(name, path, target)
+            if spec is not None:
+                break
+        else:
+            return None
+        real = spec.loader.exec_module
+
+        def exec_module(module):
+            real(module)
+            self.names.discard(name)
+            for n, m in list(sys.modules.items()):
+                base, _, leaf = n.rpartition(".")
+                if base == name and m is not None and not hasattr(module, leaf):
+                    setattr(module, leaf, m)
+
+        spec.loader.exec_module = exec_module
+        return spec
+
+
 CHILD_MEMO = None
 _MEMO = []
 MEMO_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
@@ -3112,12 +3140,14 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None, token=""
                 sys.path.remove(SRC)
         os.chdir(root)
         sys.path.insert(0, root)
-        for n in fresh or ():
-            try:
-                importlib.import_module(n)
-            except BaseException:
-                break
-        if fresh:
+        if fresh and LAZYRE:
+            sys.meta_path.insert(0, FreshFinder(fresh))
+        elif fresh:
+            for n in fresh:
+                try:
+                    importlib.import_module(n)
+                except BaseException:
+                    break
             for n, m in list(sys.modules.items()):
                 base, _, leaf = n.rpartition(".")
                 if base in fresh and m is not None and base in sys.modules and not hasattr(sys.modules[base], leaf):
