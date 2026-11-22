@@ -48,6 +48,7 @@ LAMBDAS = os.environ.get("BR_LAMBDAS", "1") == "1"
 SHARED = os.environ.get("BR_SHARED", "1") == "1"
 LAZYTABLES = os.environ.get("BR_LAZYTABLES", "1") == "1"
 TPCQ2 = os.environ.get("BR_TPCQ2", "1") == "1"
+FIXPAIRS = int(os.environ.get("BR_FIXPAIRS", "2"))
 TPCREF = os.environ.get("BR_TPCREF", "1") == "1"
 TPCWARM = os.environ.get("BR_TPCWARM", "0") == "1"
 TPCPARSE = os.environ.get("BR_TPCPARSE", "1") == "1"
@@ -910,6 +911,95 @@ def changed_query_indices(path, old_text, new_text):
         return {i + 1 for i, ((sql, _), _) in enumerate(pairs) if word.search(sql)}
     except Exception:
         return None
+
+
+def _fixture_pairs(text):
+    if SRC not in sys.path:
+        sys.path.insert(0, SRC)
+    from tests import helpers
+    st = helpers._filter_comments(text).split(";")
+    out = []
+    for i in range(0, len(st) - 1, 2):
+        sql, meta = helpers._extract_meta(st[i].strip())
+        out.append((meta, sql, st[i + 1].strip()))
+    return out
+
+
+_CHECKF = []
+
+
+def _check_files():
+    if not _CHECKF:
+        out = {}
+        try:
+            text = open(os.path.join(SRC, "tests/test_optimizer.py"), encoding="utf-8").read()
+        except OSError:
+            text = ""
+        fn = None
+        for m in re.finditer(r"^    def (\w+)\(|self\.check_file\(\s*\"([^\"\\]*)\"", text, re.M):
+            if m.group(1):
+                fn = m.group(1)
+            elif fn:
+                out.setdefault(fn, set()).add(m.group(2))
+        only = {r for v in out.values() for r in v if len(re.findall(r"[\"/]%s(?:\.sql)?\"" % re.escape(r), text)) == len(re.findall(r"self\.check_file\(\s*\"%s\"" % re.escape(r), text))}
+        _CHECKF.append(out)
+        _CHECKF.append(only)
+    return _CHECKF[0]
+
+
+def fixture_pair_keys(cov, n, path, old_text, new_text):
+    if not FIXPAIRS or old_text is None or new_text is None or "/tpc-" in path or not path.startswith("tests/fixtures/optimizer/") or not path.endswith(".sql"):
+        return None
+    tid = cov.num_id(n)
+    if not tid.startswith("tests/test_optimizer.py::TestOptimizer::"):
+        return None
+    try:
+        a, b = _fixture_pairs(old_text), _fixture_pairs(new_text)
+    except Exception:
+        return None
+    if FIXPAIRS == 2 and any(not (a[i][0] == b[i][0] and a[i][2] == b[i][2] and " ".join(a[i][1].split()).lower() == " ".join(b[i][1].split()).lower()) for i in range(min(len(a), len(b)))):
+        return "list"
+    lists = []
+    for fx, idxs in cov.fixtures.items():
+        if any(cov.idx_to_num[i] == n for i in idxs):
+            if not fx.startswith("tests/fixtures/optimizer/") or not fx.endswith(".sql") or "/tpc-" in fx:
+                return None
+            try:
+                lists.append(a if fx == path else _fixture_pairs(open(os.path.join(SRC, fx), encoding="utf-8").read()))
+            except Exception:
+                return None
+    named, titles = [], []
+    for pairs in lists:
+        t = ["s:%r" % ((m.get("title") or "%d, %s" % (i + 1, q), []),) for i, (m, q, _) in enumerate(pairs)]
+        named += [x for (m, _, _), x in zip(pairs, t) if m.get("title")]
+        titles.append(t)
+    units = [k for m, k in cov.units if m == n and k and not k.startswith("t:")]
+
+    def known(k):
+        q = _QKEY2.match(k)
+        opts = named + ([t[int(q.group(2)) - 1] for t in titles if 0 < int(q.group(2)) <= len(t)] if q else [])
+        return any(k == t or k.startswith((t + ">", t + "#")) for t in opts)
+
+    if not units or not all(known(k) for k in units):
+        return None
+    keys = set()
+    rel = path[len("tests/fixtures/optimizer/"):-4]
+    exact = PATCH_FILES == [path] and rel in _check_files().get(tid.rsplit("::", 1)[-1], ())
+    for i in range(len(b)):
+        if i < len(a) and a[i] == b[i]:
+            continue
+        if exact and i < len(a) and a[i][:2] == b[i][:2]:
+            k = "s:%r" % ((a[i][0].get("title") or "%d, %s" % (i + 1, a[i][1]), []),)
+            if any(u == k or u.startswith((k + ">", k + "#")) for u in units):
+                return "fail"
+        keys.add("q:%d" % (i + 1))
+        t = b[i][0].get("title")
+        if t:
+            for d in ("",) + tuple("#%d" % j for j in range(1, 9)):
+                top = "s:%r%s" % ((t, []), d)
+                keys.add(top)
+                keys.add("%s>s:%r" % (top, ("(execute) " + t, [])))
+    return keys
 
 
 def query_unit_keys(cov, n, idx, word):
@@ -1839,6 +1929,17 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             if extra - out:
                 notes.append("setupclass")
             res = full(out | extra)
+            for n in out - extra:
+                keys = fixture_pair_keys(cov, n, path, old_text, new_text)
+                if keys in ("fail", "list"):
+                    notes.append("pairs:" + keys)
+                elif keys == set() and PATCH_FILES == [path] and path[len("tests/fixtures/optimizer/"):-4] in _CHECKF[1] and len(cov.fixtures.get(path, ())) == 1:
+                    notes.append("pairs:same")
+                    res.pop(n, None)
+                elif keys is not None:
+                    res[n] = keys
+                    FRACTION_OK.add(n)
+                    notes.append("pairs:%d" % len(keys))
             idx = changed_query_indices(path, old_text, new_text) if TPCQ else None
             if idx is not None:
                 for n in (extra | out) if TPCQ2 else extra - out:
@@ -2606,7 +2707,7 @@ def _skippable(st, ids, local):
 
 def stmt_filter(case, tid, allowed, patched):
     smap = STMT_OF.get(tid)
-    if smap is None or "" in allowed or any(k.startswith("f:") or "#" in k for k in allowed):
+    if smap is None or "" in allowed or any(k.startswith(("f:", "q:")) or "#" in k for k in allowed):
         return False
     path, cls, meth = tid.split("::")
     if path in patched:
@@ -3285,15 +3386,21 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None, token=""
             self.key = "s:" + base + ("#%d" % n if n else "")
             self.path = ">".join(ustate["stack"] + [self.key])
             self.skip = ustate["allowed"] is not None and self.path not in ustate["allowed"] and not ustate["guard"]
-            if self.skip and not ustate["stack"]:
+            self.qtop = False
+            if not ustate["stack"]:
                 q = _QKEY2.match(self.key)
-                if q and "q:" + q.group(2) in ustate["allowed"]:
+                self.qtop = bool(q and ustate["allowed"] is not None and "q:" + q.group(2) in ustate["allowed"])
+                if self.qtop:
                     self.skip = False
+            elif self.skip and ustate.get("qtop"):
+                self.skip = False
             self.inner = None if self.skip else orig_subtest(case, msg, **params)
             if self.skip:
                 ustate["skipped"] = True
 
         def __enter__(self):
+            if not ustate["stack"]:
+                ustate["qtop"] = self.qtop
             ustate["stack"].append(self.key)
             if self.skip:
                 sys.settrace(lambda *a: None)
