@@ -310,12 +310,6 @@ def _load(name):
     if name not in _MAPS:
         p = os.path.join(MAPDIR, name)
         try:
-            with open(p[:-3], 'rb') as f:
-                _MAPS[name] = json.load(f)
-            return _MAPS[name]
-        except FileNotFoundError:
-            pass
-        try:
             with gzip.open(p, 'rt') as f:
                 _MAPS[name] = json.load(f)
         except FileNotFoundError:
@@ -337,102 +331,17 @@ class ReadMap:
                 self.subs.setdefault(b, []).append(c)
         self.owns = _LazySets(d.get('owns', {}))
         self.modglob = d.get('modglob', {})
-        self.usets = d.get('usets', [])
-        self.units = d.get('units', [])
 
     def T(self, idx):
         if idx is None:
             return ()
         v = self.sets[idx]
         if isinstance(v, str):
-            v = self.sets[idx] = [_hit(x) for x in v.split(',')] if v else []
-        return v
-
-    def U(self, u):
-        v = self.usets[u]
-        if isinstance(v, str):
-            names = self.units
-            v = self.usets[u] = frozenset((names[int(x)] for x in v.split(','))) if v else frozenset()
+            v = self.sets[idx] = [int(x) for x in v.split(',')] if v else []
         return v
 
     def subclasses(self, c):
         return [c] + self.subs.get(c, [])
-
-def _hit(x):
-    i = x.find(':')
-    if i < 0:
-        return int(x)
-    return (int(x[:i]), int(x[i + 1:]))
-
-def project_tests(items):
-    return {x if type(x) is int else x[0] for x in items}
-
-def _test_units(t):
-    M = get_cov()
-    if not M or 'tunits' not in M:
-        return None
-    tu = M.setdefault('_TU', {})
-    v = tu.get(t)
-    if v is None:
-        raw = M['tunits'].get(str(t))
-        names = M['units']
-        order = [names[int(x)] for x in raw.split(',')] if raw else []
-        group, cur = ({}, None)
-        for k in order:
-            if k.startswith('f:'):
-                cur = [k]
-                group[k] = cur
-            elif cur is not None and '>' not in k:
-                cur.append(k)
-                group[k] = cur
-        v = tu[t] = (frozenset(order), group)
-    return v
-
-def _close_units(t, us):
-    tu = _test_units(t)
-    if tu is None:
-        return set(us)
-    allu, group = tu
-    real = set()
-    for u in us:
-        if u == SETUP_UNIT:
-            continue
-        if u.startswith('b:'):
-            u = 'f:' + u[2:]
-        if u not in allu:
-            return None
-        real.add(u)
-    for u in list(real):
-        g = group.get(u)
-        if g:
-            real.update(g)
-    if real:
-        pre = tuple((u + '>' for u in real))
-        real.update((k for k in allu if k.startswith(pre)))
-    if allu and allu <= real:
-        return None
-    if SETUP_UNIT in us:
-        real.add(SETUP_UNIT)
-    return real
-SETUP_UNIT = '<setup>'
-
-def items_to_units(items, rm=None):
-    rm = rm or get_readmap()
-    out = {}
-    for x in items:
-        if type(x) is int:
-            out[x] = None
-    for x in items:
-        if type(x) is not int:
-            t = x[0]
-            if t in out and out[t] is None:
-                continue
-            u = x[1]
-            out.setdefault(t, set()).update(rm.U(u) if u >= 0 else _cov_uset(-1 - u))
-    for t, us in out.items():
-        if us is not None:
-            out[t] = _close_units(t, us)
-    return out
 
 class _LazySets(dict):
 
@@ -476,24 +385,8 @@ def cov_tests(relpath, lo, hi):
     for ln in range(lo, hi + 1):
         s = L.get(str(ln))
         if s is not None:
-            out.update(_cov_items(M, s))
+            out.update(M['sets'][s])
     return out
-
-def _cov_items(M, s):
-    v = M['sets'][s]
-    if isinstance(v, str):
-        v = M['sets'][s] = [(lambda h: h if type(h) is int else (h[0], -1 - h[1]))(_hit(x)) for x in v.split(',')] if v else []
-    return v
-
-def _cov_uset(u):
-    M = get_cov()
-    us = M.setdefault('_U', {})
-    v = us.get(u)
-    if v is None:
-        names = M['units']
-        raw = M['usets'][u]
-        v = us[u] = frozenset((names[int(x)] for x in raw.split(','))) if raw else frozenset()
-    return v
 
 def tests_for_paths(paths, info=None):
     rm = get_readmap()
@@ -749,16 +642,16 @@ def dynamic_changed_paths(patch_text, root=None, timeout=60):
     env.pop('PYTHONPATH', None)
     p = subprocess.run([sys.executable, '-I', os.path.abspath(__file__), '--dynamic', root, MAPDIR], input=patch_text, capture_output=True, text=True, timeout=timeout, env=env)
     if p.returncode != 0:
+        if os.environ.get('BR_HARDEN', '1') == '1':
+            return (None, 'rc=%d %s' % (p.returncode, p.stderr[-2000:]))
         return (None, p.stderr[-2000:])
     return (set(json.loads(p.stdout.strip().splitlines()[-1])), None)
 
-def dynamic_extra_candidates(patch_text, root=None, items=False):
+def dynamic_extra_candidates(patch_text, root=None):
     paths, err = dynamic_changed_paths(patch_text, root)
     if paths is None:
         return (set(), {'confident': False, 'error': err})
     tests, unresolved = tests_for_paths(paths)
-    if not items:
-        tests = project_tests(tests)
     return (tests, {'confident': not unresolved, 'paths': sorted(paths), 'unresolved': unresolved})
 
 def _dotted(node):
@@ -1416,10 +1309,10 @@ def module_fallback(rel):
         fm = M['files'].get(rel)
         if fm:
             for s in set(fm['lines'].values()):
-                res.update(_cov_items(M, s))
+                res.update(M['sets'][s])
     return res
 
-def static_candidates(patch_text: str, root=None, with_info=False, items=False):
+def static_candidates(patch_text: str, root=None, with_info=False):
     rm = get_readmap()
     paths, notes, ok = static_paths(patch_text, root)
     if rm is not None:
@@ -1442,8 +1335,6 @@ def static_candidates(patch_text: str, root=None, with_info=False, items=False):
             _IMPORT_EXEC[0].update(ir[k])
     ie = sorted(_IMPORT_EXEC[0])
     info = {'confident': ok and (not unresolved) and (rm is not None), 'paths': sorted(paths), 'notes': notes, 'unresolved': unresolved, 'import_time': bool(paths), 'import_exec_modules': ie, 'needs_dynamic': bool(ie) or not (ok and (not unresolved))}
-    if not items:
-        tests = project_tests(tests)
     return (tests, info) if with_info else tests
 
 def import_exec_fallback(modules):
@@ -1455,11 +1346,11 @@ def import_exec_fallback(modules):
         out |= module_fallback(rel)
     return out
 
-def best_candidates(patch_text, root=None, allow_dynamic=True, items=False):
-    tests, info = static_candidates(patch_text, root, with_info=True, items=True)
+def best_candidates(patch_text, root=None, allow_dynamic=True):
+    tests, info = static_candidates(patch_text, root, with_info=True)
     if info['needs_dynamic'] or info['import_time']:
         if allow_dynamic and (info['needs_dynamic'] or not info['confident']):
-            dt, dinfo = dynamic_extra_candidates(patch_text, root, items=True)
+            dt, dinfo = dynamic_extra_candidates(patch_text, root)
             if dinfo.get('error'):
                 info['dynamic_error'] = dinfo['error']
                 tests |= import_exec_fallback(info['import_exec_modules'])
@@ -1468,8 +1359,6 @@ def best_candidates(patch_text, root=None, allow_dynamic=True, items=False):
                 info['dynamic_paths'] = dinfo['paths']
         elif info['import_exec_modules']:
             tests |= import_exec_fallback(info['import_exec_modules'])
-    if not items:
-        tests = project_tests(tests)
     return (tests, info)
 
 def _raw_snapshot_subprocess(root, seed, unordered):
@@ -1550,8 +1439,3 @@ if __name__ == '__main__':
 def extra_candidates(patch_text: str, root=None, with_info=False, allow_dynamic=True):
     tests, info = best_candidates(patch_text, root, allow_dynamic=allow_dynamic)
     return (tests, info) if with_info else tests
-
-def extra_candidates_units(patch_text, root=None, with_info=False, allow_dynamic=True):
-    tests, info = best_candidates(patch_text, root, allow_dynamic=allow_dynamic, items=True)
-    out = items_to_units(tests)
-    return (out, info) if with_info else out
