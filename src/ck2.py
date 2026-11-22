@@ -59,11 +59,6 @@ class Recorder:
             out = fn(step, context)
             cost = time.process_time() - t0
             self.cov_cb(("frame", self.q))
-            blob = b""
-            if self.snapdir:
-                blob = pickle.dumps(out.tables, protocol=5)
-                with open(os.path.join(self.snapdir, "%d_%s.pkl" % (self.q, s)), "wb") as fh:
-                    fh.write(blob)
             post = {d: ck.tables_state(t) for d, t in deps.items()}
             post_cursor = {d: {n: (vars(t.reader).get("row"), t.range_reader.range) for n, t in tabs.items()} for d, tabs in deps.items()}
             alias_of = sorted(d for d, t in deps.items() if ck.cross_alias(t, out.tables))
@@ -74,6 +69,11 @@ class Recorder:
                         if dt is ot and on not in alias_map:
                             alias_map[on] = (d, dn)
             oalias = bool(alias_of)
+            blob = b""
+            if self.snapdir and not alias_of and not alias_map:
+                blob = pickle.dumps(out.tables, protocol=5)
+                with open(os.path.join(self.snapdir, "%d_%s.pkl" % (self.q, s)), "wb") as fh:
+                    fh.write(blob)
             for t in out.tables.values():
                 self.owner.setdefault(id(t), []).append(s)
             self.steps[s] = {"kind": type(step).__name__, "out": ck.tables_state(out.tables), "names": list(out.tables), "pre": pre, "post": post, "mut": {d: post[d] != pre[d] for d in deps}, "mutc": {d: post[d][0] != pre[d][0] for d in deps}, "xalias": xalias, "oalias": oalias, "alias_of": alias_of, "alias_map": alias_map, "post_cursor": post_cursor, "cost": cost, "bytes": len(blob), "ndeps": len(step.dependents)}

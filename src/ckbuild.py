@@ -82,7 +82,7 @@ def h_opt(expression, schema, **kw):
     setcur(("opt", state["q"]))
     o = real_opt(expression, schema, **kw)
     setcur(("frame", state["q"]))
-    state["o"] = pickle.dumps(o, protocol=5)
+    state["o"] = ck.dumps(o)
     o = pickle.loads(state["o"])
     state["osql"] = o.sql(pretty=True)
     return o
@@ -142,13 +142,14 @@ def sweep(lin, record):
         res = sx.execute(e, schema=te.TPCDS_SCHEMA, tables=arg)
         setcur(None)
         if record:
-            nat = real_px(tables=real_et(arg)).execute(real_plan(real_opt(pickle.loads(pickle.dumps(te.parse_one(sql))), te.TPCDS_SCHEMA, leave_tables_isolated=True)))
-            if nat.columns != res.columns or nat.rows != res.rows:
-                raise SystemExit("pinned AST result differs on query %d" % i)
             qt = time.process_time() - t0
-            recd = state["recd"]
+            pn = real_plan(real_opt(pickle.loads(pickle.dumps(te.parse_one(sql))), te.TPCDS_SCHEMA, leave_tables_isolated=True))
             pp = real_plan(pickle.loads(state["o"]))
-            queries[i] = {"planblob": pickle.dumps((pp, ck.step_sigs(pp)), protocol=5), "pdig": state["pdig"], "schema": state["schema"], "kw": state["kw"], "opt": state["o"], "osql": state["osql"], "sigs": sorted(state["sigs"].values()), "steps": recd.steps, "result": pickle.dumps(res, protocol=5), "qtime": qt, "tables": sorted(arg)}
+            ns, ps = ck.step_sigs(pn), ck.step_sigs(pp)
+            if sorted(ns.values()) != sorted(ps.values()) or ns[pn.root] != ps[pp.root] or ck.plan_ctes(pn) != ck.plan_ctes(pp) or sorted(ps.values()) != sorted(state["sigs"].values()):
+                raise SystemExit("pinned AST plan differs on query %d" % i)
+            recd = state["recd"]
+            queries[i] = {"planblob": ck.dumps((pp, ps)), "root": ps[pp.root], "ctes": ck.plan_ctes(pp), "pdig": state["pdig"], "schema": state["schema"], "kw": state["kw"], "opt": state["o"], "osql": state["osql"], "sigs": sorted(state["sigs"].values()), "steps": recd.steps, "result": pickle.dumps(res, protocol=5), "qtime": qt, "tables": sorted(arg)}
 
 
 rec = os.path.join(OUT, "rec.pkl")

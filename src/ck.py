@@ -1,6 +1,25 @@
+import copyreg
 import io
 import hashlib
 import pickle
+
+
+class _ASTPickler(pickle.Pickler):
+    def reducer_override(self, obj):
+        if isinstance(obj, self.base):
+            sl = {n: getattr(obj, n) for c in type(obj).__mro__ for n in c.__dict__.get("__slots__", ()) if n != "__dict__" and hasattr(obj, n)}
+            d = getattr(obj, "__dict__", None)
+            return copyreg.__newobj__, (type(obj),), (d, sl) if sl else d
+        return NotImplemented
+
+
+def dumps(obj):
+    import sqlglot.expressions as e
+    b = io.BytesIO()
+    p = _ASTPickler(b, protocol=5)
+    p.base = getattr(e, "Expr", None) or e.Expression
+    p.dump(obj)
+    return b.getvalue()
 
 
 def _dump_val(v, exp, out):
@@ -107,3 +126,13 @@ def content_state(t):
 def cross_alias(a, b):
     ia = {id(x) for t in a.values() for x in (t, t.rows)}
     return any(id(x) in ia for t in b.values() for x in (t, t.rows))
+
+
+def plan_ctes(plan):
+    from sqlglot import exp
+    out = []
+    try:
+        _dump_val(plan.ctes, exp, out)
+    except Exception:
+        return None
+    return hashlib.sha256("\x00".join(out).encode("utf-8", "surrogatepass")).hexdigest()
