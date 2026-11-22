@@ -2252,6 +2252,18 @@ def main():
         touched = set()
         if use_memo:
             use_memo, touched = use_memo
+            fx = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+            if fx in patched and all(r == fx or "noop:" + r in notes or not (r.startswith("sqlglot/") or "/tpc-" in r or r in ("tests/helpers.py", "tests/test_executor.py")) for r in patched):
+                try:
+                    known = {(q, tuple(sorted(m.items()))) for (q, m), _ in _pairs(old_by[fx])}
+                    fresh = [i + 1 for i, ((q, m), _) in enumerate(_pairs(patched[fx])) if (q, tuple(sorted(m.items()))) not in known]
+                except Exception:
+                    fresh = None
+                if fresh is not None:
+                    keys = {"f:%d" % (i - 1) for i in fresh} | {"s:%r" % (("tpc-ds %d" % i, []),) for i in fresh}
+                    if cands[memo_n] is None or keys < cands[memo_n]:
+                        cands[memo_n] = keys
+                    notes.append("memo-fresh:%d" % len(fresh))
             notes.append("memo:%s:%d" % (use_memo, len(touched)))
 
         def est(n, memo=True):
