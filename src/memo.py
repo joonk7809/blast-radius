@@ -300,10 +300,18 @@ def build(src, out_path):
             seen.add((os.path.relpath(code.co_filename, src), code.co_qualname, code.co_firstlineno))
             return mon.DISABLE
 
+    passes = []
+    cur = [None]
+
+    def lcb(code, line):
+        if state["on"] and code.co_filename.startswith(src):
+            passes[-1].setdefault(os.path.relpath(code.co_filename, src), {}).setdefault(line, set()).add(cur[0])
+            return mon.DISABLE
+
     ev = mon.events
     for e in (ev.PY_START, ev.PY_RESUME, ev.PY_THROW):
         mon.register_callback(tool, e, cb)
-    mon.set_events(tool, ev.PY_START | ev.PY_RESUME | ev.PY_THROW)
+    mon.register_callback(tool, ev.LINE, lcb)
 
     def enter():
         if not state["on"]:
@@ -317,6 +325,7 @@ def build(src, out_path):
 
     memo = {}
     pre = {}
+    run = {}
     done = []
     store = {}
 
@@ -328,30 +337,49 @@ def build(src, out_path):
 
     hooks = Hooks(ex, lookup, enter, leave)
     hooks.install()
-    for kind, word, _, attr in KINDS:
-        tables = getattr(k, attr)
-        sqls = k.tpch_sqls if kind == "h" else k.tpcds_sqls
-        for i, (meta, sql, _) in enumerate(sqls):
-            if not meta.get("execute"):
-                continue
-            t0 = time.process_time()
-            state["cpu"] = 0.0
-            store.clear()
-            try:
-                expression = pickle.loads(pickle.dumps(te.parse_one(sql)))
-                arg = {t.name: tables[t.name] for t in te.find_tables(expression)}
-                result = te.execute(expression, schema=te.TPCH_SCHEMA if kind == "h" else te.TPCDS_SCHEMA, tables=arg)
-                blob = pickle.dumps(result)
-                enter()
+    def sweep(lined):
+        if lined:
+            passes.append({})
+        mon.set_events(tool, ev.PY_START | ev.PY_RESUME | ev.PY_THROW | (ev.LINE if lined else 0))
+        for kind, word, _, attr in KINDS:
+            tables = getattr(k, attr)
+            sqls = k.tpch_sqls if kind == "h" else k.tpcds_sqls
+            for i, (meta, sql, _) in enumerate(sqls):
+                if not meta.get("execute"):
+                    continue
+                cur[0] = "f:%d" % i
+                if lined:
+                    mon.restart_events()
+                t0 = time.process_time()
+                state["cpu"] = 0.0
+                store.clear()
                 try:
-                    pickle.loads(blob)
-                finally:
-                    leave()
-            except Exception:
-                continue
-            pre.setdefault(kind, {})["f:%d" % i] = time.process_time() - t0 - state["cpu"]
-            if "x" in store:
-                done.append((kind, store["x"], blob))
+                    expression = pickle.loads(pickle.dumps(te.parse_one(sql)))
+                    arg = {t.name: tables[t.name] for t in te.find_tables(expression)}
+                    result = te.execute(expression, schema=te.TPCH_SCHEMA if kind == "h" else te.TPCDS_SCHEMA, tables=arg)
+                    blob = pickle.dumps(result)
+                    enter()
+                    try:
+                        pickle.loads(blob)
+                    finally:
+                        leave()
+                except Exception:
+                    continue
+                if lined:
+                    continue
+                pre.setdefault(kind, {})["f:%d" % i] = time.process_time() - t0 - state["cpu"]
+                run.setdefault(kind, {})["f:%d" % i] = state["cpu"]
+                if "x" in store:
+                    done.append((kind, "f:%d" % i, store["x"], blob))
+
+    sweep(True)
+    sweep(False)
+    sweep(True)
+    lines = {}
+    everyone = set(pre.get("ds", {}))
+    for rel in set(passes[0]) | set(passes[1]):
+        a, b = passes[0].get(rel, {}), passes[1].get(rel, {})
+        lines[rel] = {ln: everyone if a.get(ln) != b.get(ln) else a[ln] for ln in set(a) | set(b)}
     hooks.remove()
     mon.set_events(tool, 0)
     mon.free_tool_id(tool)
@@ -366,12 +394,14 @@ def build(src, out_path):
                 names.update(c.co_names)
                 consts.update(x for x in c.co_consts if isinstance(x, str))
     drop = () if "POSITION_META_KEYS" in names else tuple(k for k in POSITION if k not in consts)
-    for kind, ds, blob in done:
+    keyed = {}
+    for kind, key, ds, blob in done:
         d = ds[drop]
         if d:
             memo.setdefault(kind, {})[d] = blob
+            keyed.setdefault(kind, {})[key] = d
     with open(out_path, "wb") as fh:
-        pickle.dump({"memo": memo, "pre": pre, "exec": sorted(seen), "drop": drop, "names": sorted(names | consts)}, fh)
+        pickle.dump({"memo": memo, "pre": pre, "exec": sorted(seen), "drop": drop, "names": sorted(names | consts), "lines": lines, "run": run, "keyed": keyed}, fh)
 
 
 def build_state(src, memo_path, out_path):
