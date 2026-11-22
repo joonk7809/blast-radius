@@ -1,6 +1,7 @@
 import ast
 import bisect
 import builtins
+import contextvars
 import enum
 import gc
 import gzip
@@ -1811,6 +1812,9 @@ def preimport(libs=True):
             pass
 
 
+POOL_FAULT = []
+
+
 class LazyFuture:
     def __init__(self, fn, args, kwargs):
         self.fn, self.args, self.kwargs = fn, args, kwargs
@@ -1819,10 +1823,24 @@ class LazyFuture:
     def _force(self):
         if self.state is None:
             try:
-                args, kwargs = pickle.loads(pickle.dumps((self.args, self.kwargs)))
-                self.state = (True, pickle.loads(pickle.dumps(self.fn(*args, **kwargs))))
+                fn, args, kwargs = pickle.loads(pickle.dumps((self.fn, self.args, self.kwargs)))
             except BaseException as e:
                 self.state = (False, e)
+                return self.state
+            try:
+                out = (True, contextvars.Context().run(fn, *args, **kwargs))
+            except BaseException as e:
+                out = (False, e)
+            try:
+                blob = pickle.dumps(out[1])
+            except BaseException as e:
+                self.state = (False, e)
+                return self.state
+            try:
+                self.state = (out[0], pickle.loads(blob))
+            except BaseException:
+                POOL_FAULT.append(self)
+                self.state = out
         return self.state
 
     def result(self, timeout=None):
@@ -1851,13 +1869,14 @@ class LazyFuture:
 class SyncExecutor:
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
         if initializer:
-            initializer(*pickle.loads(pickle.dumps(initargs)))
+            initializer, initargs = pickle.loads(pickle.dumps((initializer, initargs)))
+            initializer(*initargs)
 
     def submit(self, fn, *args, **kwargs):
         return LazyFuture(fn, args, kwargs)
 
     def map(self, fn, *iterables, **kw):
-        return map(fn, *iterables)
+        return (self.submit(fn, *a).result() for a in zip(*iterables))
 
     def shutdown(self, wait=True, **kw):
         pass
@@ -2724,6 +2743,10 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None, token=""
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_REAL, 0)
             tid = case_to_id.get(id(test))
+            if tid and (hung or POOL_FAULT):
+                failed.add(tid)
+                subfailed.add(tid)
+                POOL_FAULT.clear()
             if tid in failed and tid not in subfailed and ustate["skipped"] and not hung:
                 failed.discard(tid)
                 recheck.append(tid)
