@@ -4,6 +4,7 @@ import enum
 import gzip
 import hashlib
 import json
+import marshal
 import os
 import re
 import sys
@@ -310,6 +311,13 @@ _MAPS = {}
 def _load(name):
     if name not in _MAPS:
         p = os.path.join(MAPDIR, name)
+        if os.environ.get('IMPORTTIME_MARSHAL', '1') == '1':
+            try:
+                with open(p[:-3] + '.m', 'rb') as f:
+                    _MAPS[name] = marshal.loads(f.read())
+                return _MAPS[name]
+            except (OSError, EOFError, ValueError, TypeError):
+                pass
         try:
             with open(p[:-3], 'rb') as f:
                 _MAPS[name] = json.load(f)
