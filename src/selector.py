@@ -79,6 +79,9 @@ CLOSURE = os.environ.get("BR_CLOSURE", "1") == "1"
 IMPORTBODY = os.environ.get("BR_IMPORTBODY", "1") == "1"
 CACHESITE = os.environ.get("BR_CACHESITE", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
+PLAN_FRAC = float(os.environ.get("BR_PLAN_FRAC", "0.35"))
+WATCHDOG = float(os.environ.get("BR_WATCHDOG", "0.94"))
+DOCFN = os.environ.get("BR_DOCFN", "1") == "1"
 DEBUGLOG = os.environ.get("BR_DEBUGLOG", "1") == "1"
 LEAN = os.environ.get("BR_LEAN", "1") == "1"
 CANARY_K = int(os.environ.get("BR_CANARY_K", "0"))
@@ -126,6 +129,10 @@ def _header_paths(rest):
     if rest[:2] == "a/" and rest[half:half + 3] == " b/" and rest[2:half] == rest[half + 3:]:
         return rest[2:half], rest[2:half]
     raise ValueError("bad diff header")
+
+
+def wall_span(n):
+    return min(270.0, 180.0 * max(1.0, n / 40.0))
 
 
 def parse_patch(text):
@@ -532,6 +539,59 @@ def strip_ast(text, resolve=None):
     if CANON:
         tree = _Canon(resolve).visit(tree)
     return ast.dump(tree, annotate_fields=False, include_attributes=False)
+
+
+def _is_future(st):
+    return isinstance(st, ast.ImportFrom) and st.module == "__future__" and not st.level
+
+
+def _touching(stmts, lines):
+    out = []
+    for st in stmts:
+        first = min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", ())])
+        i = bisect.bisect_left(lines, first)
+        if i < len(lines) and lines[i] <= st.end_lineno:
+            out.extend(_touching(st.body, lines) if isinstance(st, ast.ClassDef) else [st])
+    return out
+
+
+def compile_bad(tree, lines):
+    body = tree.body
+    head = 1 if body and _isdoc(body[0]) else 0
+    while head < len(body) and _is_future(body[head]):
+        head += 1
+    if any(_is_future(st) for st in body[head:]):
+        return True
+    try:
+        compile(ast.Module(body=body[:head] + _touching(body[head:], sorted(lines)), type_ignores=[]), "<check>", "exec", dont_inherit=True)
+    except (SyntaxError, ValueError):
+        return True
+    return False
+
+
+def _defs(body, pre=""):
+    for st in body:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield pre + st.name, st
+            yield from _defs(st.body, pre + st.name + ".")
+        else:
+            for sub in [getattr(st, k, ()) for k in ("body", "orelse", "finalbody")] + [h.body for h in getattr(st, "handlers", ())]:
+                if isinstance(sub, list):
+                    yield from _defs(sub, pre)
+
+
+def doc_moved(units, new_text, changed):
+    docs = [node for _, _, _, _, node in units.spans if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _isdoc(node.body[0]) and any(node.body[0].lineno <= ln <= node.body[0].end_lineno for ln in changed)]
+    if not docs:
+        return []
+    old_q = {id(n): q for q, n in _defs(units.tree.body)}
+    new_q = dict(_defs(parse_cached(new_text).body))
+    out = []
+    for node in docs:
+        nn = new_q.get(old_q.get(id(node)))
+        if nn is None or not _isdoc(nn.body[0]) and (len(node.body) < 2 or ast.dump(nn.body[0]) != ast.dump(node.body[1])):
+            out.append(range(node.body[1].lineno, node.body[1].end_lineno + 1) if len(node.body) > 1 else range(node.lineno, node.end_lineno + 1))
+    return out
 
 
 class Units:
@@ -1117,7 +1177,9 @@ def test_dependents(path, f, old_text, new_text):
     try:
         names = top_names(parse_cached(old_text)) if old_text is not None else {}
         newn = set(top_names(parse_cached(new_text))) if new_text is not None else set()
-    except SyntaxError:
+        if new_text is not None and compile_bad(parse_cached(new_text), new_side_lines(f["hunks"])):
+            names = {}
+    except (SyntaxError, ValueError):
         names, newn = {}, set()
     removed, anchors = changed_old_lines(f["hunks"])
     changed = removed | anchors
@@ -1206,7 +1268,7 @@ def support_dependents(path, old_text, new_text, cov):
             continue
         if not isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(x) is not type(y) or _fn_head(x) != _fn_head(y):
             return None
-        if shared_writes(a, set(range(x.lineno, x.end_lineno + 1)), old_text) or shared_writes(b, set(range(y.lineno, y.end_lineno + 1)), new_text):
+        if shared_writes(a, set(range(x.lineno, x.end_lineno + 1)), old_text) or shared_writes(b, set(range(y.lineno, y.end_lineno + 1)), new_text) or compile_bad(b, range(y.lineno, y.end_lineno + 1)):
             return None
         spans.append((min([x.lineno] + [d.lineno for d in x.decorator_list]), x.end_lineno))
 
@@ -1314,8 +1376,9 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             return full(n for n in cov.idx_to_num if n is not None)
         if new_text is not None:
             try:
-                parse_cached(new_text)
-            except SyntaxError:
+                if compile_bad(parse_cached(new_text), new_side_lines(f["hunks"])):
+                    raise SyntaxError("compile")
+            except (SyntaxError, ValueError):
                 notes.append("new-unparsable")
                 return full(n for n in cov.idx_to_num if n is not None)
             if _cookie(new_text) != _cookie(old_text or ""):
@@ -1355,8 +1418,9 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         if old_text is None:
             notes.append("newfile")
             return merge(merge(cov.tests_touching_file(path), full(module_test_files(path, cov))), full(package_scanners(cov)))
+        changed = {ln for h in f["hunks"] for part in changed_old_lines([h]) for ln in part}
         try:
-            units = Units(old_text, {ln for h in f["hunks"] for part in changed_old_lines([h]) for ln in part})
+            units = Units(old_text, changed)
         except SyntaxError:
             notes.append("old-unparsable")
             return merge(cov.tests_touching_file(path), extra)
@@ -1371,16 +1435,18 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         lam = LAMBDAS and new_units is not None and lambda_only(path, units, new_units, f["hunks"])
         if lam:
             notes.append("lambda-only")
+        for span in doc_moved(units, new_text, changed) if DOCFN else ():
+            notes.append("doc-moved")
+            merge(out, cov.tests_for_lines(path, span))
         site = CACHE_SITES.get(path)
         if site:
-            touched = {ln for h in f["hunks"] for part in changed_old_lines([h]) for ln in part}
-            if any(a <= ln <= b for a, b in site["lazy"] for ln in touched):
+            if any(a <= ln <= b for a, b in site["lazy"] for ln in changed):
                 notes.append("lazy-getattr")
                 every = full(n for n in cov.idx_to_num if n is not None)
                 FORCE_LIST.update(every)
                 return every
             for fill, readers in site["memo"]:
-                if any(a <= ln <= b for a, b in fill for ln in touched):
+                if any(a <= ln <= b for a, b in fill for ln in changed):
                     notes.append("memo-site")
                     merge(out, full(cov.tests_for_lines(path, readers)))
         for h in f["hunks"]:
@@ -2473,7 +2539,7 @@ def lean_run(order, stop, optcache, budgets, total):
     return bad
 
 
-def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None):
+def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None, token=""):
     if DEBUG:
         import faulthandler
         faulthandler.enable()
@@ -2483,6 +2549,12 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None):
     if not DEBUG:
         os.dup2(devnull, 2)
     os.environ["SKIP_INTEGRATION"] = "0"
+    try:
+        os.setpgid(0, 0)
+        with open("/proc/self/oom_score_adj", "w") as fh:
+            fh.write("1000")
+    except OSError:
+        pass
     install_futures()
     if mode is not None and mode[0] == "swap":
         import builtins
@@ -2536,9 +2608,9 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None):
     flagged = set()
 
     def emit(tag, tid):
-        if tag in ("F", "X", "K"):
+        if tag in ("F", "X", "K", "I"):
             flagged.add(tid)
-        out.write(f"{tag} {tid}\n")
+        out.write(f"{token}{tag} {tid}\n")
 
     class Timeout(BaseException):
         pass
@@ -2564,11 +2636,14 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None):
             try:
                 signal.setitimer(signal.ITIMER_REAL, 20.0, 0.5)
                 importlib.import_module(modname)
-            except BaseException:
+            except BaseException as e:
                 for tid in tids:
-                    emit("F", tid)
+                    emit("I", tid)
+                if not isinstance(e, Exception):
+                    emit("A", modname)
             finally:
                 signal.setitimer(signal.ITIMER_REAL, 0)
+    emit("G", "-")
     case_to_id = {}
     failed = set()
     subfailed = set()
@@ -2581,8 +2656,10 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None):
         try:
             m = __import__(mod, fromlist=["_"])
             c = getattr(m, cls)(meth)
-        except BaseException:
+        except BaseException as e:
             emit("F", tid)
+            if not isinstance(e, Exception):
+                emit("A", tid)
             continue
         case_to_id[id(c)] = tid
         cases.append(c)
@@ -2859,12 +2936,22 @@ class Job:
         self.current = None
         self.done = False
         self.buf = b""
+        self.sticky = set()
+        self.abort = False
+        self.collected = False
+        self.known = set(tests) | {MEMO_TEST}
+        self.token = os.urandom(8).hex() + " "
         r, w = os.pipe()
-        pid = os.fork()
+        try:
+            pid = os.fork()
+        except OSError:
+            os.close(r)
+            os.close(w)
+            raise
         if pid == 0:
             os.close(r)
             try:
-                child_run(root, tests, timeouts, w, sel or {}, mode, lean)
+                child_run(root, tests, timeouts, w, sel or {}, mode, lean, self.token)
             except BaseException:
                 if DEBUG:
                     import traceback
@@ -2872,6 +2959,10 @@ class Job:
             finally:
                 os._exit(1)
         os.close(w)
+        try:
+            os.setpgid(pid, pid)
+        except OSError:
+            pass
         self.pid = pid
         self.fd = r
 
@@ -2881,17 +2972,34 @@ class Job:
             self.finish()
             return
         self.buf += data
+        token = self.token.encode()
         while b"\n" in self.buf:
             line, self.buf = self.buf.split(b"\n", 1)
-            tag, tid = line.decode().split(" ", 1)
+            if not line.startswith(token):
+                continue
+            try:
+                tag, tid = line[len(token):].decode().split(" ", 1)
+            except ValueError:
+                continue
+            if tag in ("S", "P", "F") and tid not in self.known:
+                continue
             if tag == "S":
                 self.current = tid
             elif tag in ("P", "F"):
                 self.status[tid] = tag
                 self.current = None
             elif tag == "C":
-                t, c = tid.rsplit(" ", 1)
-                self.tcpu[t] = float(c)
+                t, _, c = tid.rpartition(" ")
+                try:
+                    self.tcpu[t] = float(c)
+                except ValueError:
+                    pass
+            elif tag == "I":
+                self.sticky.add(tid)
+            elif tag == "A":
+                self.abort = True
+            elif tag == "G":
+                self.collected = True
             elif tag == "X":
                 self.broken = True
             elif tag == "Q":
@@ -2899,7 +3007,8 @@ class Job:
             elif tag == "K":
                 self.klass_fail = getattr(self, "klass_fail", set()) | {tid}
             elif tag == "D":
-                pass
+                self.finish()
+                return
 
     def cpu_now(self):
         try:
@@ -2925,6 +3034,10 @@ class Job:
         except OSError:
             pass
         self.cpu = 0.0
+        try:
+            os.killpg(self.pid, signal.SIGKILL)
+        except OSError:
+            pass
         try:
             _, st, ru = os.wait4(self.pid, 0)
             self.cpu = ru.ru_utime + ru.ru_stime
@@ -2952,169 +3065,185 @@ def main():
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
     plans = []
     memo_warm = None
+
+    def blind_plan(cid, notes):
+        return {"cid": cid, "hunks": {}, "old": {}, "patched": {}, "light": [], "heavy": set(num_to_id), "notes": notes, "ok": False, "sel": {}, "cap": 0.0, "memo": False, "touched": set(), "strict": False, "lean": None, "fallback": None, "picks": None, "price": 0, "gain": 0}
+
     for cid in commits:
-        text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape").read()
-        FRACTION_OK.clear()
-        FORCE_LIST.clear()
-        notes = []
-        cands = {}
-        patched = {}
-        hunks_by = {}
-        old_by = {}
-        ok = True
+        if time.monotonic() > T0 + PLAN_FRAC * BUDGET_FRAC * wall_span(len(commits)):
+            log(cid, "plan budget spent")
+            plans.append(blind_plan(cid, ["late"]))
+            continue
         try:
-            files = parse_patch(text)
-            for f in files:
-                if f.get("binary"):
-                    notes.append("binary:" + f["path"])
-                    for q in {f["old"], f["path"]}:
-                        r = candidates_for(dict(f, path=q, old=q, deleted=True, new_file=False, hunks=[]), None, None, cov, notes)
-                        FORCE_LIST.update(r)
-                        merge(cands, r)
-                    continue
-                src = os.path.join(SRC, f["old"])
-                old_text = None
-                if not f["new_file"] and os.path.exists(src):
-                    with open(src, encoding="utf-8", newline="") as fh:
-                        old_text = fh.read()
-                new_text = None if f["deleted"] else apply_file(old_text or "", f["hunks"])
-                patched[f["path"]] = new_text
-                hunks_by[f["path"]] = f["hunks"]
-                old_by[f["path"]] = old_text
-                if f["old"] != f["path"]:
-                    patched[f["old"]] = None
-                    if PATHRULES and not f["old"].startswith("sqlglot/"):
-                        merge(cands, candidates_for(dict(f, path=f["old"], deleted=True, hunks=[]), old_text, None, cov, notes))
-                merge(cands, candidates_for(f, old_text, new_text, cov, notes))
-        except Exception as e:
-            ok = False
-            notes.append(f"error:{type(e).__name__}:{e}")
-            cands = full(num_to_id)
-        if IMPORTT and "importtime" in notes:
+            text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape").read()
+            FRACTION_OK.clear()
+            FORCE_LIST.clear()
+            notes = []
+            cands = {}
+            patched = {}
+            hunks_by = {}
+            old_by = {}
+            ok = True
             try:
-                os.environ.setdefault("IMPORTTIME_SQLGLOT", SRC)
-                os.environ.setdefault("IMPORTTIME_MAPS", os.path.join(HERE, "itmaps"))
-                import importtime as itf
-                if ITF_UNITS:
-                    extra, info = itf.extra_candidates_units(text, root=SRC, with_info=True)
-                    whole = "import-body" in notes
-                    for n, keys in extra.items():
-                        if n in num_to_id:
-                            keys = None if whole else keys
-                            if keys is not None:
-                                FRACTION_OK.add(n)
-                            merge(cands, {n: keys})
-                else:
-                    extra, info = itf.extra_candidates(text, root=SRC, with_info=True)
-                    merge(cands, full(n for n in extra if n in num_to_id))
-                if "import-body" in notes and "dynamic_paths" not in info:
-                    dyn, dinfo = itf.dynamic_extra_candidates(text, root=SRC, items=True)
-                    if dinfo.get("error"):
-                        raise RuntimeError("dynamic")
-                    notes.append("dynamic:%d" % len(dyn))
-                    merge(cands, full(n for n in itf.items_to_units(dyn) if n in num_to_id))
-                notes.append("itf:%d%s" % (len(extra), "" if info.get("confident", True) else ":unconfident"))
+                files = parse_patch(text)
+                for f in files:
+                    if f.get("binary"):
+                        notes.append("binary:" + f["path"])
+                        for q in {f["old"], f["path"]}:
+                            r = candidates_for(dict(f, path=q, old=q, deleted=True, new_file=False, hunks=[]), None, None, cov, notes)
+                            FORCE_LIST.update(r)
+                            merge(cands, r)
+                        continue
+                    src = os.path.join(SRC, f["old"])
+                    old_text = None
+                    if not f["new_file"] and os.path.exists(src):
+                        with open(src, encoding="utf-8", newline="") as fh:
+                            old_text = fh.read()
+                    new_text = None if f["deleted"] else apply_file(old_text or "", f["hunks"])
+                    patched[f["path"]] = new_text
+                    hunks_by[f["path"]] = f["hunks"]
+                    old_by[f["path"]] = old_text
+                    if f["old"] != f["path"]:
+                        patched[f["old"]] = None
+                        if PATHRULES and not f["old"].startswith("sqlglot/"):
+                            merge(cands, candidates_for(dict(f, path=f["old"], deleted=True, hunks=[]), old_text, None, cov, notes))
+                    merge(cands, candidates_for(f, old_text, new_text, cov, notes))
             except Exception as e:
-                notes.append(f"itf-error:{type(e).__name__}")
+                ok = False
+                notes.append(f"error:{type(e).__name__}:{e}")
                 cands = full(num_to_id)
-        for n, keys in cands.items():
-            word = _MP_TESTS.get(num_to_id[n].rsplit("::", 1)[-1])
-            if word and keys:
-                for k in list(keys):
-                    m = _QKEY.match(k)
-                    if k.startswith("f:"):
-                        keys.add("s:%r" % (("%s %d" % (word, int(k[2:]) + 1), []),))
-                    elif m and m.group(1) == word:
-                        keys.add("f:%d" % (int(m.group(2)) - 1))
-        if DEBUG_N in cands:
-            log(cid, "dbg", DEBUG_N, "keys", None if cands[DEBUG_N] is None else len(cands[DEBUG_N]), "fracok", DEBUG_N in FRACTION_OK, None if cands[DEBUG_N] is None else sorted(cands[DEBUG_N])[:5])
-        cached = TPCREF and LAZYTABLES and tpc_lazy(patched)
-        memo_n = id_to_num.get(MEMO_TEST)
-        if MEMO and memo_n in cands:
-            if memo_warm is None:
-                memo_warm = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
-            use_memo = memo_ok(patched, hunks_by, old_by, notes, memo_warm)
-        else:
-            use_memo = False
-        touched = set()
-        if use_memo:
-            use_memo, touched = use_memo
-            fx = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
-            if fx in patched and all(r == fx or "noop:" + r in notes or not (r.startswith("sqlglot/") or "/tpc-" in r or r in ("tests/helpers.py", "tests/test_executor.py")) for r in patched):
+            if IMPORTT and "importtime" in notes:
                 try:
-                    known = {(q, tuple(sorted(m.items()))) for (q, m), _ in _pairs(old_by[fx])}
-                    fresh = [i + 1 for i, ((q, m), _) in enumerate(_pairs(patched[fx])) if (q, tuple(sorted(m.items()))) not in known]
-                except Exception:
-                    fresh = None
-                if fresh is not None:
-                    keys = {"f:%d" % (i - 1) for i in fresh} | {"s:%r" % (("tpc-ds %d" % i, []),) for i in fresh}
-                    if cands[memo_n] is None or keys < cands[memo_n]:
-                        cands[memo_n] = keys
-                    notes.append("memo-fresh:%d" % len(fresh))
-            notes.append("memo:%s:%d" % (use_memo, len(touched)))
-
-        def est(n, memo=True):
-            c = runcpu.get(num_to_id[n], 0)
-            if memo and use_memo and n == memo_n:
-                pre, run = memo_data()["pre"]["ds"], memo_data()["run"]["ds"]
-                keys = set(pre) if cands[n] is None else set(cands[n])
-                return min(c, UNIT_K * sum(pre.get(k, 0) + (run.get(k, 0) if k in touched else 0) for k in keys) + FRAC_C)
-            if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
-                return c
-            u = cached and unitcpu["units"].get(num_to_id[n])
-            if u:
-                return min(c, UNIT_K * sum(u.get(k, 0) for k in cands[n]) + FRAC_C)
-            return min(c, c * FRAC_K * len(cands[n]) / cov.nunits[n] + FRAC_C)
-
-        def decide(price=None):
-            def cost(n):
-                return price if price is not None and n == memo_n else est(n)
-
-            heavy = {n for n in cands if n in FORCE_LIST or ms[n] >= HEAVY_MS or (LISTRULE and cost(n) * 1000 > ms[n] + 2000)}
-            light = sorted(set(cands) - heavy)
-            whole = split_cost(sorted(cands), ms)
-            cap = whole - split_cost(sorted(heavy), ms)
-            over = RUN_O_RE if ("importtime" in notes or any(not r.endswith(".py") for r in patched)) else RUN_O
-            if light and (RUN_K * sum(cost(n) for n in light) + over) * 1000 >= cap:
-                return set(cands), [], cap, "blind"
-            if price is None and light and memo_n in light and est(memo_n, False) * 1000 > ms[memo_n] + 2000 and (RUN_K * sum(est(n) for n in light if n != memo_n) + over) * 1000 >= whole - split_cost(sorted(heavy | {memo_n}), ms):
-                spend = RUN_K * sum(est(n) * (1 if n == memo_n else MEMO_K) for n in light) + over
-                if spend * 1000 >= cap:
-                    return set(cands), [], cap, "blind:memo"
-            return heavy, light, cap, None
-
-        heavy, light, cap, blind = decide()
-        lean = fallback = picks = None
-        u = lean_cost() if LEAN and ok and cached and memo_n in heavy and memo_n not in FORCE_LIST and _lean_meta() else None
-        if u and lean_gate(notes, patched, old_by, hunks_by):
-            need = lean_need(cov, memo_n, patched, hunks_by, notes, u)
-            optcache = not any(r in _lean_meta()["optfiles"] for r in patched if "noop:" + r not in notes)
-            if CANARY_K:
-                chosen = canary_pick(need, u, CANARY_K)
-                order = lean_order(need, u, chosen)
-                price = CANARY_SCALE * sum(u[q] for q in chosen) + FRAC_C
+                    os.environ.setdefault("IMPORTTIME_SQLGLOT", SRC)
+                    os.environ.setdefault("IMPORTTIME_MAPS", os.path.join(HERE, "itmaps"))
+                    import importtime as itf
+                    if ITF_UNITS:
+                        extra, info = itf.extra_candidates_units(text, root=SRC, with_info=True)
+                        whole = "import-body" in notes
+                        for n, keys in extra.items():
+                            if n in num_to_id:
+                                keys = None if whole else keys
+                                if keys is not None:
+                                    FRACTION_OK.add(n)
+                                merge(cands, {n: keys})
+                    else:
+                        extra, info = itf.extra_candidates(text, root=SRC, with_info=True)
+                        merge(cands, full(n for n in extra if n in num_to_id))
+                    if "import-body" in notes and "dynamic_paths" not in info:
+                        dyn, dinfo = itf.dynamic_extra_candidates(text, root=SRC, items=True)
+                        if dinfo.get("error"):
+                            raise RuntimeError("dynamic")
+                        notes.append("dynamic:%d" % len(dyn))
+                        merge(cands, full(n for n in itf.items_to_units(dyn) if n in num_to_id))
+                    rc = re.match(r"rc=(-?\d+) ", info.get("dynamic_error") or "")
+                    if rc and (int(rc[1]) < 0 or not info["dynamic_error"][rc.end():].strip()):
+                        raise RuntimeError("dynamic killed")
+                    notes.append("itf:%d%s" % (len(extra), "" if info.get("confident", True) else ":unconfident"))
+                except Exception as e:
+                    notes.append(f"itf-error:{type(e).__name__}")
+                    cands = full(num_to_id)
+            for n, keys in cands.items():
+                word = _MP_TESTS.get(num_to_id[n].rsplit("::", 1)[-1])
+                if word and keys:
+                    for k in list(keys):
+                        m = _QKEY.match(k)
+                        if k.startswith("f:"):
+                            keys.add("s:%r" % (("%s %d" % (word, int(k[2:]) + 1), []),))
+                        elif m and m.group(1) == word:
+                            keys.add("f:%d" % (int(m.group(2)) - 1))
+            if DEBUG_N in cands:
+                log(cid, "dbg", DEBUG_N, "keys", None if cands[DEBUG_N] is None else len(cands[DEBUG_N]), "fracok", DEBUG_N in FRACTION_OK, None if cands[DEBUG_N] is None else sorted(cands[DEBUG_N])[:5])
+            cached = TPCREF and LAZYTABLES and tpc_lazy(patched)
+            memo_n = id_to_num.get(MEMO_TEST)
+            if MEMO and memo_n in cands:
+                if memo_warm is None:
+                    memo_warm = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
+                use_memo = memo_ok(patched, hunks_by, old_by, notes, memo_warm)
             else:
-                order = lean_order(need, u)
-                price = LEAN_OPT_COST if optcache else LEAN_COST
-            if LEANCAL:
-                picks = {k: [int(q[2:]) for q in canary_pick(need, u, k)] for k in (0, 2, 4, 8)}
-            h2, l2, c2, b2 = decide(price)
-            saving = (split_cost(sorted(h2 | {memo_n}), ms) - split_cost(sorted(h2), ms)) / 1000
-            if memo_n in l2 and price < saving or LEANCAL:
-                fallback = {"light": light, "heavy": heavy, "cap": cap / 1000, "notes": ([blind] if blind else []) + notes, "sel": {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}, "lean": None, "fallback": None, "price": 0}
-                heavy, light, cap, blind = (h2 - {memo_n}, sorted(set(l2) | {memo_n}), 1e9, b2) if LEANCAL else (h2, l2, c2, b2)
-                if blind:
-                    heavy, light, blind = heavy - {memo_n}, [memo_n], None
-                notes = notes + ["lean%s%s:%.1f" % (":k%d" % CANARY_K if CANARY_K else "", ":opt" if optcache else "", saving)]
-                lean = (order, optcache, {} if LEANCAL else {int(q[2:]): BUDGET_K * c + BUDGET_C for q, c in u.items()}, 1e6 if LEANCAL else saving / LEAN_SCALE)
-        if blind:
-            notes.insert(0, blind)
-        sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light if not (lean and n == memo_n)}
-        runs_memo = memo_n in light and not lean
-        plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000, "memo": use_memo if runs_memo else False, "touched": touched, "strict": use_memo and runs_memo and est(memo_n, False) * 1000 > ms[memo_n] + 2000, "lean": lean, "fallback": fallback, "picks": picks, "price": price if lean else 0, "gain": saving - price if lean else 0})
-        log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4], "memo:%s:%d" % (use_memo, len(touched)) if use_memo else "")
+                use_memo = False
+            touched = set()
+            if use_memo:
+                use_memo, touched = use_memo
+                fx = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+                if fx in patched and all(r == fx or "noop:" + r in notes or not (r.startswith("sqlglot/") or "/tpc-" in r or r in ("tests/helpers.py", "tests/test_executor.py")) for r in patched):
+                    try:
+                        known = {(q, tuple(sorted(m.items()))) for (q, m), _ in _pairs(old_by[fx])}
+                        fresh = [i + 1 for i, ((q, m), _) in enumerate(_pairs(patched[fx])) if (q, tuple(sorted(m.items()))) not in known]
+                    except Exception:
+                        fresh = None
+                    if fresh is not None:
+                        keys = {"f:%d" % (i - 1) for i in fresh} | {"s:%r" % (("tpc-ds %d" % i, []),) for i in fresh}
+                        if cands[memo_n] is None or keys < cands[memo_n]:
+                            cands[memo_n] = keys
+                        notes.append("memo-fresh:%d" % len(fresh))
+                notes.append("memo:%s:%d" % (use_memo, len(touched)))
 
-    room = LEAN_ROOM * PARALLEL * BUDGET_FRAC * min(270.0, 180.0 * max(1.0, len(commits) / 40.0))
+            def est(n, memo=True):
+                c = runcpu.get(num_to_id[n], 0)
+                if memo and use_memo and n == memo_n:
+                    pre, run = memo_data()["pre"]["ds"], memo_data()["run"]["ds"]
+                    keys = set(pre) if cands[n] is None else set(cands[n])
+                    return min(c, UNIT_K * sum(pre.get(k, 0) + (run.get(k, 0) if k in touched else 0) for k in keys) + FRAC_C)
+                if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
+                    return c
+                u = cached and unitcpu["units"].get(num_to_id[n])
+                if u:
+                    return min(c, UNIT_K * sum(u.get(k, 0) for k in cands[n]) + FRAC_C)
+                return min(c, c * FRAC_K * len(cands[n]) / cov.nunits[n] + FRAC_C)
+
+            def decide(price=None):
+                def cost(n):
+                    return price if price is not None and n == memo_n else est(n)
+
+                heavy = {n for n in cands if n in FORCE_LIST or ms[n] >= HEAVY_MS or (LISTRULE and cost(n) * 1000 > ms[n] + 2000)}
+                light = sorted(set(cands) - heavy)
+                whole = split_cost(sorted(cands), ms)
+                cap = whole - split_cost(sorted(heavy), ms)
+                over = RUN_O_RE if ("importtime" in notes or any(not r.endswith(".py") for r in patched)) else RUN_O
+                if light and (RUN_K * sum(cost(n) for n in light) + over) * 1000 >= cap:
+                    return set(cands), [], cap, "blind"
+                if price is None and light and memo_n in light and est(memo_n, False) * 1000 > ms[memo_n] + 2000 and (RUN_K * sum(est(n) for n in light if n != memo_n) + over) * 1000 >= whole - split_cost(sorted(heavy | {memo_n}), ms):
+                    spend = RUN_K * sum(est(n) * (1 if n == memo_n else MEMO_K) for n in light) + over
+                    if spend * 1000 >= cap:
+                        return set(cands), [], cap, "blind:memo"
+                return heavy, light, cap, None
+
+            heavy, light, cap, blind = decide()
+            lean = fallback = picks = None
+            u = lean_cost() if LEAN and ok and cached and memo_n in heavy and memo_n not in FORCE_LIST and _lean_meta() else None
+            if u and lean_gate(notes, patched, old_by, hunks_by):
+                need = lean_need(cov, memo_n, patched, hunks_by, notes, u)
+                optcache = not any(r in _lean_meta()["optfiles"] for r in patched if "noop:" + r not in notes)
+                if CANARY_K:
+                    chosen = canary_pick(need, u, CANARY_K)
+                    order = lean_order(need, u, chosen)
+                    price = CANARY_SCALE * sum(u[q] for q in chosen) + FRAC_C
+                else:
+                    order = lean_order(need, u)
+                    price = LEAN_OPT_COST if optcache else LEAN_COST
+                if LEANCAL:
+                    picks = {k: [int(q[2:]) for q in canary_pick(need, u, k)] for k in (0, 2, 4, 8)}
+                h2, l2, c2, b2 = decide(price)
+                saving = (split_cost(sorted(h2 | {memo_n}), ms) - split_cost(sorted(h2), ms)) / 1000
+                if memo_n in l2 and price < saving or LEANCAL:
+                    fallback = {"light": light, "heavy": heavy, "cap": cap / 1000, "notes": ([blind] if blind else []) + notes, "sel": {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}, "lean": None, "fallback": None, "price": 0}
+                    heavy, light, cap, blind = (h2 - {memo_n}, sorted(set(l2) | {memo_n}), 1e9, b2) if LEANCAL else (h2, l2, c2, b2)
+                    if blind:
+                        heavy, light, blind = heavy - {memo_n}, [memo_n], None
+                    notes = notes + ["lean%s%s:%.1f" % (":k%d" % CANARY_K if CANARY_K else "", ":opt" if optcache else "", saving)]
+                    lean = (order, optcache, {} if LEANCAL else {int(q[2:]): BUDGET_K * c + BUDGET_C for q, c in u.items()}, 1e6 if LEANCAL else saving / LEAN_SCALE)
+            if blind:
+                notes.insert(0, blind)
+            sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light if not (lean and n == memo_n)}
+            runs_memo = memo_n in light and not lean
+            plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000, "memo": use_memo if runs_memo else False, "touched": touched, "strict": use_memo and runs_memo and est(memo_n, False) * 1000 > ms[memo_n] + 2000, "lean": lean, "fallback": fallback, "picks": picks, "price": price if lean else 0, "gain": saving - price if lean else 0})
+            log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4], "memo:%s:%d" % (use_memo, len(touched)) if use_memo else "")
+        except Exception as e:
+            log(cid, "plan failed", repr(e)[:300])
+            plans[:] = [q for q in plans if q["cid"] != cid]
+            plans.append(blind_plan(cid, ["error:plan:%s" % type(e).__name__]))
+
+    room = LEAN_ROOM * PARALLEL * BUDGET_FRAC * wall_span(len(commits))
     spent = sum(p["price"] for p in plans)
     for p in sorted((p for p in plans if p["fallback"] and not LEANCAL), key=lambda p: p["gain"]):
         if spent <= room:
@@ -3131,98 +3260,111 @@ def main():
         return
     if os.environ.get("BR_PLANONLY"):
         return
-    imap = json.load(gzip.open(os.path.join(HERE, "importmap.json.gz"), "rt"))
-    mod_tids = {}
-    for n, tid in num_to_id.items():
-        mod_tids.setdefault(tid.split("::")[0][:-3].replace("/", "."), []).append(tid)
-    for p in plans:
-        mask = 0
-        for rel, content in p["patched"].items():
-            if not rel.endswith(".py") or not rel.startswith(("sqlglot/", "tests/")) or "gone:" + rel in p["notes"]:
-                continue
-            if content is None or p["old"].get(rel) is None:
-                mask = -1
-                break
-            if "noop:" + rel in p["notes"]:
-                continue
-            fm = imap["files"].get(rel, {})
-            removed, anchors = changed_old_lines(p["hunks"][rel])
-            for ln in removed | anchors:
-                mask |= fm.get(str(ln), 0)
-            if NEWTOP and "newtop:" + rel in p["notes"]:
-                for v in fm.values():
-                    mask |= v
-        mods = imap["modules"]
-        chosen = mods if mask == -1 else [m for i, m in enumerate(mods) if mask >> i & 1]
-        p["collect"] = {m: mod_tids.get(m, []) for m in chosen} if COLLECT and chosen else None
-        if p["collect"]:
-            log(p["cid"], "collect", len(chosen))
-    for p in plans:
-        p["probe"] = p["collect"] is not None or (PROBE and "importtime" in p["notes"])
-    for p in plans:
-        p["runs"] = [n for n in p["light"] if not (p["lean"] and num_to_id[n] == MEMO_TEST)]
-    heavy_libs = ("tests/test_executor.py", "tests/test_optimizer.py")
-    needs_libs = any(num_to_id[n].startswith(heavy_libs) for p in plans for n in p["runs"]) or any(m in ("tests.test_executor", "tests.test_optimizer") for p in plans for m in (p["collect"] or ()))
-    if LAZYPANDAS:
-        needs_exec = any(num_to_id[n].startswith("tests/test_executor.py") for p in plans for n in p["runs"]) or any(m == "tests.test_executor" for p in plans for m in (p["collect"] or ()))
-        if not needs_exec:
-            sys.modules["pandas.testing"] = _LazyPandasTesting("pandas.testing")
-            needs_libs = False
-            try:
-                import duckdb
-            except Exception:
-                pass
-    if any(p["light"] or p.get("probe") for p in plans):
-        preimport(needs_libs or not LEANIMP)
-    log("preimported cpu=%.2f" % time.process_time())
-    zyg = None
-    if ZYGOTE and any(p["light"] or p.get("probe") for p in plans):
-        import zygote
-        install_futures()
-        warm_ids = sorted({num_to_id[n] for p in plans for n in p["runs"]})
-        table_attrs = {"tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls", "cached_execute", "subtestHelper", "_mp_execute"}
-        reach = {}
-        for _, _, classes in _setup_index(cov):
-            for _, _, tattrs in classes:
-                reach.update(tattrs)
-
-        def needs_tables(n):
-            if not num_to_id[n].startswith("tests/test_executor.py::TestExecutor::"):
-                return False
-            r = reach.get(n)
-            return not LAZYEXEC or r is None or bool(r & table_attrs)
-
-        exec_commits = sum(1 for p in plans if any(needs_tables(n) for n in p["runs"]))
-        opt_commits = sum(1 for p in plans if any(num_to_id[n].startswith("tests/test_optimizer.py::TestOptimizer::") for n in p["light"]))
-        zygote.warm(SRC, warm_ids, (TPCWARM or not (TPCREF and LAZYTABLES)) and exec_commits >= (3 if LAZYTABLES else 2 if LAZYEXEC or LEANIMP else 1), OPTWARM and opt_commits >= 2)
-        if PARTIAL:
-            load_edges()
-        warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
-        code_idx = zygote.code_index({os.path.join(SRC, r) for p in plans for r in p["patched"] if r.endswith(".py")})
-        zyg = (zygote, warm_lines, code_idx)
-        if GCFREEZE:
-            _PARSED.clear()
-            gc.collect()
-            gc.freeze()
-        log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
-    if GCOFF:
-        gc.freeze()
-        gc.enable()
     results = {}
-    pending = [p for p in plans if p["light"] or p["probe"]]
-    for p in plans:
-        if not p["light"] and not p["probe"]:
-            results[p["cid"]] = set(p["heavy"])
-    pending.sort(key=lambda p: -sum(ms[n] for n in p["light"]))
     running = []
-    queue = list(pending)
-    end = T0 + BUDGET_FRAC * min(270.0, 180.0 * max(1.0, len(commits) / 40.0))
-    while queue or running:
-        while queue and len(running) < PARALLEL:
-            p = queue.pop(0)
-            if time.monotonic() > end - 5:
-                results[p["cid"]] = set(p["heavy"]) | set(p["light"])
-                continue
+
+    def listing(p):
+        if p.get("probe", True) and "importtime" in p["notes"]:
+            return set(num_to_id)
+        return set(p["heavy"]) | set(p["light"]) | {id_to_num[t] for tids in (p.get("collect") or {}).values() for t in tids}
+
+    try:
+        imap = json.load(gzip.open(os.path.join(HERE, "importmap.json.gz"), "rt"))
+        mod_tids = {}
+        for n, tid in num_to_id.items():
+            mod_tids.setdefault(tid.split("::")[0][:-3].replace("/", "."), []).append(tid)
+        for p in plans:
+            mask = 0
+            for rel, content in p["patched"].items():
+                if not rel.endswith(".py") or not rel.startswith(("sqlglot/", "tests/")) or "gone:" + rel in p["notes"]:
+                    continue
+                if content is None or p["old"].get(rel) is None:
+                    mask = -1
+                    break
+                if "noop:" + rel in p["notes"]:
+                    continue
+                fm = imap["files"].get(rel, {})
+                removed, anchors = changed_old_lines(p["hunks"][rel])
+                for ln in removed | anchors:
+                    mask |= fm.get(str(ln), 0)
+                if NEWTOP and "newtop:" + rel in p["notes"]:
+                    for v in fm.values():
+                        mask |= v
+            mods = imap["modules"]
+            chosen = mods if mask == -1 else [m for i, m in enumerate(mods) if mask >> i & 1]
+            p["collect"] = {m: mod_tids.get(m, []) for m in chosen} if COLLECT and chosen else None
+            if p["collect"]:
+                log(p["cid"], "collect", len(chosen))
+        for p in plans:
+            p["probe"] = (p["collect"] is not None or (PROBE and "importtime" in p["notes"])) and len(p["heavy"]) < len(num_to_id)
+        for p in plans:
+            p["runs"] = [n for n in p["light"] if not (p["lean"] and num_to_id[n] == MEMO_TEST)]
+        heavy_libs = ("tests/test_executor.py", "tests/test_optimizer.py")
+        needs_libs = any(num_to_id[n].startswith(heavy_libs) for p in plans for n in p["runs"]) or any(m in ("tests.test_executor", "tests.test_optimizer") for p in plans for m in (p["collect"] or ()))
+        if LAZYPANDAS:
+            needs_exec = any(num_to_id[n].startswith("tests/test_executor.py") for p in plans for n in p["runs"]) or any(m == "tests.test_executor" for p in plans for m in (p["collect"] or ()))
+            if not needs_exec:
+                sys.modules["pandas.testing"] = _LazyPandasTesting("pandas.testing")
+                needs_libs = False
+                try:
+                    import duckdb
+                except Exception:
+                    pass
+        if any(p["light"] or p.get("probe") for p in plans):
+            preimport(needs_libs or not LEANIMP)
+        log("preimported cpu=%.2f" % time.process_time())
+        zyg = None
+        if ZYGOTE and any(p["light"] or p.get("probe") for p in plans):
+            import zygote
+            install_futures()
+            warm_ids = sorted({num_to_id[n] for p in plans for n in p["runs"]})
+            table_attrs = {"tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls", "cached_execute", "subtestHelper", "_mp_execute"}
+            reach = {}
+            for _, _, classes in _setup_index(cov):
+                for _, _, tattrs in classes:
+                    reach.update(tattrs)
+
+            def needs_tables(n):
+                if not num_to_id[n].startswith("tests/test_executor.py::TestExecutor::"):
+                    return False
+                r = reach.get(n)
+                return not LAZYEXEC or r is None or bool(r & table_attrs)
+
+            exec_commits = sum(1 for p in plans if any(needs_tables(n) for n in p["runs"]))
+            opt_commits = sum(1 for p in plans if any(num_to_id[n].startswith("tests/test_optimizer.py::TestOptimizer::") for n in p["light"]))
+            zygote.warm(SRC, warm_ids, (TPCWARM or not (TPCREF and LAZYTABLES)) and exec_commits >= (3 if LAZYTABLES else 2 if LAZYEXEC or LEANIMP else 1), OPTWARM and opt_commits >= 2)
+            if PARTIAL:
+                load_edges()
+            warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
+            code_idx = zygote.code_index({os.path.join(SRC, r) for p in plans for r in p["patched"] if r.endswith(".py")})
+            zyg = (zygote, warm_lines, code_idx)
+            if GCFREEZE:
+                _PARSED.clear()
+                gc.collect()
+                gc.freeze()
+            log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
+        if GCOFF:
+            gc.freeze()
+            gc.enable()
+        pending = [p for p in plans if p["light"] or p["probe"]]
+        for p in plans:
+            if not p["light"] and not p["probe"]:
+                results[p["cid"]] = set(p["heavy"])
+        pending.sort(key=lambda p: -sum(ms[n] for n in p["light"]))
+        queue = list(pending)
+        end = T0 + BUDGET_FRAC * wall_span(len(commits))
+
+        def write_overlay(p, mode, root):
+            if THINOV and mode is not None and mode[0] == "swap":
+                for rel in mode[3]:
+                    os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+                    with open(os.path.join(root, rel), "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+                        fh.write(p["patched"][rel])
+            else:
+                build_overlay(root, p["patched"])
+
+        def start(p):
+            global CHILD_LAZY, CHILD_PATCHED, CHILD_MEMO
             root = os.path.join(TMP, "ov", p["cid"])
             slot = False
             ids = [num_to_id[n] for n in p["runs"]]
@@ -3250,81 +3392,102 @@ def main():
                         if rel in zmod.WARM_OPENED:
                             ok = False
                         nonpy.append(rel)
-                if ok:
+                if ok and not p["probe"]:
                     mode = ("swap", swaps, code_idx, nonpy)
                 log(p["cid"], "mode", mode[0])
             try:
                 rmtree(root)
-                if THINOV and mode is not None and mode[0] == "swap":
-                    for rel in mode[3]:
-                        os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
-                        with open(os.path.join(root, rel), "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
-                            fh.write(p["patched"][rel])
-                else:
-                    if REUSEOV:
-                        slot = True
-                        root = SLOTS.pop() if SLOTS else root
-                    build_overlay(root, p["patched"])
+                if REUSEOV and not (THINOV and mode is not None and mode[0] == "swap"):
+                    slot = True
+                    root = SLOTS.pop() if SLOTS else root
+                write_overlay(p, mode, root)
             except Exception as e:
                 log(p["cid"], "overlay failed", repr(e))
-                results[p["cid"]] = set(num_to_id)
-                continue
-            global CHILD_LAZY, CHILD_PATCHED, CHILD_MEMO
+                import tempfile
+                slot = False
+                root = os.path.join(tempfile.mkdtemp(prefix="ovr", dir=TMP), p["cid"])
+                write_overlay(p, mode, root)
             CHILD_PATCHED = list(p["patched"])
             CHILD_MEMO = (memo_blobs(p["touched"]), memo_data()["drop"], memo_state() if p["memo"] == "state" else None, p["strict"] and MEMO_MISS + 2 * sum(memo_data()["run"]["ds"].get(k, 0) for k in p["touched"])) if p["memo"] else None
             CHILD_LAZY = tpc_lazy(p["patched"])
-            p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode, p["lean"])
             p["root"] = root
             p["slot"] = slot
-            running.append(p)
-        fds = [p["job"].fd for p in running]
-        r, _, _ = select.select(fds, [], [], 0.5)
-        for p in list(running):
-            job = p["job"]
-            if job.fd in r:
-                job.feed()
-            if p["memo"] and not job.done and job.status.get(MEMO_TEST) == "F":
-                fail = {id_to_num[t] for t, v in job.status.items() if v == "F"} | set(p["heavy"])
-                if split_cost(sorted(fail | set(p["light"])), ms) <= split_cost(sorted(fail), ms):
-                    log(p["cid"], "memo test failed, listing the rest")
+            p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode, p["lean"])
+
+        while queue or running:
+            while queue and len(running) < PARALLEL:
+                p = queue.pop(0)
+                if time.monotonic() > end - 5:
+                    results[p["cid"]] = listing(p)
+                    continue
+                try:
+                    start(p)
+                except Exception as e:
+                    log(p["cid"], "start failed", repr(e))
+                    results[p["cid"]] = listing(p)
+                    continue
+                running.append(p)
+            fds = [p["job"].fd for p in running]
+            r, _, _ = select.select(fds, [], [], 0.5)
+            for p in list(running):
+                job = p["job"]
+                if job.fd in r:
+                    job.feed()
+                if p["memo"] and not job.done and job.status.get(MEMO_TEST) == "F":
+                    fail = {id_to_num[t] for t, v in job.status.items() if v == "F"} | set(p["heavy"])
+                    if split_cost(sorted(fail | set(p["light"])), ms) <= split_cost(sorted(fail), ms):
+                        log(p["cid"], "memo test failed, listing the rest")
+                        job.kill()
+                        p["listall"] = True
+                if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
+                    log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
                     job.kill()
-                    p["listall"] = True
-            if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
-                log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
-                job.kill()
-                if p["probe"]:
-                    job.broken = True
-            if job.done:
-                running.remove(p)
-                fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
-                for kq in getattr(job, "klass_fail", ()):
-                    mod, _, cname = kq.rpartition(".")
-                    pre = "%s.py::%s::" % (mod.replace(".", "/"), cname)
-                    fail |= {n for n, t in num_to_id.items() if t.startswith(pre)}
-                if getattr(job, "broken", False):
-                    log(p["cid"], "patched module does not import")
-                    fail = set(num_to_id)
-                unresolved = job.unresolved()
-                if unresolved:
-                    log(p["cid"], "unresolved", len(unresolved), "current", job.current, "exit", getattr(job, "exit", None))
-                    fail |= {id_to_num[t] for t in unresolved}
-                if p["lean"] and job.status.get(MEMO_TEST) != "P":
-                    fail.add(id_to_num[MEMO_TEST])
-                if p["lean"] and CANARY_K and fail - {id_to_num[MEMO_TEST]}:
-                    fail.add(id_to_num[MEMO_TEST])
-                if p["lean"] and LEANCAL:
-                    log(p["cid"], "leancal", json.dumps({"full": getattr(job, "lean", None), "picks": p["picks"], "other": sorted(fail - {id_to_num[MEMO_TEST]}), "status": job.status.get(MEMO_TEST), "cpu": job.tcpu.get(MEMO_TEST)}))
-                results[p["cid"]] = fail | set(p["heavy"]) | (set(p["light"]) if p.get("listall") else set())
-                if p["slot"]:
-                    release_slot(p["root"], p["patched"])
-                else:
-                    rmtree(p["root"])
-                top = sorted(job.tcpu.items(), key=lambda kv: -kv[1])[:4]
-                log(p["cid"], "testcpu=%.2f" % sum(job.tcpu.values()), "top", " ".join("%s:%.2f" % (t.split("::")[-1], c) for t, c in top))
-                log(p["cid"], "fail", sorted(fail), "heavy", sorted(p["heavy"]), "cpu=%.2f" % job.cpu, "t=%.1f" % (time.monotonic() - T0))
+                    if p["probe"]:
+                        job.broken = True
+                if job.done:
+                    running.remove(p)
+                    fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
+                    for kq in getattr(job, "klass_fail", ()):
+                        mod, _, cname = kq.rpartition(".")
+                        pre = "%s.py::%s::" % (mod.replace(".", "/"), cname)
+                        fail |= {n for n, t in num_to_id.items() if t.startswith(pre)}
+                    fail |= {id_to_num[t] for t in job.sticky if t in id_to_num}
+                    if getattr(job, "broken", False) or job.abort or p["probe"] and not job.collected:
+                        log(p["cid"], "patched module does not import", job.abort, job.collected)
+                        fail = set(num_to_id)
+                    unresolved = job.unresolved()
+                    if unresolved:
+                        log(p["cid"], "unresolved", len(unresolved), "current", job.current, "exit", getattr(job, "exit", None))
+                        fail |= {id_to_num[t] for t in unresolved}
+                    if p["lean"] and job.status.get(MEMO_TEST) != "P":
+                        fail.add(id_to_num[MEMO_TEST])
+                    if p["lean"] and CANARY_K and fail - {id_to_num[MEMO_TEST]}:
+                        fail.add(id_to_num[MEMO_TEST])
+                    if p["lean"] and LEANCAL:
+                        log(p["cid"], "leancal", json.dumps({"full": getattr(job, "lean", None), "picks": p["picks"], "other": sorted(fail - {id_to_num[MEMO_TEST]}), "status": job.status.get(MEMO_TEST), "cpu": job.tcpu.get(MEMO_TEST)}))
+                    results[p["cid"]] = fail | set(p["heavy"]) | (set(p["light"]) if p.get("listall") else set())
+                    try:
+                        if p["slot"]:
+                            release_slot(p["root"], p["patched"])
+                        else:
+                            rmtree(p["root"])
+                    except OSError as e:
+                        log(p["cid"], "cleanup failed", repr(e))
+                    top = sorted(job.tcpu.items(), key=lambda kv: -kv[1])[:4]
+                    log(p["cid"], "testcpu=%.2f" % sum(job.tcpu.values()), "top", " ".join("%s:%.2f" % (t.split("::")[-1], c) for t, c in top))
+                    log(p["cid"], "fail", sorted(fail), "heavy", sorted(p["heavy"]), "cpu=%.2f" % job.cpu, "t=%.1f" % (time.monotonic() - T0))
+    except BaseException as e:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        log("loop failed", repr(e)[:300])
+        for p in running:
+            p["job"].kill()
+        for p in plans:
+            if p["cid"] not in results:
+                results[p["cid"]] = listing(p)
+    signal.setitimer(signal.ITIMER_REAL, 0)
     log("loop done cpu=%.2f" % time.process_time())
     for cid in commits:
-        workers = split(sorted(results.get(cid, set())), ms)
+        workers = split(sorted(results.get(cid, set(num_to_id))), ms)
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
         WRITTEN.add(cid)
     sys.stdout.flush()
@@ -3335,19 +3498,33 @@ def main():
 WRITTEN = set()
 
 
+class Watchdog(BaseException):
+    pass
+
+
+def on_watchdog(signum, frame):
+    raise Watchdog()
+
+
 def fallback():
-    tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
-    nums = [t["number"] for t in tests]
+    try:
+        nums = [t["number"] for t in json.load(open(os.path.join(DATA, "tests.json")))["tests"]]
+    except BaseException:
+        nums = []
     for p in sorted(os.listdir(os.path.join(DATA, "commits"))):
         if p.endswith(".patch") and p[:-6] not in WRITTEN:
             sys.stdout.write(json.dumps({"commit": p[:-6], "workers": [nums[i::8] for i in range(8)]}) + "\n")
+            WRITTEN.add(p[:-6])
     sys.stdout.flush()
 
 
 if __name__ == "__main__":
     try:
+        signal.signal(signal.SIGALRM, on_watchdog)
+        signal.setitimer(signal.ITIMER_REAL, WATCHDOG * wall_span(sum(1 for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))))
         main()
     except BaseException as e:
+        signal.setitimer(signal.ITIMER_REAL, 0)
         log("main failed", repr(e))
         fallback()
     sys.stdout.flush()
