@@ -46,6 +46,8 @@ LAZYUNITS = os.environ.get("BR_LAZYUNITS", "1") == "1"
 DEBUG_N = int(os.environ.get("BR_DEBUG_N", "-1"))
 UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
+DOCSTRIP = os.environ.get("BR_DOCSTRIP", "1") == "1"
+DOC = [False]
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
 RUN_K = float(os.environ.get("BR_RUN_K", "1.0"))
@@ -223,7 +225,31 @@ def parse_cached(text):
     return t
 
 
+def _isdoc(st):
+    return isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str)
+
+
+def _undoc(node):
+    undo = []
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body and _isdoc(n.body[0]):
+            undo.append((n, n.body))
+            n.body = n.body[1:] or [ast.Pass()]
+    return undo
+
+
 def _canon_dump(node, resolve):
+    if DOC[0]:
+        undo = _undoc(node)
+        try:
+            return _canon_dump1(node, resolve)
+        finally:
+            for n, body in reversed(undo):
+                n.body = body
+    return _canon_dump1(node, resolve)
+
+
+def _canon_dump1(node, resolve):
     if not CANON:
         return ast.dump(node, annotate_fields=False, include_attributes=False)
     canon = _Canon(resolve)
@@ -332,6 +358,9 @@ def _class_head(node, resolve):
 
 
 def _same_body(a_body, b_body, oc, nc, resolve):
+    if DOC[0]:
+        a_body = a_body[1:] if a_body and _isdoc(a_body[0]) else a_body
+        b_body = b_body[1:] if b_body and _isdoc(b_body[0]) else b_body
     if len(a_body) != len(b_body):
         return False
     for x, y in zip(a_body, b_body):
@@ -383,6 +412,8 @@ def strip_ast(text, resolve=None):
         tree = ast.parse(text)
     except SyntaxError:
         return None
+    if DOC[0]:
+        _undoc(tree)
     if CANON:
         tree = _Canon(resolve).visit(tree)
     return ast.dump(tree, annotate_fields=False, include_attributes=False)
@@ -1047,11 +1078,13 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                     extra = full(n for tf in hit for n in cov.by_file.get(tf, []))
         if old_text is not None and new_text is not None:
             res = module_resolver(path)
+            DOC[0] = DOCSTRIP and not path.startswith("sqlglot/typing/")
             if FASTNOOP:
                 same = ast_noop(old_text, new_text, f["hunks"], res)
             else:
                 a, b = strip_ast(old_text, res), strip_ast(new_text, res)
                 same = a is not None and a == b
+            DOC[0] = False
             if same:
                 notes.append("ast-noop")
                 notes.append("noop:" + path)
