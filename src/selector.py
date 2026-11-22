@@ -98,7 +98,8 @@ DOCFN = os.environ.get("BR_DOCFN", "1") == "1"
 SRCREAD = os.environ.get("BR_SRCREAD", "1") == "1"
 DEBUGLOG = os.environ.get("BR_DEBUGLOG", "1") == "1"
 LEAN = os.environ.get("BR_LEAN", "1") == "1"
-CANARY_K = int(os.environ.get("BR_CANARY_K", "0"))
+CANARY_K = int(os.environ.get("BR_CANARY_K", "2"))
+CANARY_STRICT = os.environ.get("BR_CANARY_STRICT", "0") == "1"
 CANARY_SCALE = float(os.environ.get("BR_CANARY_SCALE", "0.65"))
 LEAN_COST = float(os.environ.get("BR_LEAN_COST", "15.5"))
 LEAN_SCALE = float(os.environ.get("BR_LEAN_SCALE", "0.5"))
@@ -3992,7 +3993,7 @@ def main():
                         fail |= {id_to_num[t] for t in unresolved}
                     if p["lean"] and job.status.get(MEMO_TEST) != "P":
                         fail.add(id_to_num[MEMO_TEST])
-                    if p["lean"] and CANARY_K and fail - {id_to_num[MEMO_TEST]}:
+                    if p["lean"] and CANARY_K and CANARY_STRICT and fail - {id_to_num[MEMO_TEST]}:
                         fail.add(id_to_num[MEMO_TEST])
                     if p["lean"] and LEANCAL:
                         log(p["cid"], "leancal", json.dumps({"full": getattr(job, "lean", None), "picks": p["picks"], "other": sorted(fail - {id_to_num[MEMO_TEST]}), "status": job.status.get(MEMO_TEST), "cpu": job.tcpu.get(MEMO_TEST)}))
