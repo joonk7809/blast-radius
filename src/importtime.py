@@ -642,6 +642,8 @@ def dynamic_changed_paths(patch_text, root=None, timeout=60):
     env.pop('PYTHONPATH', None)
     p = subprocess.run([sys.executable, '-I', os.path.abspath(__file__), '--dynamic', root, MAPDIR], input=patch_text, capture_output=True, text=True, timeout=timeout, env=env)
     if p.returncode != 0:
+        if os.environ.get('BR_HARDEN', '1') == '1':
+            return (None, 'rc=%d %s' % (p.returncode, p.stderr[-2000:]))
         return (None, p.stderr[-2000:])
     return (set(json.loads(p.stdout.strip().splitlines()[-1])), None)
 

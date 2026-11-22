@@ -28,6 +28,10 @@ FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
 COLLECT = os.environ.get("BR_COLLECT", "1") == "1"
 IMPORTT = os.environ.get("BR_IMPORTT", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
+HARDEN = os.environ.get("BR_HARDEN", "1") == "1"
+PLAN_FRAC = float(os.environ.get("BR_PLAN_FRAC", "0.35"))
+DOCFN = os.environ.get("BR_DOCFN", "1") == "1"
+WATCHDOG = float(os.environ.get("BR_WATCHDOG", "0.94"))
 T0 = time.monotonic()
 
 
@@ -35,11 +39,15 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+def nl_lines(text):
+    return [ln for ln in re.split(r"(?<=\n)", text) if ln] if HARDEN else text.splitlines(keepends=True)
+
+
 def parse_patch(text):
     files = []
     cur = None
     hunk = None
-    for line in text.splitlines(keepends=True):
+    for line in nl_lines(text):
         if line.startswith("diff --git "):
             m = re.match(r"diff --git a/(\S+) b/(\S+)", line)
             cur = {"old": m.group(1), "path": m.group(2), "hunks": [], "new_file": False, "deleted": False}
@@ -76,7 +84,7 @@ def parse_patch(text):
 
 
 def apply_file(old_text, hunks):
-    old = old_text.splitlines(keepends=True)
+    old = nl_lines(old_text)
     out = []
     pos = 0
     for h in hunks:
@@ -530,6 +538,27 @@ def test_dependents(path, f, old_text, new_text):
     return hit
 
 
+def is_doc(d):
+    return isinstance(d, ast.Expr) and isinstance(d.value, ast.Constant) and isinstance(d.value.value, str)
+
+
+def fn_bodies(tree):
+    out = {}
+
+    def walk(node, pre):
+        for c in ast.iter_child_nodes(node):
+            if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                q = pre + "." + c.name
+                if not isinstance(c, ast.ClassDef) and c.body:
+                    out.setdefault(q, c)
+                walk(c, q)
+            else:
+                walk(c, pre)
+
+    walk(tree, "")
+    return out
+
+
 def _candidates_for(f, old_text, new_text, cov, notes):
     path = f["path"]
     if path.startswith("sqlglot/") and path.endswith(".py"):
@@ -538,8 +567,11 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             return full(n for n in cov.idx_to_num if n is not None)
         if new_text is not None:
             try:
-                ast.parse(new_text)
-            except SyntaxError:
+                if HARDEN:
+                    compile(new_text, path, "exec", dont_inherit=True)
+                else:
+                    ast.parse(new_text)
+            except (SyntaxError, ValueError):
                 notes.append("new-unparsable")
                 return full(n for n in cov.idx_to_num if n is not None)
         extra = {}
@@ -574,6 +606,20 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             return merge(cov.tests_touching_file(path), extra)
         out = {}
         importtime = False
+        if DOCFN:
+            newfns = None
+            for qn, node in fn_bodies(units.tree).items():
+                d = node.body[0]
+                if is_doc(d) and any(d.lineno <= ln <= d.end_lineno for ln in removed | anchors):
+                    if newfns is None:
+                        try:
+                            newfns = fn_bodies(ast.parse(new_text)) if new_text is not None else {}
+                        except SyntaxError:
+                            newfns = {}
+                    nn = newfns.get(qn)
+                    if nn is None or not is_doc(nn.body[0]):
+                        tgt = range(node.body[1].lineno, node.body[1].end_lineno + 1) if len(node.body) > 1 else range(node.lineno, node.end_lineno + 1)
+                        merge(out, cov.tests_for_lines(path, tgt))
         for ln in sorted(removed | anchors):
             u = units.unit_for(ln)
             if u is None:
@@ -655,7 +701,7 @@ def build_overlay(root, patched):
         if os.path.lexists(target):
             os.unlink(target)
         if content is not None:
-            with open(target, "w", encoding="utf-8", newline="") as fh:
+            with open(target, "w", encoding="utf-8", errors="surrogateescape" if HARDEN else None, newline="") as fh:
                 fh.write(content)
 
 
@@ -762,7 +808,7 @@ def install_futures():
     concurrent.futures.as_completed = lazy_as_completed
 
 
-def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
+def child_run(root, test_ids, timeouts, wfd, sel, mode=None, nonce=""):
     if DEBUG:
         import faulthandler
         faulthandler.enable()
@@ -772,6 +818,13 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
     if not DEBUG:
         os.dup2(devnull, 2)
     os.environ["SKIP_INTEGRATION"] = "0"
+    if HARDEN:
+        try:
+            os.setpgid(0, 0)
+            with open("/proc/self/oom_score_adj", "w") as fh:
+                fh.write("1000")
+        except OSError:
+            pass
     install_futures()
     if mode is not None and mode[0] == "swap":
         import builtins
@@ -809,15 +862,19 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
     out = os.fdopen(wfd, "w", buffering=1)
 
     def emit(tag, tid):
-        out.write(f"{tag} {tid}\n")
+        out.write(f"{nonce}{tag} {tid}\n")
 
     class Timeout(BaseException):
         pass
 
     hung = []
+    running_tid = []
+    failed = set()
 
     def on_alarm(signum, frame):
         hung.append(1)
+        if HARDEN and running_tid:
+            failed.add(running_tid[0])
         raise Timeout()
 
     signal.signal(signal.SIGALRM, on_alarm)
@@ -826,13 +883,15 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             try:
                 signal.setitimer(signal.ITIMER_REAL, 20.0, 0.5)
                 importlib.import_module(modname)
-            except BaseException:
+            except BaseException as e:
                 for tid in tids:
-                    emit("F", tid)
+                    emit("I" if HARDEN else "F", tid)
+                if HARDEN and not isinstance(e, Exception):
+                    emit("A", "-")
             finally:
                 signal.setitimer(signal.ITIMER_REAL, 0)
+    emit("G", "-")
     case_to_id = {}
-    failed = set()
     cases = []
     for tid in test_ids:
         path, cls, meth = tid.split("::")
@@ -840,8 +899,10 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
         try:
             m = __import__(mod, fromlist=["_"])
             c = getattr(m, cls)(meth)
-        except BaseException:
+        except BaseException as e:
             emit("F", tid)
+            if HARDEN and not isinstance(e, Exception):
+                emit("A", "-")
             continue
         case_to_id[id(c)] = tid
         cases.append(c)
@@ -852,12 +913,14 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
             tid = case_to_id.get(id(test))
             ustate.update(tid=tid, allowed=sel.get(tid), stack=[], seen={}, fut=0)
             if tid:
+                running_tid[:] = [tid]
                 emit("S", tid)
                 self.t0 = time.process_time()
                 signal.setitimer(signal.ITIMER_REAL, timeouts.get(tid, 10.0), 0.5)
 
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_REAL, 0)
+            del running_tid[:]
             tid = case_to_id.get(id(test))
             if tid:
                 emit("F" if tid in failed else "P", tid)
@@ -1014,12 +1077,24 @@ class Job:
         self.current = None
         self.done = False
         self.buf = b""
+        self.sticky = set()
+        self.collected = False
+        self.abort = False
+        self.end_kill = False
+        self.we_killed = False
+        self.known = set(tests)
+        self.nonce = (os.urandom(8).hex() + " ").encode() if HARDEN else b""
         r, w = os.pipe()
-        pid = os.fork()
+        try:
+            pid = os.fork()
+        except OSError:
+            os.close(r)
+            os.close(w)
+            raise
         if pid == 0:
             os.close(r)
             try:
-                child_run(root, tests, timeouts, w, sel or {}, mode)
+                child_run(root, tests, timeouts, w, sel or {}, mode, self.nonce.decode())
             except BaseException:
                 if DEBUG:
                     import traceback
@@ -1038,17 +1113,39 @@ class Job:
         self.buf += data
         while b"\n" in self.buf:
             line, self.buf = self.buf.split(b"\n", 1)
-            tag, tid = line.decode().split(" ", 1)
-            if tag == "S":
+            if self.nonce:
+                if not line.startswith(self.nonce):
+                    continue
+                line = line[len(self.nonce):]
+            try:
+                tag, tid = line.decode().split(" ", 1)
+            except ValueError:
+                if HARDEN:
+                    continue
+                raise
+            if HARDEN and tag in ("S", "P", "F") and tid not in self.known:
+                continue
+            if tag == "A":
+                self.abort = True
+            elif tag == "I":
+                self.sticky.add(tid)
+            elif tag == "G":
+                self.collected = True
+            elif tag == "S":
                 self.current = tid
             elif tag in ("P", "F"):
                 self.status[tid] = tag
                 self.current = None
             elif tag == "C":
-                t, c = tid.rsplit(" ", 1)
-                self.tcpu[t] = float(c)
-            elif tag == "D":
-                pass
+                try:
+                    t, c = tid.rsplit(" ", 1)
+                    self.tcpu[t] = float(c)
+                except ValueError:
+                    if not HARDEN:
+                        raise
+            elif tag == "D" and HARDEN:
+                self.finish()
+                return
 
     def cpu_now(self):
         try:
@@ -1074,6 +1171,11 @@ class Job:
         except OSError:
             pass
         self.cpu = 0.0
+        if HARDEN:
+            try:
+                os.killpg(self.pid, signal.SIGKILL)
+            except OSError:
+                pass
         try:
             _, st, ru = os.wait4(self.pid, 0)
             self.cpu = ru.ru_utime + ru.ru_stime
@@ -1099,7 +1201,9 @@ def main():
 
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
     plans = []
+    span = min(270.0, 180.0 * max(1.0, len(commits) / 40.0))
     for cid in commits:
+        late = HARDEN and time.monotonic() > T0 + PLAN_FRAC * BUDGET_FRAC * span
         text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape").read()
         notes = []
         cands = {}
@@ -1108,6 +1212,8 @@ def main():
         old_by = {}
         ok = True
         try:
+            if late:
+                raise TimeoutError("plan budget")
             files = parse_patch(text)
             for f in files:
                 src = os.path.join(SRC, f["old"])
@@ -1126,7 +1232,7 @@ def main():
             ok = False
             notes.append(f"error:{type(e).__name__}:{e}")
             cands = full(num_to_id)
-        if IMPORTT and "importtime" in notes:
+        if IMPORTT and "importtime" in notes and not late:
             try:
                 os.environ.setdefault("IMPORTTIME_SQLGLOT", SRC)
                 os.environ.setdefault("IMPORTTIME_MAPS", os.path.join(HERE, "itmaps"))
@@ -1134,6 +1240,13 @@ def main():
                 extra, info = itf.extra_candidates(text, root=SRC, with_info=True)
                 merge(cands, full(n for n in extra if n in num_to_id))
                 notes.append("itf:%d%s" % (len(extra), "" if info.get("confident", True) else ":unconfident"))
+                if info.get("dynamic_error") is not None:
+                    notes.insert(0, "dynerr")
+                    err = str(info["dynamic_error"])
+                    m = re.match(r"rc=(-?\d+) ", err)
+                    if HARDEN and ((m and int(m.group(1)) < 0) or not err[m.end() if m else 0:].strip()):
+                        notes.insert(0, "dynerr-full")
+                        cands = full(num_to_id)
             except Exception as e:
                 notes.append(f"itf-error:{type(e).__name__}")
                 cands = full(num_to_id)
@@ -1147,7 +1260,7 @@ def main():
         light = sorted(set(cands) - heavy)
         blind = split_cost(sorted(cands), ms)
         cap = blind - split_cost(sorted(heavy), ms)
-        if light and sum(est(n) for n in light) * 1000 >= cap:
+        if late or (HARDEN and not ok) or (light and sum(est(n) for n in light) * 1000 >= cap):
             notes.insert(0, "blind")
             heavy, light = set(cands), []
         sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}
@@ -1155,112 +1268,212 @@ def main():
         log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4])
 
     log("planned cpu=%.2f" % time.process_time())
-    preimport()
-    log("preimported cpu=%.2f" % time.process_time())
-    zyg = None
-    if ZYGOTE:
-        import zygote
-        install_futures()
-        warm_ids = sorted({num_to_id[n] for p in plans for n in p["light"]})
-        zygote.warm(SRC, warm_ids, any(t.startswith("tests/test_executor.py::TestExecutor::") for t in warm_ids))
-        warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
-        code_idx = zygote.code_index()
-        zyg = (zygote, warm_lines, code_idx)
-        log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
     results = {}
-    imap = json.load(gzip.open(os.path.join(HERE, "importmap.json.gz"), "rt"))
-    mod_tids = {}
-    for n, tid in num_to_id.items():
-        mod_tids.setdefault(tid.split("::")[0][:-3].replace("/", "."), []).append(tid)
-    for p in plans:
-        mask = 0
-        for rel, content in p["patched"].items():
-            if not rel.endswith(".py") or not rel.startswith(("sqlglot/", "tests/")):
-                continue
-            if content is None or p["old"].get(rel) is None:
-                mask = -1
-                break
-            fm = imap["files"].get(rel, {})
-            removed, anchors = changed_old_lines(p["hunks"][rel])
-            for ln in removed | anchors:
-                mask |= fm.get(str(ln), 0)
-        mods = imap["modules"]
-        chosen = mods if mask == -1 else [m for i, m in enumerate(mods) if mask >> i & 1]
-        p["collect"] = {m: mod_tids.get(m, []) for m in chosen} if COLLECT and chosen else None
-        if p["collect"]:
-            log(p["cid"], "collect", len(chosen))
-    pending = [p for p in plans if p["light"] or p["collect"]]
-    for p in plans:
-        if not p["light"] and not p["collect"]:
-            results[p["cid"]] = set(p["heavy"])
-    pending.sort(key=lambda p: -sum(ms[n] for n in p["light"]))
     running = []
-    queue = list(pending)
-    end = T0 + BUDGET_FRAC * min(270.0, 180.0 * max(1.0, len(commits) / 40.0))
-    while queue or running:
-        while queue and len(running) < PARALLEL:
-            p = queue.pop(0)
-            if time.monotonic() > end - 5:
-                results[p["cid"]] = set(p["heavy"]) | set(p["light"])
-                continue
-            root = os.path.join(TMP, "ov", p["cid"])
-            rmtree(root)
-            build_overlay(root, p["patched"])
-            ids = [num_to_id[n] for n in p["light"]]
-            timeouts = {num_to_id[n]: max(3.0, ms[n] / 1000 * 10 + 2) for n in p["light"]}
-            budget = sum(timeouts.values()) + 30
-            mode = None
-            if zyg is not None:
-                mode = ("reimport", p["collect"])
-                zmod, warm_lines, code_idx = zyg
-                swaps, nonpy, ok = [], [], True
-                for rel, content in p["patched"].items():
-                    if content is None or p["old"].get(rel) is None:
-                        ok = False
-                    elif rel.endswith(".py"):
-                        removed, anchors = changed_old_lines(p["hunks"][rel])
-                        plan = zmod.swap_plan(SRC, rel, p["old"][rel], content, removed | anchors, warm_lines)
-                        if plan is None:
+
+    def fallback(p):
+        extra = {id_to_num[t] for tids in (p.get("collect") or {}).values() for t in tids} if HARDEN else set()
+        return set(p["heavy"]) | set(p["light"]) | extra
+
+    try:
+        preimport()
+        log("preimported cpu=%.2f" % time.process_time())
+        zyg = None
+        if ZYGOTE:
+            import zygote
+            install_futures()
+            warm_ids = sorted({num_to_id[n] for p in plans for n in p["light"]})
+            zygote.warm(SRC, warm_ids, any(t.startswith("tests/test_executor.py::TestExecutor::") for t in warm_ids))
+            warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
+            code_idx = zygote.code_index()
+            zyg = (zygote, warm_lines, code_idx)
+            log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
+        imap = json.load(gzip.open(os.path.join(HERE, "importmap.json.gz"), "rt"))
+        mod_tids = {}
+        for n, tid in num_to_id.items():
+            mod_tids.setdefault(tid.split("::")[0][:-3].replace("/", "."), []).append(tid)
+        for p in plans:
+            mask = 0
+            for rel, content in p["patched"].items():
+                if not rel.endswith(".py") or not rel.startswith(("sqlglot/", "tests/")):
+                    continue
+                if content is None or p["old"].get(rel) is None:
+                    mask = -1
+                    break
+                fm = imap["files"].get(rel, {})
+                removed, anchors = changed_old_lines(p["hunks"][rel])
+                for ln in removed | anchors:
+                    mask |= fm.get(str(ln), 0)
+            mods = imap["modules"]
+            chosen = mods if mask == -1 else [m for i, m in enumerate(mods) if mask >> i & 1]
+            p["collect"] = {m: mod_tids.get(m, []) for m in chosen} if COLLECT and chosen else None
+            if HARDEN and len(p["heavy"]) >= len(num_to_id):
+                p["collect"] = None
+            if p["collect"]:
+                log(p["cid"], "collect", len(chosen))
+        pending = [p for p in plans if p["light"] or p["collect"]]
+        for p in plans:
+            if not p["light"] and not p["collect"]:
+                results[p["cid"]] = set(p["heavy"])
+        pending.sort(key=lambda p: -sum(ms[n] for n in p["light"]))
+        queue = list(pending)
+        end = T0 + BUDGET_FRAC * span
+        while queue or running:
+            while queue and len(running) < PARALLEL:
+                p = queue.pop(0)
+                if time.monotonic() > end - 5:
+                    results[p["cid"]] = fallback(p)
+                    continue
+                root = os.path.join(TMP, "ov", p["cid"])
+                try:
+                    rmtree(root)
+                    build_overlay(root, p["patched"])
+                except Exception:
+                    if not HARDEN:
+                        raise
+                    try:
+                        import tempfile
+                        root = os.path.join(tempfile.mkdtemp(prefix="ovb", dir=TMP), p["cid"])
+                        build_overlay(root, p["patched"])
+                        log(p["cid"], "overlay retry", root)
+                    except Exception:
+                        log(p["cid"], "overlay failed")
+                        results[p["cid"]] = fallback(p)
+                        continue
+                ids = [num_to_id[n] for n in p["light"]]
+                timeouts = {num_to_id[n]: max(3.0, ms[n] / 1000 * 10 + 2) for n in p["light"]}
+                budget = sum(timeouts.values()) + 30
+                mode = None
+                if zyg is not None:
+                    mode = ("reimport", p["collect"])
+                    zmod, warm_lines, code_idx = zyg
+                    swaps, nonpy, ok = [], [], True
+                    for rel, content in p["patched"].items():
+                        if content is None or p["old"].get(rel) is None:
                             ok = False
+                        elif rel.endswith(".py"):
+                            removed, anchors = changed_old_lines(p["hunks"][rel])
+                            plan = zmod.swap_plan(SRC, rel, p["old"][rel], content, removed | anchors, warm_lines)
+                            if plan is None:
+                                ok = False
+                            else:
+                                swaps.append((rel, p["old"][rel], content, removed | anchors))
                         else:
-                            swaps.append((rel, p["old"][rel], content, removed | anchors))
-                    else:
-                        if rel in zmod.WARM_OPENED:
-                            ok = False
-                        nonpy.append(rel)
-                if ok:
-                    mode = ("swap", swaps, code_idx, nonpy)
-                log(p["cid"], "mode", mode[0])
-            p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode)
-            p["root"] = root
-            running.append(p)
-        fds = [p["job"].fd for p in running]
-        r, _, _ = select.select(fds, [], [], 0.5)
-        for p in list(running):
-            job = p["job"]
-            if job.fd in r:
-                job.feed()
-            if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
-                log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
-                job.kill()
-            if job.done:
-                running.remove(p)
-                fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
-                unresolved = job.unresolved()
-                if unresolved:
-                    log(p["cid"], "unresolved", len(unresolved), "current", job.current, "exit", getattr(job, "exit", None))
-                    fail |= {id_to_num[t] for t in unresolved}
-                results[p["cid"]] = fail | set(p["heavy"])
-                rmtree(p["root"])
-                top = sorted(job.tcpu.items(), key=lambda kv: -kv[1])[:4]
-                log(p["cid"], "testcpu=%.2f" % sum(job.tcpu.values()), "top", " ".join("%s:%.2f" % (t.split("::")[-1], c) for t, c in top))
-                log(p["cid"], "fail", sorted(fail), "heavy", sorted(p["heavy"]), "cpu=%.2f" % job.cpu, "t=%.1f" % (time.monotonic() - T0))
+                            if rel in zmod.WARM_OPENED:
+                                ok = False
+                            nonpy.append(rel)
+                    if HARDEN and p["collect"]:
+                        ok = False
+                    if ok:
+                        mode = ("swap", swaps, code_idx, nonpy)
+                    log(p["cid"], "mode", mode[0])
+                try:
+                    p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode)
+                except OSError:
+                    if not HARDEN:
+                        raise
+                    log(p["cid"], "fork failed")
+                    results[p["cid"]] = fallback(p)
+                    continue
+                p["root"] = root
+                running.append(p)
+            fds = [p["job"].fd for p in running]
+            r, _, _ = select.select(fds, [], [], 0.5)
+            for p in list(running):
+                job = p["job"]
+                if job.fd in r:
+                    job.feed()
+                if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
+                    log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
+                    job.end_kill = time.monotonic() > end
+                    job.we_killed = True
+                    job.kill()
+                if job.done:
+                    running.remove(p)
+                    fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
+                    unresolved = job.unresolved()
+                    if unresolved:
+                        log(p["cid"], "unresolved", len(unresolved), "current", job.current, "exit", getattr(job, "exit", None))
+                        fail |= {id_to_num[t] for t in unresolved}
+                    if HARDEN:
+                        fail |= {id_to_num[t] for t in job.sticky if t in id_to_num}
+                        st = getattr(job, "exit", None)
+                        sig = st is not None and os.WIFSIGNALED(st) and not job.we_killed
+                        if job.abort or (p["collect"] and not job.collected and not job.end_kill and not sig):
+                            log(p["cid"], "abort-all", job.abort)
+                            fail |= set(num_to_id)
+                        elif p["collect"] and not job.collected:
+                            log(p["cid"], "collect incomplete")
+                            fail |= fallback(p)
+                    results[p["cid"]] = fail | set(p["heavy"])
+                    try:
+                        rmtree(p["root"])
+                    except OSError:
+                        if not HARDEN:
+                            raise
+                    top = sorted(job.tcpu.items(), key=lambda kv: -kv[1])[:4]
+                    log(p["cid"], "testcpu=%.2f" % sum(job.tcpu.values()), "top", " ".join("%s:%.2f" % (t.split("::")[-1], c) for t, c in top))
+                    log(p["cid"], "fail", sorted(fail), "heavy", sorted(p["heavy"]), "cpu=%.2f" % job.cpu, "t=%.1f" % (time.monotonic() - T0))
+    except BaseException as e:
+        if not HARDEN:
+            raise
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        log("loop error", type(e).__name__, e)
+        for p in running:
+            p["job"].kill()
+        for p in plans:
+            if p["cid"] not in results:
+                results[p["cid"]] = fallback(p)
     log("loop done cpu=%.2f" % time.process_time())
+    if HARDEN:
+        signal.setitimer(signal.ITIMER_REAL, 0)
     for cid in commits:
-        workers = split(sorted(results.get(cid, set())), ms)
+        workers = split(sorted(results.get(cid, set(num_to_id) if HARDEN else set())), ms)
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
+        WRITTEN.add(cid)
+    sys.stdout.flush()
+
+
+WRITTEN = set()
+
+
+class Watchdog(BaseException):
+    pass
+
+
+def on_watchdog(signum, frame):
+    raise Watchdog()
+
+
+def emergency():
+    try:
+        sys.stdout.flush()
+    except BaseException:
+        pass
+    try:
+        nums = sorted(t["number"] for t in json.load(open(os.path.join(DATA, "tests.json")))["tests"])
+    except BaseException:
+        nums = []
+    for p in sorted(os.listdir(os.path.join(DATA, "commits"))):
+        if p.endswith(".patch") and p[:-6] not in WRITTEN:
+            sys.stdout.write(json.dumps({"commit": p[:-6], "workers": [nums[i::8] for i in range(8)]}) + "\n")
+            WRITTEN.add(p[:-6])
     sys.stdout.flush()
 
 
 if __name__ == "__main__":
-    main()
+    if not HARDEN:
+        main()
+    else:
+        try:
+            n = sum(1 for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
+            signal.signal(signal.SIGALRM, on_watchdog)
+            signal.setitimer(signal.ITIMER_REAL, WATCHDOG * min(270.0, 180.0 * max(1.0, n / 40.0)))
+            main()
+        except BaseException as e:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            log("main failed", repr(e)[:300])
+            emergency()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
