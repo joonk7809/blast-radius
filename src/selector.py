@@ -67,6 +67,9 @@ FASTNOOP = os.environ.get("BR_FASTNOOP", "1") == "1"
 SETUP_ATTRS = os.environ.get("BR_SETUP_ATTRS", "1") == "1"
 NEWTOP = os.environ.get("BR_NEWTOP", "1") == "1"
 TPCQ = os.environ.get("BR_TPCQ", "1") == "1"
+MEMO = os.environ.get("BR_MEMO", "1") == "1"
+MEMO_K = float(os.environ.get("BR_MEMO_K", "1.0"))
+MEMO_MISS = float(os.environ.get("BR_MEMO_MISS", "0.8"))
 PROBE = os.environ.get("BR_PROBE", "1") == "1"
 COLLECT = os.environ.get("BR_COLLECT", "1") == "1"
 IMPORTT = os.environ.get("BR_IMPORTT", "1") == "1"
@@ -1501,6 +1504,216 @@ def partial_purge(root):
     for n in dead & ours:
         del sys.modules[n]
     return sorted((dead & ours) - gone - {n for n in dead if n.startswith("tests")}, key=lambda n: n.count("."))
+
+
+CHILD_MEMO = None
+_MEMO = []
+MEMO_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+MEMO_BAD = ("shared-write", "toplevel", "newfile", "deleted-or-renamed", "unparsable", "bad-coding", "error:", "itf-error")
+MEMO_IMPORT = ("importtime", "newtop:", "itf")
+
+
+def memo_data():
+    if not _MEMO:
+        try:
+            with open(os.path.join(HERE, "tpc", "memo.pkl"), "rb") as fh:
+                d = pickle.load(fh)
+            d["exec"] = set(map(tuple, d["exec"]))
+            _MEMO.append(d)
+        except (OSError, pickle.UnpicklingError, EOFError, KeyError):
+            _MEMO.append(None)
+    return _MEMO[0]
+
+
+def memo_blobs(touched):
+    d = memo_data()
+    gone = {d["keyed"]["ds"][k] for k in touched if k in d["keyed"]["ds"]}
+    return {k: v for k, v in d["memo"].get("ds", {}).items() if k not in gone}
+
+
+def memo_state():
+    d = memo_data()
+    with open(os.path.join(HERE, "tpc", "state.pkl"), "rb") as fh:
+        return (set(d["names"]), pickle.load(fh))
+
+
+def _code_spans(code, out):
+    lines = [ln for _, _, ln in code.co_lines() if ln is not None]
+    out.append((code.co_qualname, code.co_firstlineno, max(lines + [code.co_firstlineno])))
+    for c in code.co_consts:
+        if isinstance(c, types.CodeType):
+            _code_spans(c, out)
+    return out
+
+
+def memo_ok(patched, hunks_by, old_by, notes, warm_lines):
+    d = memo_data()
+    if d is None or any(n.startswith(MEMO_BAD) for n in notes):
+        return False
+    import zygote
+    mode = "state" if any(n.startswith(MEMO_IMPORT) for n in notes) else "plain"
+    touched = set()
+    for rel, content in patched.items():
+        old = old_by.get(rel)
+        if "noop:" + rel in notes:
+            continue
+        if rel.startswith("sqlglot/") and rel.endswith(".py"):
+            if content is None or old is None:
+                return False
+            removed, anchors = changed_old_lines(hunks_by[rel])
+            changed = removed | anchors
+            try:
+                tree = parse_cached(old)
+                spans = _code_spans(compile(old, os.path.join(SRC, rel), "exec"), [])
+            except (SyntaxError, ValueError):
+                return False
+            if changed & warm_lines.get(rel, set()) or not all(zygote.in_body(tree.body, ln) for ln in changed):
+                mode = "state"
+            hit = set()
+            removed, inserts = _replaced_lines(hunks_by[rel])
+            for q, first, last in spans:
+                if (rel, q, first) in d["exec"]:
+                    inside = {ln for ln in changed if first <= ln <= last}
+                    if inside and (q == "<module>" or not all(zygote.in_body(tree.body, ln) for ln in inside)):
+                        return False
+                    hit |= inside
+            if hit:
+                seen = d["lines"].get("ds", {}).get(rel, {})
+                ran = d["anywhere"].get(rel, set())
+                stmts = [n for n in ast.walk(tree) if isinstance(n, ast.stmt)]
+                check = set()
+                for ln in hit & removed:
+                    for a, b in _stmt_span(stmts, ln):
+                        check.update(range(a, b + 1))
+                for ln in inserts:
+                    if ln in hit or ln - 1 in hit:
+                        check |= _insert_lines(stmts, ln)
+                for x in check:
+                    q = seen.get(x)
+                    if q:
+                        touched |= q
+                    elif x in ran:
+                        touched |= set(d["pre"]["ds"])
+        elif rel == "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql":
+            if content is None or old is None:
+                return False
+        elif rel.startswith("tests/fixtures/") and "/tpc-" not in rel:
+            continue
+        elif rel.startswith("tests/") and os.path.basename(rel).startswith("test_") and rel.endswith(".py") and rel != "tests/test_executor.py":
+            continue
+        else:
+            return False
+    if mode == "state" and not os.path.exists(os.path.join(HERE, "tpc", "state.pkl")):
+        return False
+    return mode, touched
+
+
+def _replaced_lines(hunks):
+    removed, inserts = set(), set()
+    for h in hunks:
+        ln = h["old_start"] if h["old_len"] else h["old_start"] + 1
+        repl = False
+        for tag, _ in h["lines"]:
+            if tag == "-":
+                removed.add(ln)
+                ln += 1
+                repl = True
+            elif tag == "+":
+                if not repl:
+                    inserts.add(ln)
+            else:
+                ln += 1
+                repl = False
+    return removed, inserts
+
+
+def _insert_lines(stmts, ln):
+    funcs = [n for n in stmts if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.lineno < ln <= n.end_lineno + 1]
+    if not funcs:
+        return {ln - 1, ln}
+    f = max(funcs, key=lambda n: n.lineno)
+    starts = {n.lineno for n in stmts}
+    if ln > f.end_lineno or ln not in starts:
+        return set(range(f.lineno, f.end_lineno + 1))
+    out = set()
+    for a, b in _stmt_span(stmts, ln):
+        out.update(range(a, b + 1))
+    prev = max((n.end_lineno for n in stmts if f.lineno < n.lineno and n.end_lineno < ln), default=None)
+    for n in stmts:
+        if prev is not None and n.end_lineno == prev and f.lineno < n.lineno:
+            for a, b in _stmt_span(stmts, n.lineno):
+                out.update(range(a, b + 1))
+    return out
+
+
+def _stmt_span(stmts, ln):
+    inner = [n for n in stmts if n.lineno <= ln <= n.end_lineno]
+    if not inner:
+        return [(ln, ln)]
+    best = max(inner, key=lambda n: (n.lineno, -n.end_lineno))
+    blocks = [b for f in ("body", "orelse", "finalbody", "handlers", "cases") for b in [getattr(best, f, None)] if b]
+    if not blocks:
+        return [(best.lineno, best.end_lineno)]
+    first = min(b[0].lineno for b in blocks)
+    if ln < first:
+        return [(best.lineno, first - 1)]
+    return [(best.lineno, best.end_lineno)]
+
+
+def state_diff(names, pristine, checked):
+    import memo
+    mods = {m: v for m, v in sys.modules.items() if m not in checked and (m == "sqlglot" or m.startswith("sqlglot.")) and v is not None}
+    if not mods:
+        return False
+    checked.update(mods)
+    entries, keys, lazy = pristine["entries"], pristine["keys"], pristine["lazy"]
+    known = {k[0] for k in keys}
+    if any(m not in known for m in mods):
+        return True
+    now = memo.state(names, mods)
+    for k, h in now.items():
+        p = entries.get(k)
+        if h is None or (p != h if type(h) is not frozenset or type(p) is not frozenset else not h <= p):
+            if DEBUG:
+                log("state differs", k)
+            return True
+    have = memo.keysets(mods)
+    for o, ks in keys.items():
+        if o[0] in mods and o in have and ks - have[o] - lazy.get(o, frozenset()):
+            if DEBUG:
+                log("state keys missing", o, sorted(ks - have[o] - lazy.get(o, frozenset()))[:5])
+            return True
+    return False
+
+
+def install_memo(blobs, drop, check, strict, ustate):
+    import sqlglot.executor as ex
+    sys.path.insert(0, HERE)
+    import memo
+    spent = [0.0]
+    checked = set()
+    bad = []
+
+    def lookup(d, expression, raw):
+        if ustate.get("tid") != MEMO_TEST:
+            return None
+        if check is not None and not bad and state_diff(check[0], check[1], checked):
+            bad.append(1)
+        hit = blobs.get(d) if d and not bad else None
+        if hit is None and strict:
+            if spent[0] > strict or bad:
+                ustate["skipped"] = False
+                raise RuntimeError("memo budget")
+            hooks.t0 = time.process_time()
+        return hit
+
+    def leave():
+        if getattr(hooks, "t0", None) is not None:
+            spent[0] += time.process_time() - hooks.t0
+            hooks.t0 = None
+
+    hooks = memo.Hooks(ex, lookup, None, leave, drop)
+    hooks.install()
 STMT_OF = {}
 _STMT_TREES = {}
 _STMT_LINES = {}
@@ -2118,6 +2331,8 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
                 _lazy_class_setup(k, ("tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls"))
                 if UNITS and TPCPARSE:
                     defer_mp_parse(k, ustate)
+    if CHILD_MEMO is not None:
+        install_memo(*CHILD_MEMO, ustate)
     suite = unittest.TestSuite(cases)
     try:
         suite.run(Result())
@@ -2243,6 +2458,7 @@ def main():
 
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
     plans = []
+    memo_warm = None
     for cid in commits:
         text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape").read()
         FRACTION_OK.clear()
@@ -2303,9 +2519,36 @@ def main():
         if DEBUG_N in cands:
             log(cid, "dbg", DEBUG_N, "keys", None if cands[DEBUG_N] is None else len(cands[DEBUG_N]), "fracok", DEBUG_N in FRACTION_OK, None if cands[DEBUG_N] is None else sorted(cands[DEBUG_N])[:5])
         cached = TPCREF and LAZYTABLES and tpc_lazy(patched)
+        memo_n = id_to_num.get(MEMO_TEST)
+        if MEMO and memo_n in cands:
+            if memo_warm is None:
+                memo_warm = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
+            use_memo = memo_ok(patched, hunks_by, old_by, notes, memo_warm)
+        else:
+            use_memo = False
+        touched = set()
+        if use_memo:
+            use_memo, touched = use_memo
+            fx = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+            if fx in patched and all(r == fx or "noop:" + r in notes or not (r.startswith("sqlglot/") or "/tpc-" in r or r in ("tests/helpers.py", "tests/test_executor.py")) for r in patched):
+                try:
+                    known = {(q, tuple(sorted(m.items()))) for (q, m), _ in _pairs(old_by[fx])}
+                    fresh = [i + 1 for i, ((q, m), _) in enumerate(_pairs(patched[fx])) if (q, tuple(sorted(m.items()))) not in known]
+                except Exception:
+                    fresh = None
+                if fresh is not None:
+                    keys = {"f:%d" % (i - 1) for i in fresh} | {"s:%r" % (("tpc-ds %d" % i, []),) for i in fresh}
+                    if cands[memo_n] is None or keys < cands[memo_n]:
+                        cands[memo_n] = keys
+                    notes.append("memo-fresh:%d" % len(fresh))
+            notes.append("memo:%s:%d" % (use_memo, len(touched)))
 
-        def est(n):
+        def est(n, memo=True):
             c = runcpu.get(num_to_id[n], 0)
+            if memo and use_memo and n == memo_n:
+                pre, run = memo_data()["pre"]["ds"], memo_data()["run"]["ds"]
+                keys = set(pre) if cands[n] is None else set(cands[n])
+                return min(c, UNIT_K * sum(pre.get(k, 0) + (run.get(k, 0) if k in touched else 0) for k in keys) + FRAC_C)
             if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
                 return c
             u = cached and unitcpu["units"].get(num_to_id[n])
@@ -2321,9 +2564,14 @@ def main():
         if light and (RUN_K * sum(est(n) for n in light) + over) * 1000 >= cap:
             notes.insert(0, "blind")
             heavy, light = set(cands), []
+        elif light and memo_n in light and est(memo_n, False) * 1000 > ms[memo_n] + 2000 and (RUN_K * sum(est(n) for n in light if n != memo_n) + over) * 1000 >= blind - split_cost(sorted(heavy | {memo_n}), ms):
+            spend = RUN_K * sum(est(n) * (1 if n == memo_n else MEMO_K) for n in light) + over
+            if spend * 1000 >= cap:
+                notes.insert(0, "blind:memo")
+                heavy, light = set(cands), []
         sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}
-        plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000})
-        log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4])
+        plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000, "memo": use_memo if memo_n in light else False, "touched": touched, "strict": use_memo and memo_n in light and est(memo_n, False) * 1000 > ms[memo_n] + 2000})
+        log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4], "memo:%s:%d" % (use_memo, len(touched)) if use_memo else "")
 
     log("planned cpu=%.2f" % time.process_time())
     if STATIC:
@@ -2470,8 +2718,9 @@ def main():
                 log(p["cid"], "overlay failed", repr(e))
                 results[p["cid"]] = set(num_to_id)
                 continue
-            global CHILD_LAZY, CHILD_PATCHED
+            global CHILD_LAZY, CHILD_PATCHED, CHILD_MEMO
             CHILD_PATCHED = list(p["patched"])
+            CHILD_MEMO = (memo_blobs(p["touched"]), memo_data()["drop"], memo_state() if p["memo"] == "state" else None, p["strict"] and MEMO_MISS + 2 * sum(memo_data()["run"]["ds"].get(k, 0) for k in p["touched"])) if p["memo"] else None
             CHILD_LAZY = tpc_lazy(p["patched"])
             p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode)
             p["root"] = root
@@ -2483,6 +2732,12 @@ def main():
             job = p["job"]
             if job.fd in r:
                 job.feed()
+            if p["memo"] and not job.done and job.status.get(MEMO_TEST) == "F":
+                fail = {id_to_num[t] for t, v in job.status.items() if v == "F"} | set(p["heavy"])
+                if split_cost(sorted(fail | set(p["light"])), ms) <= split_cost(sorted(fail), ms):
+                    log(p["cid"], "memo test failed, listing the rest")
+                    job.kill()
+                    p["listall"] = True
             if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
                 log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
                 job.kill()
@@ -2502,7 +2757,7 @@ def main():
                 if unresolved:
                     log(p["cid"], "unresolved", len(unresolved), "current", job.current, "exit", getattr(job, "exit", None))
                     fail |= {id_to_num[t] for t in unresolved}
-                results[p["cid"]] = fail | set(p["heavy"])
+                results[p["cid"]] = fail | set(p["heavy"]) | (set(p["light"]) if p.get("listall") else set())
                 if p["slot"]:
                     release_slot(p["root"], p["patched"])
                 else:
