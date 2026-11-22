@@ -151,7 +151,8 @@ def sweep(lin, record):
         if record:
             recd = state["recd"]
             pp = real_plan(pickle.loads(state["o"]))
-            queries[i] = {"planblob": pickle.dumps((pp, ck.step_sigs(pp)), protocol=5), "pdig": state["pdig"], "schema": state["schema"], "kw": state["kw"], "opt": state["o"], "osql": state["osql"], "sigs": sorted(state["sigs"].values()), "steps": recd.steps, "result": pickle.dumps(res, protocol=5), "qtime": qt, "tables": sorted(arg)}
+            ps = ck.step_sigs(pp)
+            queries[i] = {"planblob": pickle.dumps((pp, ps), protocol=5), "root": ps[pp.root], "ctes": ck.plan_ctes(pp), "pdig": state["pdig"], "schema": state["schema"], "kw": state["kw"], "opt": state["o"], "osql": state["osql"], "sigs": sorted(state["sigs"].values()), "steps": recd.steps, "result": pickle.dumps(res, protocol=5), "qtime": qt, "tables": sorted(arg)}
             inst = k("test_execute_tpcds")
             frames[sql] = inst.cached_execute(sql, tpch=False)
             inst.subtestHelper(i, res, tpch=False)

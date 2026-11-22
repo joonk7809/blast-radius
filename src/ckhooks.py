@@ -78,6 +78,7 @@ class Session:
                     else:
                         self.touched.add(x)
         self.allq, self.imp = allq, bool(imp)
+        self.cte_readers = self._cte_readers(pristine)
         self.nogo = allq or bool(imp) or force_native
         self.only_sqlglot = all(f.startswith("sqlglot/") for f in self.files)
         self.T = {k: 0.0 for k in ("opt", "base", "plan", "replay", "real", "native", "load", "hash")}
@@ -86,6 +87,23 @@ class Session:
         self.st, self.sch, self.base = {}, {}, {}
         self.base_dirty = False
         self.spent = 0.0
+
+    def _cte_readers(self, pristine):
+        rel = "sqlglot/executor/python.py"
+        with open(os.path.join(pristine, rel), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        lines = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "_register_subquery":
+                lines.update(range(n.body[0].lineno, n.end_lineno + 1))
+        out = set()
+        for ln in lines:
+            v = self.D["lines"].get((rel, ln))
+            if v in ("ALL", "IMPORT", "OPTALL"):
+                return set(self.Q)
+            for x in v or ():
+                out.add(x[0] if type(x[0]) is int else x[1])
+        return out
 
     def frames(self):
         return dict(self.D["frames"]) if self.only_sqlglot else None
@@ -199,7 +217,7 @@ class Session:
                     plan = real_plan(expression)
                     sigs = ck.step_sigs(plan)
                 S.T["plan"] += time.process_time() - t
-                if sorted(sigs.values()) != r["sigs"]:
+                if sorted(sigs.values()) != r["sigs"] or sigs.get(plan.root) != r["root"] or (q in S.plan_q and q in S.cte_readers and (r["ctes"] is None or ck.plan_ctes(plan) != r["ctes"])):
                     S.fb.append((q + 1, "plan"))
                     return self.native(marker.get() if marker else expression, q)
                 S.stats["replayed"] += 1

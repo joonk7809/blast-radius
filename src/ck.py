@@ -107,3 +107,13 @@ def content_state(t):
 def cross_alias(a, b):
     ia = {id(x) for t in a.values() for x in (t, t.rows)}
     return any(id(x) in ia for t in b.values() for x in (t, t.rows))
+
+
+def plan_ctes(plan):
+    from sqlglot import exp
+    out = []
+    try:
+        _dump_val(plan.ctes, exp, out)
+    except Exception:
+        return None
+    return hashlib.sha256("\x00".join(out).encode("utf-8", "surrogatepass")).hexdigest()

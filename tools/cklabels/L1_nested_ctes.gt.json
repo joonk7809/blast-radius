@@ -1,0 +1,1 @@
+{"failed": [], "note": "Plan.ctes dropped: changes only subquery-time planning; 0 of 57 TPC-DS queries run _register_subquery, native run passes"}
