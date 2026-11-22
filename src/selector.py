@@ -123,6 +123,8 @@ CK_BUDGET = float(os.environ.get("BR_CK_BUDGET", "1e9"))
 LEANPRE = os.environ.get("BR_LEANPRE", "1") == "1"
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
+MEMO_KILL_K = float(os.environ.get("BR_MEMO_KILL_K", "1.5"))
+MEMO_KILL_C = float(os.environ.get("BR_MEMO_KILL_C", "2.0"))
 PATHRULES = os.environ.get("BR_PATHRULES", "1") == "1"
 TESTSIDE = os.environ.get("BR_TESTSIDE", "1") == "1"
 LAZYGONE = os.environ.get("BR_LAZYGONE", "1") == "1"
@@ -3796,8 +3798,9 @@ def main():
                 notes.insert(0, blind)
             sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light if not (lean and n == memo_n)}
             runs_memo = memo_n in light and not lean
-            plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": (cap / 1000 + lean[3]) if lean and not LEANCAL else cap / 1000, "memo": use_memo if runs_memo else False, "touched": touched, "strict": use_memo and runs_memo and est(memo_n, False) * 1000 > ms[memo_n] + 2000, "lean": lean, "fallback": fallback, "picks": picks, "price": price if lean else 0, "gain": saving - price if lean else 0})
-            log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4], "memo:%s:%d" % (use_memo, len(touched)) if use_memo else "")
+            est_cpu = sum(est(n) for n in light)
+            plans.append({"est": est_cpu, "cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": (cap / 1000 + lean[3]) if lean and not LEANCAL else cap / 1000, "memo": use_memo if runs_memo else False, "touched": touched, "strict": use_memo and runs_memo and est(memo_n, False) * 1000 > ms[memo_n] + 2000, "lean": lean, "fallback": fallback, "picks": picks, "price": price if lean else 0, "gain": saving - price if lean else 0})
+            log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % est_cpu, notes[:4], "memo:%s:%d" % (use_memo, len(touched)) if use_memo else "")
         except Exception as e:
             log(cid, "plan failed", repr(e)[:300])
             plans[:] = [q for q in plans if q["cid"] != cid]
@@ -4002,7 +4005,7 @@ def main():
                         log(p["cid"], "memo test failed, listing the rest")
                         job.kill()
                         p["listall"] = True
-                if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
+                if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > (min(p["cap"], MEMO_KILL_K * p["est"] + MEMO_KILL_C) if p["memo"] else p["cap"]) + 2.0):
                     log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
                     job.kill()
                 if job.done:
