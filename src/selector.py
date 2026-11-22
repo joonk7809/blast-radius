@@ -64,6 +64,7 @@ TPCQ = os.environ.get("BR_TPCQ", "1") == "1"
 PROBE = os.environ.get("BR_PROBE", "1") == "1"
 COLLECT = os.environ.get("BR_COLLECT", "1") == "1"
 IMPORTT = os.environ.get("BR_IMPORTT", "1") == "1"
+CLOSURE = os.environ.get("BR_CLOSURE", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
 T0 = time.monotonic()
 
@@ -1043,10 +1044,75 @@ def package_scanners(cov):
     return out
 
 
+_CLOSURE = []
+
+
+def closure_hits(cov, hit):
+    if not _CLOSURE:
+        try:
+            with gzip.open(os.path.join(HERE, "closure.json.gz"), "rt") as fh:
+                _CLOSURE.append(json.load(fh))
+        except OSError:
+            _CLOSURE.append(None)
+    m = _CLOSURE[0]
+    if m is None:
+        return None
+    out = set()
+    for n, tid in cov.ids.items():
+        rec = m["tests"].get(tid)
+        if rec is None or rec[3] or hit(m, rec):
+            out.add(n)
+    return out
+
+
+def gone_dependents(old, cov):
+    if not old.endswith(".py") or old.endswith("__init__.py"):
+        return None
+    mod, folder = modname_of(old), os.path.dirname(old)
+    return closure_hits(cov, lambda m, rec: any(m["mods"][i] == mod for i in rec[0]) or any(m["fs"][i] in (old, folder) for i in rec[2]))
+
+
+def _fn_head(node):
+    return ast.dump(type(node)(**{**{k: getattr(node, k, None) for k in node._fields}, "body": []}))
+
+
+def support_dependents(path, old_text, new_text, cov):
+    if old_text is None or new_text is None:
+        return None
+    try:
+        a, b = parse_cached(old_text), parse_cached(new_text)
+    except SyntaxError:
+        return None
+    if len(a.body) != len(b.body):
+        return None
+    spans = []
+    for x, y in zip(a.body, b.body):
+        if ast.dump(x) == ast.dump(y):
+            continue
+        if not isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(x) is not type(y) or _fn_head(x) != _fn_head(y):
+            return None
+        if shared_writes(a, set(range(x.lineno, x.end_lineno + 1)), old_text) or shared_writes(b, set(range(y.lineno, y.end_lineno + 1)), new_text):
+            return None
+        spans.append((min([x.lineno] + [d.lineno for d in x.decorator_list]), x.end_lineno))
+
+    def hit(m, rec):
+        for i in rec[1]:
+            f, _, ln = m["code"][i].rpartition(":")
+            if f == path and any(lo <= int(ln) <= hi for lo, hi in spans):
+                return True
+        return False
+
+    return closure_hits(cov, hit)
+
+
 def _candidates_for(f, old_text, new_text, cov, notes):
     path = f["path"]
-    if path.startswith("sqlglot/") and path.endswith(".py"):
+    if path.startswith("sqlglot/") and path.endswith(".py") or CLOSURE and f["old"].startswith("sqlglot/") and f["old"].endswith(".py"):
         if f["deleted"] or (f["old"] and f["old"] != path):
+            gone = gone_dependents(f["old"], cov) if CLOSURE else None
+            if gone is not None:
+                notes.extend(("closure-gone:%d" % len(gone), "gone:" + f["old"], "gone:" + path))
+                return merge(merge(full(gone), full(module_test_files(path, cov))), full(package_scanners(cov)))
             notes.append("deleted-or-renamed")
             return full(n for n in cov.idx_to_num if n is not None)
         if new_text is not None:
@@ -1146,6 +1212,10 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                 notes.append("test-dependents:%d" % len(hit))
                 out.update(n for tf in hit for n in cov.by_file.get(tf, []))
             return out
+        dep = support_dependents(path, old_text, new_text, cov) if CLOSURE and f["old"] == path and not f["deleted"] and not f["new_file"] else None
+        if dep is not None:
+            notes.append("closure-support:%d" % len(dep))
+            return dep
         notes.append("test-support")
         return {n for p, ns in cov.by_file.items() for n in ns}
     if path.startswith("tests/"):
@@ -1618,6 +1688,9 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
         os.chdir(SRC)
     else:
         if mode is not None:
+            if CLOSURE:
+                import gc
+                gc.freeze()
             for m in [m for m in sys.modules if m == "sqlglot" or m.startswith(("sqlglot.", "tests"))]:
                 del sys.modules[m]
             if SRC in sys.path:
@@ -2099,7 +2172,7 @@ def main():
     for p in plans:
         mask = 0
         for rel, content in p["patched"].items():
-            if not rel.endswith(".py") or not rel.startswith(("sqlglot/", "tests/")):
+            if not rel.endswith(".py") or not rel.startswith(("sqlglot/", "tests/")) or "gone:" + rel in p["notes"]:
                 continue
             if content is None or p["old"].get(rel) is None:
                 mask = -1
@@ -2190,7 +2263,7 @@ def main():
             budget = sum(timeouts.values()) + 30
             mode = None
             if zyg is not None:
-                mode = ("reimport", p["collect"], [modname_of(r) for r, c in p["patched"].items() if c is not None and p["old"].get(r) is not None and r.startswith("sqlglot/") and r.endswith(".py")])
+                mode = ("reimport", p["collect"], [modname_of(r) for r, c in p["patched"].items() if c is not None and p["old"].get(r) is not None and r.startswith("sqlglot/") and r.endswith(".py") and "gone:" + r not in p["notes"]])
                 zmod, warm_lines, code_idx = zyg
                 swaps, nonpy, ok = [], [], True
                 for rel, content in p["patched"].items():
