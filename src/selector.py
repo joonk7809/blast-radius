@@ -770,8 +770,12 @@ def full(nums):
 
 class CovMap:
     def __init__(self, path, id_to_num):
-        with open(path) as fh:
-            m = json.load(fh)
+        try:
+            with open(path + ".m", "rb") as fh:
+                m = marshal.loads(fh.read())
+        except OSError:
+            with open(path) as fh:
+                m = json.load(fh)
         with open(os.path.join(os.path.dirname(path), "covsets.bin"), "rb") as fh:
             raw = fh.read()
         n = int.from_bytes(raw[:4], "little")
@@ -3834,10 +3838,11 @@ def main():
             if not needs_exec:
                 sys.modules["pandas.testing"] = _LazyPandasTesting("pandas.testing")
                 needs_libs = False
-                try:
-                    import duckdb
-                except Exception:
-                    pass
+                if any(num_to_id[n].startswith("tests/test_optimizer.py") for p in plans for n in p["runs"] + list((p["fallback"] or {}).get("light", ()))) or any(m == "tests.test_optimizer" for p in plans for m in (p["collect"] or ())):
+                    try:
+                        import duckdb
+                    except Exception:
+                        pass
         if any(p["light"] or p.get("probe") for p in plans):
             preimport(needs_libs or not LEANIMP)
         log("preimported cpu=%.2f" % time.process_time())
