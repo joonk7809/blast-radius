@@ -115,7 +115,7 @@ LEANWIDE = os.environ.get("BR_LEANWIDE", "0") == "1"
 CK_C = float(os.environ.get("BR_CK_C", "1.5"))
 CK_K = float(os.environ.get("BR_CK_K", "0.5"))
 CK_R = float(os.environ.get("BR_CK_R", "0.25"))
-CK_BUDGET = float(os.environ.get("BR_CK_BUDGET", "2.0"))
+CK_BUDGET = float(os.environ.get("BR_CK_BUDGET", "1e9"))
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
 PATHRULES = os.environ.get("BR_PATHRULES", "1") == "1"
