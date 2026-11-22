@@ -12,6 +12,7 @@ RUN python -c "import gzip,lzma,shutil;shutil.copyfileobj(lzma.open('/app/covset
  && mkdir /app/tpc && python -c "import selector;selector.build_tpc_cache('/app/tpc')" \
  && python /app/memo.py /sqlglot /app/tpc/memo.pkl \
  && python /app/memo.py state /sqlglot /app/tpc/memo.pkl /app/tpc/state.pkl \
+ && python /app/ckbuild.py /sqlglot /app/tpc/ck \
  && python -c "import glob,gzip,shutil;[shutil.copyfileobj(gzip.open(f),open(f[:-3],'wb')) for f in glob.glob('/app/itmaps/*.json.gz')]" \
  && python -m compileall -q /app >/dev/null \
  && chmod -R a+rX /app
