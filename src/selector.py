@@ -316,16 +316,14 @@ def module_resolver(path):
 _PARSED = {}
 
 
+def parse_src(text):
+    return ast.parse(text.encode("utf-8", "surrogateescape"))
+
+
 def parse_cached(text):
     t = _PARSED.get(text)
     if t is None:
-        try:
-            t = ast.parse(text)
-        except UnicodeEncodeError:
-            if not RAWBIN:
-                raise
-            t = ast.parse(text.encode("utf-8", "surrogateescape"))
-        _PARSED[text] = t
+        t = _PARSED[text] = parse_src(text)
     return t
 
 
@@ -550,7 +548,7 @@ def new_side_lines(hunks):
 
 def strip_ast(text, resolve=None):
     try:
-        tree = ast.parse(text)
+        tree = parse_src(text)
     except SyntaxError:
         return None
     if DOC[0]:
@@ -882,7 +880,7 @@ def _setup_raw(tf):
     entry = _read_tree(os.path.join(SRC, tf))
     if entry[1] is None:
         try:
-            entry[1] = ast.parse(entry[0])
+            entry[1] = parse_src(entry[0])
         except SyntaxError:
             entry[1] = False
     tree = entry[1]
@@ -1161,7 +1159,7 @@ def importers(mod, names, root_dir):
                 continue
             if entry[1] is None:
                 try:
-                    entry[1] = ast.parse(text)
+                    entry[1] = parse_src(text)
                 except SyntaxError:
                     entry[1] = False
             tree = entry[1]
@@ -1215,17 +1213,6 @@ def test_dependents(path, f, old_text, new_text):
                 todo.append(g)
     hit.discard(path)
     return hit
-
-
-COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
-
-
-def _cookie(text):
-    for line in text.split("\n", 2)[:2]:
-        m = COOKIE.match(line)
-        if m:
-            return m[1]
-    return None
 
 
 def package_scanners(cov):
@@ -1321,7 +1308,7 @@ def _plain_def(node, lazy):
 
 def _inert_change(old_text, new_text):
     try:
-        a, b = ast.parse(old_text), ast.parse(new_text)
+        a, b = parse_src(old_text), parse_src(new_text)
     except (SyntaxError, ValueError):
         return False
     if any(isinstance(n, ast.ImportFrom) and any(x.name == "*" for x in n.names) for n in a.body):
@@ -1362,7 +1349,7 @@ def _side_effects(text):
     if text is None:
         return []
     try:
-        tree = ast.parse(text)
+        tree = parse_src(text)
     except (SyntaxError, ValueError):
         return []
     return sorted(ast.dump(n) for n in tree.body if _risky(n))
@@ -1400,12 +1387,6 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             except (SyntaxError, ValueError):
                 notes.append("new-unparsable")
                 return full(n for n in cov.idx_to_num if n is not None)
-            if _cookie(new_text) != _cookie(old_text or ""):
-                try:
-                    ast.parse(new_text.encode("utf-8", "surrogateescape"))
-                except (SyntaxError, LookupError, UnicodeError, ValueError):
-                    notes.append("bad-coding")
-                    return full(n for n in cov.idx_to_num if n is not None)
         extra = {}
         if old_text is not None and new_text is not None:
             try:
@@ -1932,7 +1913,7 @@ def partial_purge(root):
 CHILD_MEMO = None
 _MEMO = []
 MEMO_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-MEMO_BAD = ("shared-write", "toplevel", "newfile", "deleted-or-renamed", "unparsable", "bad-coding", "error:", "itf-error")
+MEMO_BAD = ("shared-write", "toplevel", "newfile", "deleted-or-renamed", "unparsable", "error:", "itf-error")
 MEMO_IMPORT = ("importtime", "newtop:", "itf")
 
 

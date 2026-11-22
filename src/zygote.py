@@ -92,7 +92,7 @@ def old_code(fn, old_text):
         data = b""
     if len(data) > 16 and int.from_bytes(data[4:8], "little") == 0 and int.from_bytes(data[8:12], "little") == int(st.st_mtime) & 0xFFFFFFFF and int.from_bytes(data[12:16], "little") == len(old_text.encode("utf-8")) == st.st_size:
         return marshal.loads(data[16:])
-    return compile(old_text, fn, "exec")
+    return compile(old_text.encode("utf-8", "surrogateescape"), fn, "exec")
 
 
 def _pair(old, new, out):
@@ -119,7 +119,7 @@ def swap_plan(src, path, old_text, new_text, changed, warm_lines, tree):
     fn = os.path.join(src, path)
     try:
         oldc = old_code(fn, old_text)
-        newc = compile(new_text, fn, "exec")
+        newc = compile(new_text.encode("utf-8", "surrogateescape"), fn, "exec")
     except SyntaxError:
         return None
     pairs = []
