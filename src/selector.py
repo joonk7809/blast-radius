@@ -1,12 +1,16 @@
 import ast
+import base64
 import bisect
 import builtins
 import contextvars
 import enum
 import gc
 import gzip
+import hashlib
 import importlib
 import importlib.util
+import inspect
+import io
 import json
 import logging
 import marshal
@@ -83,6 +87,8 @@ IMPORTT = os.environ.get("BR_IMPORTT", "1") == "1"
 CLOSURE = os.environ.get("BR_CLOSURE", "1") == "1"
 IMPORTBODY = os.environ.get("BR_IMPORTBODY", "1") == "1"
 CACHESITE = os.environ.get("BR_CACHESITE", "1") == "1"
+HELPERS = os.environ.get("BR_HELPERS", "1") == "1"
+HELPERS2 = os.environ.get("BR_HELPERS2", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
 PLAN_FRAC = float(os.environ.get("BR_PLAN_FRAC", "0.35"))
 WATCHDOG = float(os.environ.get("BR_WATCHDOG", "0.94"))
@@ -1007,8 +1013,8 @@ def _setup_index(cov):
     return _SETUP_INDEX
 
 
-def tpc_lazy(patched):
-    return LAZYEXEC and not any(r in ("tests/helpers.py", "sqlglot/executor/table.py", "tests/test_executor.py") or "/tpc-" in r and not (LAZYTABLES and r.endswith(".sql") and fixture_loads(r, c)) for r, c in patched.items())
+def tpc_lazy(patched, notes=()):
+    return LAZYEXEC and not any(r in ("tests/helpers.py", "sqlglot/executor/table.py", "tests/test_executor.py") and not (r == "tests/helpers.py" and "helper-clean" in notes) or "/tpc-" in r and not (LAZYTABLES and r.endswith(".sql") and fixture_loads(r, c)) for r, c in patched.items())
 
 
 def fixture_loads(path, text):
@@ -1306,7 +1312,7 @@ def _fn_head(node):
     return ast.dump(type(node)(**{**{k: getattr(node, k, None) for k in node._fields}, "body": []}))
 
 
-def support_dependents(path, old_text, new_text, cov):
+def support_dependents(path, old_text, new_text, cov, notes):
     if old_text is None or new_text is None:
         return None
     try:
@@ -1315,7 +1321,7 @@ def support_dependents(path, old_text, new_text, cov):
         return None
     if len(a.body) != len(b.body):
         return None
-    spans = []
+    spans, names = [], set()
     for x, y in zip(a.body, b.body):
         if ast.dump(x) == ast.dump(y):
             continue
@@ -1324,6 +1330,7 @@ def support_dependents(path, old_text, new_text, cov):
         if shared_writes(a, set(range(x.lineno, x.end_lineno + 1)), old_text) or shared_writes(b, set(range(y.lineno, y.end_lineno + 1)), new_text) or compile_bad(b, range(y.lineno, y.end_lineno + 1)):
             return None
         spans.append((min([x.lineno] + [d.lineno for d in x.decorator_list]), x.end_lineno))
+        names.add(x.name)
 
     def hit(m, rec):
         for i in rec[1]:
@@ -1332,7 +1339,234 @@ def support_dependents(path, old_text, new_text, cov):
                 return True
         return False
 
-    return closure_hits(cov, hit)
+    dep = closure_hits(cov, hit)
+    if HELPERS and dep and PATCH_FILES == [path] and not ambient(a) and not ambient(b):
+        return replay_dependents(path, old_text, new_text, spans, names, dep, cov, notes)
+    return dep
+
+
+PATCH_FILES = []
+_CALLS = []
+AMBIENT = {"environ", "getenv", "getcwd", "argv", "modules", "time", "random", "uuid", "datetime", "now", "monotonic", "perf_counter", "stdin", "_getframe", "currentframe", "globals"}
+
+
+def ambient(tree):
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for x in ast.walk(fn):
+                if isinstance(x, ast.Name) and x.id in AMBIENT or isinstance(x, ast.Attribute) and x.attr in AMBIENT or isinstance(x, (ast.Global, ast.Nonlocal)):
+                    return True
+    return False
+
+
+class _ModPickler(pickle.Pickler):
+    def persistent_id(self, obj):
+        return obj.__name__ if isinstance(obj, types.ModuleType) else None
+
+
+class _ModUnpickler(pickle.Unpickler):
+    def persistent_load(self, name):
+        return importlib.import_module(name)
+
+
+def support_dumps(obj):
+    buf = io.BytesIO()
+    try:
+        _ModPickler(buf, 4).dump(obj)
+    except Exception:
+        return None
+    return buf.getvalue()
+
+
+def support_module(rel, text):
+    mod = types.ModuleType(modname_of(rel))
+    mod.__file__ = os.path.join(SRC, rel)
+    exec(compile(text, mod.__file__, "exec"), mod.__dict__)
+    return mod
+
+
+def support_outcome(fn, blob):
+    try:
+        kw = _ModUnpickler(io.BytesIO(blob)).load()
+        out = []
+        try:
+            r = fn(**kw)
+            if inspect.isgenerator(r):
+                for x in r:
+                    out.append(x)
+            else:
+                out.append(r)
+        except BaseException as e:
+            out.append((type(e).__qualname__, repr(e.args)))
+        return support_dumps((out, kw))
+    except Exception:
+        return None
+
+
+def support_digest(raw):
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _replay_child(path, old_text, new_text, names, blobs):
+    sys.path.insert(0, SRC)
+    os.chdir(SRC)
+    full = os.path.join(SRC, path)
+    mon = sys.monitoring
+    boot, lines = [], set()
+
+    def on_start(code, offset):
+        if code.co_filename != full:
+            return mon.DISABLE
+        lines.add(code.co_firstlineno)
+        if code.co_qualname in names:
+            boot.append((code.co_qualname, support_dumps(dict(sys._getframe(1).f_locals))))
+
+    mon.use_tool_id(mon.PROFILER_ID, "replay")
+    mon.register_callback(mon.PROFILER_ID, mon.events.PY_START, on_start)
+    mon.set_events(mon.PROFILER_ID, mon.events.PY_START)
+    old = support_module(path, old_text)
+    mon.set_events(mon.PROFILER_ID, 0)
+    new = support_module(path, new_text)
+
+    def state(mod):
+        return {k: support_dumps(v) for k, v in vars(mod).items() if not k.startswith("__") and not isinstance(v, (types.FunctionType, type))}
+
+    def same(name, blob):
+        a = support_outcome(getattr(old, name, None), blob)
+        b = support_outcome(getattr(new, name, None), blob)
+        return [bool(a) and a == b, a and support_digest(a), a and b and a != b and name == "load_sql_fixture_pairs" and support_items(a, b)]
+
+    def truth(mod, k):
+        try:
+            return bool(getattr(mod, k))
+        except Exception:
+            return None
+
+    a, b = state(old), state(new)
+    drift = None if None in a.values() or None in b.values() else sorted(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
+    if not drift and not all(blob and same(name, blob)[0] for name, blob in boot):
+        drift = None
+    calls = {cid: same(name, blob) for cid, (name, blob, hot) in blobs.items() if hot or drift}
+    return {"drift": drift, "truth": {k: [truth(old, k), truth(new, k)] for k in drift or ()}, "lines": sorted(lines), "calls": calls}
+
+
+def support_items(a, b):
+    (xs, kx), (ys, ky) = _ModUnpickler(io.BytesIO(a)).load(), _ModUnpickler(io.BytesIO(b)).load()
+    if kx != ky or len(xs) != len(ys) or not all(type(x) is tuple and len(x) == 3 for x in xs + ys):
+        return None
+    return [kx.get("filename"), [j + 1 for j, (x, y) in enumerate(zip(xs, ys)) if support_dumps(x) is None or support_dumps(x) != support_dumps(y)]]
+
+
+def support_replay(path, old_text, new_text, names, blobs):
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            signal.alarm(20)
+            null = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(null, 1)
+            os.dup2(null, 2)
+            res = _replay_child(path, old_text, new_text, names, blobs)
+            with os.fdopen(w, "w") as fh:
+                json.dump(res, fh)
+        finally:
+            os._exit(0)
+    os.close(w)
+    with os.fdopen(r) as fh:
+        data = fh.read()
+    os.waitpid(pid, 0)
+    return json.loads(data) if data else None
+
+
+def replay_dependents(path, old_text, new_text, spans, names, dep, cov, notes):
+    if not _CALLS:
+        try:
+            with gzip.open(os.path.join(HERE, "helpercalls.json.gz"), "rt") as fh:
+                _CALLS.append(json.load(fh))
+        except OSError:
+            _CALLS.append(None)
+    doc, m = _CALLS[0], _CLOSURE[0]
+    if doc is None:
+        return dep
+
+    def touched(lines):
+        return {ln for ln in lines if any(lo <= ln <= hi for lo, hi in spans)}
+
+    calls = {i: c for i, c in enumerate(doc["calls"]) if c[0] == path}
+    hot = {i for i, c in calls.items() if touched(c[4])}
+    per, dirty = {}, set(doc["dirty"])
+    for n in dep:
+        ids, rec = None if cov.ids[n] in dirty else doc["tests"].get(cov.ids[n]), m["tests"].get(cov.ids[n])
+        if ids is not None and rec and not rec[3]:
+            per[n] = [i for i in ids if i in calls]
+    blobs = {str(i): (calls[i][1], base64.b64decode(calls[i][2]), i in hot) for ids in per.values() for i in ids if calls[i][2]}
+    res = support_replay(path, old_text, new_text, names, blobs)
+    if res is None or res["drift"] is None:
+        return dep
+    out = full(set(dep) - set(per))
+    if HELPERS2 and not res["drift"]:
+        notes.append("helper-clean")
+    if res["drift"]:
+        hot = set(calls)
+        direct = set(importers(modname_of(path), set(res["drift"]), "tests"))
+        files, todo = set(direct), list(direct)
+        while todo:
+            for g in set(importers(modname_of(todo.pop()), None, "tests")) - files:
+                files.add(g)
+                todo.append(g)
+        for tf in files:
+            if not (HELPERS2 and tf in direct and skip_only(tf, res["drift"], res["truth"])):
+                out.update((n, None) for n in cov.by_file.get(tf, []) if n in dep)
+    for n, ids in per.items():
+        got = set(res["lines"]).union(*(calls[i][4] for i in ids))
+        want = {int(m["code"][i].rpartition(":")[2]) for i in m["tests"][cov.ids[n]][1] if m["code"][i].startswith(path + ":")}
+        bad = [(res["calls"].get(str(i)), calls[i][3]) for i in ids if i in hot and res["calls"].get(str(i)) != [True, calls[i][3], False]]
+        keys = None if not touched(want) <= got else (loader_keys(n, bad, cov) if HELPERS2 else None) if bad else set()
+        if keys is None or keys:
+            merge(out, {n: keys})
+    return out
+
+
+def skip_only(tf, drift, truth):
+    if any(truth.get(k) != [False, True] for k in drift):
+        return False
+    try:
+        tree = ast.parse(_read_tree(os.path.join(SRC, tf))[0])
+    except SyntaxError:
+        return False
+    ok = set()
+    for node in tree.body:
+        for inner in [node] + (node.body if isinstance(node, ast.ClassDef) else []):
+            for d in getattr(inner, "decorator_list", ()):
+                if isinstance(d, ast.Call) and d.args and isinstance(d.args[0], ast.Name) and d.args[0].id in drift and (isinstance(inner, ast.ClassDef) if inner is node else isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef))):
+                    f = d.func
+                    if isinstance(f, ast.Attribute) and f.attr == "skipIf" and isinstance(f.value, ast.Name) and f.value.id == "unittest":
+                        ok.add(id(d.args[0]))
+    return all(id(x) in ok for x in ast.walk(tree) if isinstance(x, ast.Name) and x.id in drift) and not any(isinstance(x, ast.Attribute) and x.attr in drift for x in ast.walk(tree))
+
+
+def loader_keys(n, bad, cov):
+    keys = set()
+    for r, dig in bad:
+        if not r or r[1] != dig or not isinstance(r[2], list) or not isinstance(r[2][0], str) or not r[2][1]:
+            return None
+        fx = "tests/fixtures/" + r[2][0]
+        folder = os.path.dirname(fx)
+        if fx != os.path.join(folder, os.path.basename(folder) + ".sql") or not os.path.exists(os.path.join(SRC, fx)):
+            return None
+        direct, setup = {cov.idx_to_num[i] for i in cov.fixtures.get(fx, []) if cov.idx_to_num[i] is not None}, class_setup_readers(fx, cov)
+        if n not in direct | setup:
+            if n in class_setup_readers(fx, cov, False):
+                continue
+            return None
+        k = query_unit_keys(cov, n, set(r[2][1]), os.path.basename(folder)) if TPCQ and (TPCQ2 or n not in direct) else None
+        if k is None:
+            return None
+        keys |= k
+    if keys:
+        FRACTION_OK.add(n)
+    return keys
 
 
 def _exported(tree):
@@ -1574,7 +1808,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         if INERT and os.path.basename(path) != "__init__.py" and not importers(modname_of(path), None, "tests") and not importers(modname_of(path), None, "sqlglot"):
             notes.append("test-support-unimported")
             return set()
-        dep = support_dependents(path, old_text, new_text, cov) if CLOSURE and f["old"] == path and not f["deleted"] and not f["new_file"] else None
+        dep = support_dependents(path, old_text, new_text, cov, notes) if CLOSURE and f["old"] == path and not f["deleted"] and not f["new_file"] else None
         if dep is not None:
             notes.append("closure-support:%d" % len(dep))
             return dep
@@ -2091,6 +2325,8 @@ def memo_ok(patched, hunks_by, old_by, notes, warm_lines):
                 return False
         elif rel.startswith("tests/fixtures/") and "/tpc-" not in rel:
             continue
+        elif rel == "tests/helpers.py" and "helper-clean" in notes:
+            mode = "state"
         elif rel.startswith("tests/") and os.path.basename(rel).startswith("test_") and rel.endswith(".py") and rel != "tests/test_executor.py":
             continue
         else:
@@ -3178,6 +3414,7 @@ def main():
             ok = True
             try:
                 files = parse_patch(text)
+                PATCH_FILES[:] = [f["path"] for f in files]
                 for f in files:
                     if f.get("binary"):
                         notes.append("binary:" + f["path"])
@@ -3248,7 +3485,7 @@ def main():
                             keys.add("f:%d" % (int(m.group(2)) - 1))
             if DEBUG_N in cands:
                 log(cid, "dbg", DEBUG_N, "keys", None if cands[DEBUG_N] is None else len(cands[DEBUG_N]), "fracok", DEBUG_N in FRACTION_OK, None if cands[DEBUG_N] is None else sorted(cands[DEBUG_N])[:5])
-            cached = TPCREF and LAZYTABLES and tpc_lazy(patched)
+            cached = TPCREF and LAZYTABLES and tpc_lazy(patched, notes)
             memo_n = id_to_num.get(MEMO_TEST)
             if MEMO and memo_n in cands:
                 if memo_warm is None:
@@ -3504,7 +3741,7 @@ def main():
                 write_overlay(p, mode, root)
             CHILD_PATCHED = list(p["patched"])
             CHILD_MEMO = (memo_blobs(p["touched"]), memo_data()["drop"], memo_state() if p["memo"] == "state" else None, p["strict"] and MEMO_MISS + 2 * sum(memo_data()["run"]["ds"].get(k, 0) for k in p["touched"])) if p["memo"] else None
-            CHILD_LAZY = tpc_lazy(p["patched"])
+            CHILD_LAZY = tpc_lazy(p["patched"], p["notes"])
             p["root"] = root
             p["slot"] = slot
             p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode, p["lean"])
