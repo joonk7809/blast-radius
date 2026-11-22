@@ -185,6 +185,10 @@ def code_key(c):
     return (c.co_code, tuple(code_key(x) if isinstance(x, types.CodeType) else x for x in c.co_consts), c.co_names, c.co_freevars)
 
 
+def keysets(mods):
+    return {(mname, qual): frozenset(k for k in d if type(k) is str) for mname, qual, d in owners(mods)}
+
+
 def owners(mods):
     for mname, mod in list(mods.items()):
         if mod is None or not (mname == "sqlglot" or mname.startswith("sqlglot.")):
@@ -417,8 +421,10 @@ def build_state(src, memo_path, out_path):
     os.chdir(src)
     import importlib
     import pkgutil
+    import tests.test_executor
     import sqlglot
     from sqlglot.dialects.dialect import Dialect, Dialects
+    first = keysets(sys.modules)
     for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
         try:
             importlib.import_module(m.name)
@@ -429,11 +435,12 @@ def build_state(src, memo_path, out_path):
             Dialect.get_or_raise(d.value)
         except Exception:
             pass
-    import tests.test_executor
     with open(memo_path, "rb") as fh:
         names = set(pickle.load(fh)["names"])
+    keys = keysets(sys.modules)
+    lazy = {o: keys[o] - ks for o, ks in first.items() if o in keys}
     with open(out_path, "wb") as fh:
-        pickle.dump(state(names, sys.modules), fh)
+        pickle.dump({"entries": state(names, sys.modules), "keys": keys, "lazy": lazy}, fh)
 
 
 if __name__ == "__main__":

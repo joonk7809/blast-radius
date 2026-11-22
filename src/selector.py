@@ -1458,15 +1458,24 @@ def state_diff(names, pristine, checked):
     if not mods:
         return False
     checked.update(mods)
-    known = {k[0] for k in pristine}
+    entries, keys, lazy = pristine["entries"], pristine["keys"], pristine["lazy"]
+    known = {k[0] for k in keys}
+    if any(m not in known for m in mods):
+        return True
     now = memo.state(names, mods)
     for k, h in now.items():
-        p = pristine.get(k)
-        if k[0] not in known or h is None or (p != h if type(h) is not frozenset or type(p) is not frozenset else not h <= p):
+        p = entries.get(k)
+        if h is None or (p != h if type(h) is not frozenset or type(p) is not frozenset else not h <= p):
             if DEBUG:
                 log("state differs", k)
             return True
-    return any(k[0] in mods and k[1] and k not in now for k in pristine)
+    have = memo.keysets(mods)
+    for o, ks in keys.items():
+        if o[0] in mods and o in have and ks - have[o] - lazy.get(o, frozenset()):
+            if DEBUG:
+                log("state keys missing", o, sorted(ks - have[o] - lazy.get(o, frozenset()))[:5])
+            return True
+    return False
 
 
 def install_memo(blobs, drop, check, strict, ustate):
