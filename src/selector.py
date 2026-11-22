@@ -31,7 +31,7 @@ UNITEST = os.environ.get("BR_UNITEST", "1") == "1"
 PARTIAL = os.environ.get("BR_PARTIAL", "1") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
 FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
-LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
+LEANIMP = os.environ.get("BR_LEANIMP", "1") == "1"
 DYNSKIP = os.environ.get("BR_DYNSKIP", "1") == "1"
 DYNSKIP_MS = float(os.environ.get("BR_DYNSKIP_MS", "500"))
 LAZYPANDAS = os.environ.get("BR_LAZYPANDAS", "1") == "1"
