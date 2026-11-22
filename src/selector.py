@@ -16,6 +16,7 @@ import signal
 import sys
 import time
 import types
+from io import StringIO
 
 DATA = os.environ.get("BR_DATA", "/data")
 SRC = os.environ.get("BR_SRC", "/sqlglot")
@@ -138,8 +139,10 @@ def wall_span(n):
 def parse_patch(text):
     files = []
     cur = None
-    hunk = None
-    for line in text.splitlines(keepends=True):
+    hunk = last = None
+    for line in StringIO(text, newline="\n"):
+        if hunk is not None and (line.startswith(("diff --git ", "@@ ")) or not line.startswith((" ", "-", "+", "\\")) and line not in ("\n", "\r\n")):
+            raise ValueError("hunk shorter than its header")
         if line.startswith("diff --git "):
             if RAWBIN:
                 old, new = _header_paths(line[11:].rstrip("\n").rstrip("\r"))
@@ -163,33 +166,49 @@ def parse_patch(text):
                 pass
         m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
         if m:
-            hunk = {"old_start": int(m.group(1)), "old_len": int(m.group(2) or 1), "new_start": int(m.group(3)), "lines": []}
+            hunk = last = {"old_start": int(m.group(1)), "old_len": int(m.group(2) or 1), "new_start": int(m.group(3)), "lines": []}
+            want = [hunk["old_len"], int(m.group(4) or 1)]
             cur["hunks"].append(hunk)
-            continue
-        if hunk is None:
+            if want == [0, 0]:
+                hunk = None
             continue
         if line.startswith("\\"):
-            if hunk["lines"]:
-                tag, body = hunk["lines"][-1]
-                hunk["lines"][-1] = (tag, body.rstrip("\n").rstrip("\r") if body.endswith("\n") else body)
+            if last is not None and last["lines"]:
+                tag, body = last["lines"][-1]
+                last["lines"][-1] = (tag, body.rstrip("\n").rstrip("\r") if body.endswith("\n") else body)
+            continue
+        if hunk is None:
             continue
         tag = line[:1]
         if tag in " -+":
             hunk["lines"].append((tag, line[1:]))
-        elif line in ("\n", "\r\n"):
-            hunk["lines"].append((" ", line))
+        else:
+            tag = " "
+            hunk["lines"].append((tag, line))
+        want[0] -= tag != "+"
+        want[1] -= tag != "-"
+        if min(want) < 0:
+            raise ValueError("hunk longer than its header")
+        if want == [0, 0]:
+            hunk = None
+    if hunk is not None:
+        raise ValueError("hunk shorter than its header")
     return files
 
 
 def apply_file(old_text, hunks):
-    old = old_text.splitlines(keepends=True)
+    old = StringIO(old_text, newline="\n").readlines()
     out = []
     pos = 0
     for h in hunks:
         start = h["old_start"] - 1 if h["old_len"] else h["old_start"]
+        if start < pos:
+            raise ValueError("hunks overlap")
         out.extend(old[pos:start])
         pos = start
         for tag, body in h["lines"]:
+            if tag != "+" and (pos >= len(old) or old[pos] != body):
+                raise ValueError("hunk does not match the pristine file")
             if tag == " ":
                 out.append(old[pos])
                 pos += 1

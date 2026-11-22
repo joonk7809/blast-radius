@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import types
+from io import StringIO
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAPDIR = os.environ.get('IMPORTTIME_MAPS', os.path.join(HERE, 'maps'))
 SQLGLOT_ROOT = os.environ.get('IMPORTTIME_SQLGLOT', '/sqlglot')
@@ -592,7 +593,7 @@ def _key_tests(rm, cls, attr, key):
 def parse_patch(text):
     files = []
     cur = None
-    lines = text.splitlines(keepends=True)
+    lines = StringIO(text, newline='\n').readlines()
     i = 0
     while i < len(lines):
         ln = lines[i]
@@ -647,7 +648,7 @@ def parse_patch(text):
     return files
 
 def apply_hunks(src, hunks):
-    a = src.splitlines(keepends=True)
+    a = StringIO(src, newline='\n').readlines()
     out, pos = ([], 0)
     for ostart, old, new in hunks:
         start = max(ostart - 1, 0) if old else ostart
@@ -822,7 +823,7 @@ def _alignment(old_lines_n, hunks_ops):
 def _hunk_ops(text):
     res = {}
     cur = None
-    for line in text.splitlines():
+    for line in StringIO(text, newline='\n'):
         if line.startswith('diff --git'):
             m = re.match('diff --git a/(\\S+) b/(\\S+)', line)
             cur = res.setdefault(m.group(1) if m else line, {'hunks': [], 'removed': set(), 'ins': set()})
@@ -1124,7 +1125,7 @@ def static_paths(patch_text, root=None):
             ok = False
             continue
         info = hp.get(rel) or {'hunks': [], 'removed': set(), 'ins': set()}
-        old_lines = old_src.splitlines(keepends=True)
+        old_lines = StringIO(old_src, newline='\n').readlines()
         touched = []
         locs = [(ln, 'rm') for ln in sorted(info['removed'])] + [(ln, 'ins') for ln in sorted(info['ins'])]
         need = []
@@ -1162,7 +1163,7 @@ def static_paths(patch_text, root=None):
             continue
         new_src = apply_hunks(old_src, f['hunks'])
         amap = _alignment(len(old_lines), info['hunks'])
-        new_lines = new_src.splitlines(keepends=True)
+        new_lines = StringIO(new_src, newline='\n').readlines()
         scopes = {}
         for key, chain, hit, ln, why in need:
             scopes.setdefault(key, (chain, []))[1].append((hit, ln, why))
