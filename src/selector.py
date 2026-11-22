@@ -98,7 +98,7 @@ DOCFN = os.environ.get("BR_DOCFN", "1") == "1"
 SRCREAD = os.environ.get("BR_SRCREAD", "1") == "1"
 DEBUGLOG = os.environ.get("BR_DEBUGLOG", "1") == "1"
 LEAN = os.environ.get("BR_LEAN", "1") == "1"
-CANARY_K = int(os.environ.get("BR_CANARY_K", "0"))
+CANARY_K = int(os.environ.get("BR_CANARY_K", "2"))
 CANARY_SCALE = float(os.environ.get("BR_CANARY_SCALE", "0.65"))
 LEAN_COST = float(os.environ.get("BR_LEAN_COST", "15.5"))
 LEAN_SCALE = float(os.environ.get("BR_LEAN_SCALE", "0.5"))
