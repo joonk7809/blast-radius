@@ -115,7 +115,9 @@ CKHOOKS = os.environ.get("BR_CKHOOKS", "1") == "1"
 LEANWIDE = os.environ.get("BR_LEANWIDE", "0") == "1"
 CK_C = float(os.environ.get("BR_CK_C", "1.5"))
 CK_K = float(os.environ.get("BR_CK_K", "0.5"))
-CK_R = float(os.environ.get("BR_CK_R", "0.25"))
+CK_P = float(os.environ.get("BR_CK_P", "0.45"))
+CK_S = float(os.environ.get("BR_CK_S", "1.25"))
+CK_B = float(os.environ.get("BR_CK_B", "2.0"))
 CK_BUDGET = float(os.environ.get("BR_CK_BUDGET", "1e9"))
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
@@ -1993,12 +1995,12 @@ def ck_price(text, u, native):
     if not _CKL:
         with open(os.path.join(HERE, "tpc", "ck", "lines.pkl"), "rb") as fh:
             _CKL.append(pickle.load(fh))
-    lines, queries = _CKL[0]
+    lines, queries, cost = _CKL[0]
     r = _ckhooks().Reach(lines, queries, text, SRC)
     if r.allq or r.imp:
         return native, False
     rerun = r.frame | r.opt_q
-    est = CK_C + min(CK_BUDGET, sum((CK_K if q in rerun else CK_R) * u.get("f:%d" % q, 0) for q in r.hot()))
+    est = CK_C + min(CK_BUDGET, CK_K * sum(u.get("f:%d" % q, 0) for q in rerun) + CK_P * sum(u.get("f:%d" % q, 0) for q in r.plan_q - rerun) + CK_S * sum(cost.get(x, 0) for x in r.touched if x[0] not in rerun) + (CK_B if r.setup_hit or not r.only_sqlglot else 0))
     return (est, True) if est < native else (native, False)
 
 
@@ -2987,13 +2989,23 @@ def lean_run(order, stop, optcache, budgets, total, ck=None, duck=False):
     def run(expression):
         return pickle.loads(pickle.dumps(X.execute(expression, schema=schema, tables={t.name: tables[t.name] for t in find_tables(expression)})))
 
+    def ckrun(i):
+        r = S.Q[i]
+        S.hint = (ckhooks.Parsed(r["pblob"], find_tables), i)
+        return pickle.loads(pickle.dumps(X.execute(S.hint[0], schema=schema, tables={n: tables[n] for n in r["targ"]})))
+
     bad = []
     for i in order:
         blob = blobs.get(keyed.get("f:%d" % i))
         if i not in queries or blob is None:
             return [i]
         signal.setitimer(signal.ITIMER_VIRTUAL, budgets.get(i, 0))
-        got = _outcome(lambda: run(pickle.loads(pickle.dumps(parse_one(queries[i])))))
+        if ck is not None:
+            S.hint = None
+        if ck is not None and i in S.fast and "targ" in S.Q[i] and S.Q[i]["sql"] == queries[i]:
+            got = _outcome(lambda: ckrun(i))
+        else:
+            got = _outcome(lambda: run(pickle.loads(pickle.dumps(parse_one(queries[i])))))
         if duck and got[0] == "ok":
             try:
                 d = transpile(queries[i], write="duckdb")[0]
@@ -3527,38 +3539,6 @@ class Job:
         return [t for t in self.tests if t not in self.status]
 
 
-DIAG_EXPECT = {"2haz": 0, "2jrq": 25454, "2qn5": 0, "2vdj": 2083, "3utz": 25454, "4d63": 0, "535z": 2596, "5y72": 0, "66ks": 0, "6vvp": 2037, "6ze8": 2001, "8y7j": 0, "986c": 2329, "9u5k": 0, "ary6": 4382, "bap8": 0, "bj7g": 2011, "bvw2": 2061, "egys": 2596, "f4bn": 2007, "f4xa": 0, "fryt": 0, "gbav": 0, "gbhk": 2061, "j6uz": 4399, "ktz3": 0, "mthh": 3016, "nwnx": 2092, "rszg": 5764, "st8f": 2008}
-DIAG_EDGES = (2500, 3500, 8000, 20000)
-
-
-def diag_res(cid, workers, p, ms, split_cost):
-    listed = {n for w in workers for n in w}
-    cost = split_cost(sorted(listed), ms)
-    u = cost - split_cost(sorted(p.get("conf", set()) & listed), ms)
-    if cid in DIAG_EXPECT:
-        if cost == DIAG_EXPECT[cid]:
-            return
-        digit = 0
-    elif u > 0:
-        digit = 5 - sum(u >= e for e in DIAG_EDGES)
-    else:
-        return
-    want = 8 ** digit
-    rem, add = want, []
-    for n in sorted((n for n in ms if ms[n] > 0 and n not in listed), key=lambda n: (-ms[n], n)):
-        if ms[n] <= rem:
-            add.append(n)
-            rem -= ms[n]
-            if not rem:
-                break
-    if rem or not workers:
-        log(cid, "diagres skip", digit, u, cost, want)
-        return
-    top = max(range(len(workers)), key=lambda i: sum(ms[n] for n in workers[i]))
-    workers[top] = workers[top] + add
-    log(cid, "diagres", digit, u, cost, want)
-
-
 def main():
     tests_doc = json.load(open(os.path.join(DATA, "tests.json")))
     tests = tests_doc["tests"]
@@ -3755,7 +3735,7 @@ def main():
                 notes.insert(0, blind)
             sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light if not (lean and n == memo_n)}
             runs_memo = memo_n in light and not lean
-            plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000, "memo": use_memo if runs_memo else False, "touched": touched, "strict": use_memo and runs_memo and est(memo_n, False) * 1000 > ms[memo_n] + 2000, "lean": lean, "fallback": fallback, "picks": picks, "price": price if lean else 0, "gain": saving - price if lean else 0})
+            plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": (cap / 1000 + lean[3]) if lean and not LEANCAL else cap / 1000, "memo": use_memo if runs_memo else False, "touched": touched, "strict": use_memo and runs_memo and est(memo_n, False) * 1000 > ms[memo_n] + 2000, "lean": lean, "fallback": fallback, "picks": picks, "price": price if lean else 0, "gain": saving - price if lean else 0})
             log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4], "memo:%s:%d" % (use_memo, len(touched)) if use_memo else "")
         except Exception as e:
             log(cid, "plan failed", repr(e)[:300])
@@ -3961,8 +3941,6 @@ def main():
                 if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
                     log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
                     job.kill()
-                    if p["probe"]:
-                        job.broken = True
                 if job.done:
                     running.remove(p)
                     fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
@@ -3971,7 +3949,6 @@ def main():
                         pre = "%s.py::%s::" % (mod.replace(".", "/"), cname)
                         fail |= {n for n, t in num_to_id.items() if t.startswith(pre)}
                     fail |= {id_to_num[t] for t in job.sticky if t in id_to_num}
-                    p["conf"] = set(fail)
                     if getattr(job, "broken", False) or job.abort or p["probe"] and not job.collected:
                         log(p["cid"], "patched module does not import", job.abort, job.collected)
                         fail = set(num_to_id)
@@ -4008,10 +3985,8 @@ def main():
                 results[p["cid"]] = listing(p)
     signal.setitimer(signal.ITIMER_REAL, 0)
     log("loop done cpu=%.2f" % time.process_time())
-    by_cid = {p["cid"]: p for p in plans}
     for cid in commits:
         workers = split(sorted(results.get(cid, set(num_to_id))), ms)
-        diag_res(cid, workers, by_cid.get(cid, {}), ms, split_cost)
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
         WRITTEN.add(cid)
     sys.stdout.flush()

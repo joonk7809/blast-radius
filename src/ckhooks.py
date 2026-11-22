@@ -49,6 +49,7 @@ def check_lines(patch_text, pristine):
 class Reach:
     def __init__(self, lines, queries, patch_text, pristine):
         chk, imp, self.files = check_lines(patch_text, pristine)
+        self.chk = chk
         self.touched, self.frame, self.plan_q, self.opt_q = set(), set(), set(), set()
         self.setup_hit, allq = False, chk is None
         for key in chk or ():
@@ -82,6 +83,16 @@ class Reach:
         return {q for q, _ in self.touched} | self.plan_q | self.frame | self.opt_q
 
 
+class Parsed:
+    def __init__(self, blob, find_tables):
+        self.blob, self.find_tables = blob, find_tables
+
+    def get(self):
+        e = pickle.loads(self.blob)
+        self.find_tables(e)
+        return e
+
+
 class Session(Reach):
     def __init__(self, store, pristine, patch_text, budget=None, force_native=False):
         with open(os.path.join(store, "ck2.pkl"), "rb") as fh:
@@ -92,6 +103,10 @@ class Session(Reach):
         Reach.__init__(self, self.D["lines"], self.Q, patch_text, pristine)
         self.nogo = self.allq or self.imp or force_native
         self.cte_readers = self._cte_readers(pristine)
+        pl = self.D.get("plines")
+        parse_q = set(self.Q) if pl is None else {q for key in self.chk or () for q in pl.get(key, ())}
+        self.fast = set() if self.nogo else {i for i, r in self.Q.items() if "pblob" in r and self.by_pdig[r["pdig"]] == i and i not in parse_q and i not in self.frame and i not in self.opt_q}
+        self.hint = None
         self.T = {k: 0.0 for k in ("opt", "base", "plan", "replay", "real", "native", "load", "hash")}
         self.stats = {"virtual": 0, "realsteps": 0, "untouched": 0, "optskip": 0, "replayed": 0, "native": 0}
         self.fb = []
@@ -136,7 +151,27 @@ class Session(Reach):
             if h is None or h[0] is not schema:
                 h = S.sch[key] = (schema, memo._hash((schema, a, sorted(kw.items()))))
             S.st["schema"] = h[1]
+            if S.hint is not None and h[1] == Q[S.hint[1]]["schema"] and "sta" in Q[S.hint[1]]:
+                return LazySchema(schema, a, kw, Q[S.hint[1]]["sta"])
             return real_es(schema, *a, **kw)
+
+        class LazySchema:
+            def __init__(self, schema, a, kw, sta):
+                self.args, self.sta, self.obj, self.served = (schema, a, kw), sta, None, False
+
+            def get(self):
+                if self.obj is None:
+                    schema, a, kw = self.args
+                    self.obj = real_es(schema, *a, **kw)
+                    if self.served:
+                        self.obj.supported_table_args
+                return self.obj
+
+            def __getattr__(self, name):
+                if name == "supported_table_args" and self.obj is None:
+                    self.served = True
+                    return self.sta
+                return getattr(self.get(), name)
 
         class Marker:
             def __init__(self, q):
@@ -157,14 +192,15 @@ class Session(Reach):
 
         def h_opt(expression, schema, **kw):
             t = time.process_time()
-            q = S.by_pdig.get(memo.digest(expression, {}))
+            h, S.hint = S.hint, None
+            q = h[1] if h is not None and h[0] is expression else S.by_pdig.get(memo.digest(expression, {}))
             S.st["q"], S.st["optskip"], S.st["opt_same"] = q, False, False
             try:
                 if q is not None and not S.nogo and q not in S.opt_q and q not in S.frame and repr(sorted(kw.items())) == Q[q]["kw"] and S.st.pop("schema", None) == Q[q]["schema"]:
                     S.st["optskip"] = True
                     S.stats["optskip"] += 1
                     return Marker(q)
-                o = real_opt(expression, schema, **kw)
+                o = real_opt(expression.get() if type(expression) is Parsed else expression, schema.get() if type(schema) is LazySchema else schema, **kw)
                 S.st["opt_same"] = q is not None and memo.digest(o, {}) == memo.digest(pickle.loads(Q[q]["opt"]), {})
                 return o
             finally:
