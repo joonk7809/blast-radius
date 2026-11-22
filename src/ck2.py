@@ -7,6 +7,7 @@ import time
 import ck
 
 METHODS = ("scan", "aggregate", "join", "sort", "set_operation")
+SKIPHASH = os.environ.get("BR_CKSKIPHASH", "1") == "1"
 
 
 class Fallback(Exception):
@@ -92,6 +93,7 @@ class Replayer:
         for s, r in rec["steps"].items():
             for d in r["alias_of"]:
                 self.aliased_by.setdefault(d, set()).add(s)
+        self.need = {s for s in rec["steps"] if any((q, y) not in touched for y in self.dependents.get(s, ()))} if SKIPHASH else None
 
     def wrap(self, ex):
         self.ex = ex
@@ -212,13 +214,21 @@ class Replayer:
                 out = fn(step, context)
             finally:
                 self.T["real"] += time.process_time() - t0
-            oc = self._hash(out.tables)
-            self.eq[s] = 2 if oc == tuple(r["out"]) else 1 if oc[0] == r["out"][0] else 0
+            if self.need is None or s in self.need:
+                oc = self._hash(out.tables)
+                self.eq[s] = 2 if oc == tuple(r["out"]) else 1 if oc[0] == r["out"][0] else 0
+            else:
+                self.eq[s] = 0
+                self.stats["hashskip"] = self.stats.get("hashskip", 0) + 1
             for d, tabs in deps.items():
-                pc = self._hash(tabs)
                 want = r["post"].get(d)
                 if want is None:
                     raise Fallback("dep")
+                if self.need is not None and self.need.isdisjoint(self.closure(d)):
+                    for x in self.closure(d):
+                        self.eq[x] = min(self.eq.get(x, 2), 0)
+                    continue
+                pc = self._hash(tabs)
                 if pc == tuple(want):
                     continue
                 for x in self.closure(d):

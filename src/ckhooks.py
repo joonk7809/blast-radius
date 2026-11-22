@@ -242,7 +242,7 @@ class Session(Reach):
                 r = Q[q]
                 t = time.process_time()
                 bad = set()
-                if S.setup_hit or S.base_dirty or not S.only_sqlglot:
+                if (S.setup_hit or S.base_dirty or not S.only_sqlglot) and not (ck2.SKIPHASH and all((q, x) in S.touched for x in r["steps"])):
                     for n in r["tables"]:
                         tb = self.tables.find(sx.exp.to_table(n))
                         h = S.base.get(id(tb))
