@@ -65,6 +65,8 @@ def warm(src, ids, prewarm=True, optwarm=False):
 
 def code_index(files):
     idx = {}
+    if not files:
+        return idx
     fn_type = types.FunctionType
     for o in gc.get_objects():
         if type(o) is fn_type and o.__code__.co_filename in files:

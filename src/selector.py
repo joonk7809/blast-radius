@@ -119,6 +119,7 @@ CK_P = float(os.environ.get("BR_CK_P", "0.45"))
 CK_S = float(os.environ.get("BR_CK_S", "1.25"))
 CK_B = float(os.environ.get("BR_CK_B", "2.0"))
 CK_BUDGET = float(os.environ.get("BR_CK_BUDGET", "1e9"))
+LEANPRE = os.environ.get("BR_LEANPRE", "1") == "1"
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
 PATHRULES = os.environ.get("BR_PATHRULES", "1") == "1"
@@ -769,8 +770,12 @@ def full(nums):
 
 class CovMap:
     def __init__(self, path, id_to_num):
-        with open(path) as fh:
-            m = json.load(fh)
+        try:
+            with open(path + ".m", "rb") as fh:
+                m = marshal.loads(fh.read())
+        except OSError:
+            with open(path) as fh:
+                m = json.load(fh)
         with open(os.path.join(os.path.dirname(path), "covsets.bin"), "rb") as fh:
             raw = fh.read()
         n = int.from_bytes(raw[:4], "little")
@@ -2946,11 +2951,36 @@ def _over_budget(signum, frame):
 
 
 _CKINFO = []
+_LEANPRE = {}
+
+
+def _table_code(mod):
+    owners = [mod] + [v for _, v in sorted(vars(mod).items()) if isinstance(v, type) and v.__module__ == mod.__name__]
+    return [(o.__name__, k, v, getattr(v, "__code__", None)) for o in owners for k, v in sorted(vars(o).items()) if callable(v) or isinstance(v, (classmethod, staticmethod, property))]
+
+
+def lean_preload(ck):
+    import sqlglot.executor.table as tm
+    with open(os.path.join(HERE, "tpc", "lean.pkl"), "rb") as fh:
+        ref = pickle.load(fh)
+    tables = {}
+    for table in ref["schema"]:
+        with open(os.path.join(HERE, "tpc", "ds.%s.m" % table), "rb") as fh:
+            tables[table] = tm.Table(columns=ref["schema"][table], rows=marshal.loads(fh.read()))
+    _LEANPRE.update(ref=ref, tables=pickle.loads(pickle.dumps(tables)), mod=tm, code=_table_code(tm))
+    if ck:
+        with open(os.path.join(HERE, "tpc", "ck", "ck2.pkl"), "rb") as fh:
+            _LEANPRE["ck"] = pickle.load(fh)
 
 
 def lean_run(order, stop, optcache, budgets, total, ck=None, duck=False):
-    with open(os.path.join(HERE, "tpc", "lean.pkl"), "rb") as fh:
-        ref = pickle.load(fh)
+    import sqlglot.executor.table as tm
+    pre = _LEANPRE if _LEANPRE and sys.modules.get("sqlglot.executor.table") is _LEANPRE["mod"] and _table_code(tm) == _LEANPRE["code"] else {}
+    if pre:
+        ref = pre["ref"]
+    else:
+        with open(os.path.join(HERE, "tpc", "lean.pkl"), "rb") as fh:
+            ref = pickle.load(fh)
     queries, schema = ref["queries"], ref["schema"]
     from sqlglot import find_tables, parse_one
     import sqlglot.executor as X
@@ -2960,12 +2990,15 @@ def lean_run(order, stop, optcache, budgets, total, ck=None, duck=False):
     signal.signal(signal.SIGVTALRM, _over_budget)
     signal.signal(signal.SIGPROF, _over_budget)
     signal.setitimer(signal.ITIMER_PROF, total)
-    tables = {}
-    for kind, names in (("h", ref["hschema"]), ("ds", schema)):
-        for table in names:
-            with open(os.path.join(HERE, "tpc", "%s.%s.m" % (kind, table)), "rb") as fh:
-                tables[kind, table] = Table(columns=names[table], rows=marshal.loads(fh.read()))
-    tables = pickle.loads(pickle.dumps({t: v for (kind, t), v in tables.items() if kind == "ds"}))
+    if pre:
+        tables = pre["tables"]
+    else:
+        tables = {}
+        for kind, names in (("h", ref["hschema"]), ("ds", schema)):
+            for table in names:
+                with open(os.path.join(HERE, "tpc", "%s.%s.m" % (kind, table)), "rb") as fh:
+                    tables[kind, table] = Table(columns=names[table], rows=marshal.loads(fh.read()))
+        tables = pickle.loads(pickle.dumps({t: v for (kind, t), v in tables.items() if kind == "ds"}))
     if optcache:
         real, opt = X.optimize, ref["opt"]
 
@@ -2979,7 +3012,7 @@ def lean_run(order, stop, optcache, budgets, total, ck=None, duck=False):
         X.optimize = cached
     if ck is not None:
         ckhooks = _ckhooks()
-        S = ckhooks.Session(os.path.join(HERE, "tpc", "ck"), SRC, ck, min(total, CK_BUDGET))
+        S = ckhooks.Session(os.path.join(HERE, "tpc", "ck"), SRC, ck, min(total, CK_BUDGET), D=pre.get("ck"))
         S.install(X)
         first = [i for i in S.order_hint() if i in order]
         order = first + [i for i in order if i not in first]
@@ -3290,8 +3323,6 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None, token=""
         k = ustate["fut"]
         ustate["fut"] += 1
         skip = ustate["allowed"] is not None and ("f:%d" % k) not in ustate["allowed"]
-        if not skip:
-            args = resolve_parses(args)
         f = LazyFuture(fn, args, kwargs)
         f.skip_outer = skip
         if skip:
@@ -3805,10 +3836,11 @@ def main():
             if not needs_exec:
                 sys.modules["pandas.testing"] = _LazyPandasTesting("pandas.testing")
                 needs_libs = False
-                try:
-                    import duckdb
-                except Exception:
-                    pass
+                if any(num_to_id[n].startswith("tests/test_optimizer.py") for p in plans for n in p["runs"] + list((p["fallback"] or {}).get("light", ()))) or any(m == "tests.test_optimizer" for p in plans for m in (p["collect"] or ())):
+                    try:
+                        import duckdb
+                    except Exception:
+                        pass
         if any(p["light"] or p.get("probe") for p in plans):
             preimport(needs_libs or not LEANIMP)
         log("preimported cpu=%.2f" % time.process_time())
@@ -3837,6 +3869,8 @@ def main():
             warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
             code_idx = zygote.code_index({os.path.join(SRC, r) for p in plans for r in p["patched"] if r.endswith(".py")})
             zyg = (zygote, warm_lines, code_idx)
+            if LEANPRE and any(p["lean"] for p in plans):
+                lean_preload(any(p["lean"][4] is not None for p in plans if p["lean"]))
             if GCFREEZE:
                 _PARSED.clear()
                 gc.collect()
