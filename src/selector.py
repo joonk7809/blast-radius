@@ -53,7 +53,7 @@ TPCWARM = os.environ.get("BR_TPCWARM", "0") == "1"
 TPCPARSE = os.environ.get("BR_TPCPARSE", "1") == "1"
 UNITCOST = os.environ.get("BR_UNITCOST", "1") == "1"
 UNIT_K = float(os.environ.get("BR_UNIT_K", "2.0"))
-KILL_M = float(os.environ.get("BR_KILL_M", "0.0"))
+KILL_M = float(os.environ.get("BR_KILL_M", "1.0"))
 GCFREEZE = os.environ.get("BR_GCFREEZE", "0") == "1"
 LAZYEXEC = os.environ.get("BR_LAZYEXEC", "1") == "1"
 LAZYUNITS = os.environ.get("BR_LAZYUNITS", "1") == "1"
