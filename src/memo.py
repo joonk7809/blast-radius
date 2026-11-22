@@ -288,7 +288,6 @@ def build(src, out_path):
     import tests.test_executor as te
     import sqlglot.executor as ex
     k = te.TestExecutor
-    k.setUpClass()
     mon = sys.monitoring
     tool = 4
     mon.use_tool_id(tool, "memo")
@@ -301,17 +300,24 @@ def build(src, out_path):
             return mon.DISABLE
 
     passes = []
+    anywhere = {}
     cur = [None]
 
     def lcb(code, line):
-        if state["on"] and code.co_filename.startswith(src):
-            passes[-1].setdefault(os.path.relpath(code.co_filename, src), {}).setdefault(line, set()).add(cur[0])
+        if not code.co_filename.startswith(src):
             return mon.DISABLE
+        rel = os.path.relpath(code.co_filename, src)
+        if state["on"]:
+            passes[-1].setdefault(cur[0][0], {}).setdefault(rel, {}).setdefault(line, set()).add(cur[0][1])
+            return mon.DISABLE
+        anywhere.setdefault(rel, set()).add(line)
 
     ev = mon.events
     for e in (ev.PY_START, ev.PY_RESUME, ev.PY_THROW):
         mon.register_callback(tool, e, cb)
     mon.register_callback(tool, ev.LINE, lcb)
+    mon.set_events(tool, ev.LINE)
+    k.setUpClass()
 
     def enter():
         if not state["on"]:
@@ -347,7 +353,7 @@ def build(src, out_path):
             for i, (meta, sql, _) in enumerate(sqls):
                 if not meta.get("execute"):
                     continue
-                cur[0] = "f:%d" % i
+                cur[0] = (kind, "f:%d" % i)
                 if lined:
                     mon.restart_events()
                 t0 = time.process_time()
@@ -376,10 +382,12 @@ def build(src, out_path):
     sweep(False)
     sweep(True)
     lines = {}
-    everyone = set(pre.get("ds", {}))
-    for rel in set(passes[0]) | set(passes[1]):
-        a, b = passes[0].get(rel, {}), passes[1].get(rel, {})
-        lines[rel] = {ln: everyone if a.get(ln) != b.get(ln) else a[ln] for ln in set(a) | set(b)}
+    for kind in pre:
+        everyone = set(pre[kind])
+        pa, pb = passes[0].get(kind, {}), passes[1].get(kind, {})
+        for rel in set(pa) | set(pb):
+            a, b = pa.get(rel, {}), pb.get(rel, {})
+            lines.setdefault(kind, {})[rel] = {ln: everyone if a.get(ln) != b.get(ln) else a[ln] for ln in set(a) | set(b)}
     hooks.remove()
     mon.set_events(tool, 0)
     mon.free_tool_id(tool)
@@ -401,7 +409,7 @@ def build(src, out_path):
             memo.setdefault(kind, {})[d] = blob
             keyed.setdefault(kind, {})[key] = d
     with open(out_path, "wb") as fh:
-        pickle.dump({"memo": memo, "pre": pre, "exec": sorted(seen), "drop": drop, "names": sorted(names | consts), "lines": lines, "run": run, "keyed": keyed}, fh)
+        pickle.dump({"memo": memo, "pre": pre, "exec": sorted(seen), "drop": drop, "names": sorted(names | consts), "lines": lines, "anywhere": anywhere, "run": run, "keyed": keyed}, fh)
 
 
 def build_state(src, memo_path, out_path):

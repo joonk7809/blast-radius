@@ -1370,7 +1370,8 @@ def memo_ok(patched, hunks_by, old_by, notes, warm_lines):
                         return False
                     hit |= inside
             if hit:
-                seen = d["lines"].get(rel, {})
+                seen = d["lines"].get("ds", {}).get(rel, {})
+                ran = d["anywhere"].get(rel, set())
                 stmts = [n for n in ast.walk(tree) if isinstance(n, ast.stmt)]
                 check = set()
                 for ln in hit & removed:
@@ -1380,7 +1381,11 @@ def memo_ok(patched, hunks_by, old_by, notes, warm_lines):
                     if ln in hit or ln - 1 in hit:
                         check |= _insert_lines(stmts, ln)
                 for x in check:
-                    touched |= seen.get(x, set())
+                    q = seen.get(x)
+                    if q:
+                        touched |= q
+                    elif x in ran:
+                        touched |= set(d["pre"]["ds"])
         elif rel == "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql":
             if content is None or old is None:
                 return False
