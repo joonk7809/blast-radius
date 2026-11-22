@@ -29,7 +29,8 @@ def check_lines(patch_text, pristine):
         stmts = [n for n in ast.walk(tree) if isinstance(n, ast.stmt)]
         removed, anchors = selector.changed_old_lines(f["hunks"])
         _, inserts = selector._replaced_lines(f["hunks"])
-        check = set(anchors)
+        head = {ln for ln in inserts if selector.LEANHDR and ln - 1 not in removed and any(n.body[0].lineno == ln > n.lineno and not selector._isdoc(n.body[0]) for n in stmts if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))}
+        check = anchors - {ln - 1 for ln in head}
         for ln in removed:
             for a, b in selector._stmt_span(stmts, ln):
                 check.update(range(a, b + 1))
@@ -38,7 +39,7 @@ def check_lines(patch_text, pristine):
         for ln in removed:
             if not zygote.in_body(tree.body, ln):
                 imp.add((rel, ln))
-        for ln in inserts:
+        for ln in inserts - head:
             if not (zygote.in_body(tree.body, ln - 1) and zygote.in_body(tree.body, ln)):
                 imp.add((rel, ln))
         out.update((rel, ln) for ln in check)
@@ -53,6 +54,8 @@ class Reach:
         for key in chk or ():
             v = lines.get(key)
             if v is None:
+                if key[0] == "sqlglot/executor/__init__.py":
+                    self.frame.update(queries)
                 continue
             if v == "ALL":
                 allq = True
