@@ -32,6 +32,8 @@ PARTIAL = os.environ.get("BR_PARTIAL", "1") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
 FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "0") == "1"
+DYNSKIP = os.environ.get("BR_DYNSKIP", "1") == "1"
+DYNSKIP_MS = float(os.environ.get("BR_DYNSKIP_MS", "500"))
 LAZYPANDAS = os.environ.get("BR_LAZYPANDAS", "1") == "1"
 STMTSEL = os.environ.get("BR_STMTSEL", "1") == "1"
 ALPHA = os.environ.get("BR_ALPHA", "1") == "1"
@@ -2974,7 +2976,9 @@ def main():
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
     plans = []
     memo_warm = None
-    for cid in commits:
+    work = [(c, DYNSKIP) for c in commits]
+    for cid, dynskip in work:
+        deferred = False
         text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape").read()
         FRACTION_OK.clear()
         FORCE_LIST.clear()
@@ -3018,7 +3022,8 @@ def main():
                 os.environ.setdefault("IMPORTTIME_MAPS", os.path.join(HERE, "itmaps"))
                 import importtime as itf
                 if ITF_UNITS:
-                    extra, info = itf.extra_candidates_units(text, root=SRC, with_info=True)
+                    extra, info = itf.extra_candidates_units(text, root=SRC, with_info=True, allow_dynamic=not dynskip)
+                    deferred = dynskip and bool(info.get("needs_dynamic") or (info.get("import_time") and not info.get("confident", True)) or "import-body" in notes)
                     whole = "import-body" in notes
                     for n, keys in extra.items():
                         if n in num_to_id:
@@ -3029,7 +3034,7 @@ def main():
                 else:
                     extra, info = itf.extra_candidates(text, root=SRC, with_info=True)
                     merge(cands, full(n for n in extra if n in num_to_id))
-                if "import-body" in notes and "dynamic_paths" not in info:
+                if "import-body" in notes and "dynamic_paths" not in info and not deferred:
                     dyn, dinfo = itf.dynamic_extra_candidates(text, root=SRC, items=True)
                     if dinfo.get("error"):
                         raise RuntimeError("dynamic")
@@ -3106,6 +3111,15 @@ def main():
             return heavy, light, cap, None
 
         heavy, light, cap, blind = decide()
+        if deferred:
+            if blind and split_cost(sorted(num_to_id), ms) - split_cost(sorted(cands), ms) <= DYNSKIP_MS:
+                cands = full(num_to_id)
+                notes.append("dynskip")
+                heavy, light, cap, blind = decide()
+            else:
+                log(cid, "dynskip retry")
+                work.append((cid, False))
+                continue
         lean = fallback = picks = None
         u = lean_cost() if LEAN and ok and cached and memo_n in heavy and memo_n not in FORCE_LIST and _lean_meta() else None
         if u and lean_gate(notes, patched, old_by, hunks_by):
