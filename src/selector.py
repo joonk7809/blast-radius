@@ -1,11 +1,16 @@
 import ast
+import base64
 import bisect
 import builtins
+import contextvars
 import enum
 import gc
 import gzip
+import hashlib
 import importlib
 import importlib.util
+import inspect
+import io
 import json
 import logging
 import marshal
@@ -17,6 +22,9 @@ import signal
 import sys
 import time
 import types
+from codecs import lookup
+from io import StringIO
+from tokenize import detect_encoding
 
 DATA = os.environ.get("BR_DATA", "/data")
 SRC = os.environ.get("BR_SRC", "/sqlglot")
@@ -32,8 +40,6 @@ PARTIAL = os.environ.get("BR_PARTIAL", "1") == "1"
 GAPS = os.environ.get("BR_GAPS", "1") == "1"
 FIXLIST = os.environ.get("BR_FIXLIST", "1") == "1"
 LEANIMP = os.environ.get("BR_LEANIMP", "1") == "1"
-DYNSKIP = os.environ.get("BR_DYNSKIP", "1") == "1"
-DYNSKIP_MS = float(os.environ.get("BR_DYNSKIP_MS", "500"))
 LAZYPANDAS = os.environ.get("BR_LAZYPANDAS", "1") == "1"
 STMTSEL = os.environ.get("BR_STMTSEL", "1") == "1"
 ALPHA = os.environ.get("BR_ALPHA", "1") == "1"
@@ -81,7 +87,13 @@ IMPORTT = os.environ.get("BR_IMPORTT", "1") == "1"
 CLOSURE = os.environ.get("BR_CLOSURE", "1") == "1"
 IMPORTBODY = os.environ.get("BR_IMPORTBODY", "1") == "1"
 CACHESITE = os.environ.get("BR_CACHESITE", "1") == "1"
+HELPERS = os.environ.get("BR_HELPERS", "1") == "1"
+HELPERS2 = os.environ.get("BR_HELPERS2", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
+PLAN_FRAC = float(os.environ.get("BR_PLAN_FRAC", "0.35"))
+WATCHDOG = float(os.environ.get("BR_WATCHDOG", "0.94"))
+DOCFN = os.environ.get("BR_DOCFN", "1") == "1"
+SRCREAD = os.environ.get("BR_SRCREAD", "1") == "1"
 DEBUGLOG = os.environ.get("BR_DEBUGLOG", "1") == "1"
 LEAN = os.environ.get("BR_LEAN", "1") == "1"
 CANARY_K = int(os.environ.get("BR_CANARY_K", "0"))
@@ -132,11 +144,17 @@ def _header_paths(rest):
     raise ValueError("bad diff header")
 
 
+def wall_span(n):
+    return min(270.0, 180.0 * max(1.0, n / 40.0))
+
+
 def parse_patch(text):
     files = []
     cur = None
-    hunk = None
-    for line in text.splitlines(keepends=True):
+    hunk = last = None
+    for line in StringIO(text, newline="\n"):
+        if hunk is not None and (line.startswith(("diff --git ", "@@ ")) or not line.startswith((" ", "-", "+", "\\")) and line not in ("\n", "\r\n")):
+            raise ValueError("hunk shorter than its header")
         if line.startswith("diff --git "):
             if RAWBIN:
                 old, new = _header_paths(line[11:].rstrip("\n").rstrip("\r"))
@@ -160,33 +178,49 @@ def parse_patch(text):
                 pass
         m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
         if m:
-            hunk = {"old_start": int(m.group(1)), "old_len": int(m.group(2) or 1), "new_start": int(m.group(3)), "lines": []}
+            hunk = last = {"old_start": int(m.group(1)), "old_len": int(m.group(2) or 1), "new_start": int(m.group(3)), "lines": []}
+            want = [hunk["old_len"], int(m.group(4) or 1)]
             cur["hunks"].append(hunk)
-            continue
-        if hunk is None:
+            if want == [0, 0]:
+                hunk = None
             continue
         if line.startswith("\\"):
-            if hunk["lines"]:
-                tag, body = hunk["lines"][-1]
-                hunk["lines"][-1] = (tag, body.rstrip("\n").rstrip("\r") if body.endswith("\n") else body)
+            if last is not None and last["lines"]:
+                tag, body = last["lines"][-1]
+                last["lines"][-1] = (tag, body.rstrip("\n").rstrip("\r") if body.endswith("\n") else body)
+            continue
+        if hunk is None:
             continue
         tag = line[:1]
         if tag in " -+":
             hunk["lines"].append((tag, line[1:]))
-        elif line in ("\n", "\r\n"):
-            hunk["lines"].append((" ", line))
+        else:
+            tag = " "
+            hunk["lines"].append((tag, line))
+        want[0] -= tag != "+"
+        want[1] -= tag != "-"
+        if min(want) < 0:
+            raise ValueError("hunk longer than its header")
+        if want == [0, 0]:
+            hunk = None
+    if hunk is not None:
+        raise ValueError("hunk shorter than its header")
     return files
 
 
 def apply_file(old_text, hunks):
-    old = old_text.splitlines(keepends=True)
+    old = StringIO(old_text, newline="\n").readlines()
     out = []
     pos = 0
     for h in hunks:
         start = h["old_start"] - 1 if h["old_len"] else h["old_start"]
+        if start < pos:
+            raise ValueError("hunks overlap")
         out.extend(old[pos:start])
         pos = start
         for tag, body in h["lines"]:
+            if tag != "+" and (pos >= len(old) or old[pos] != body):
+                raise ValueError("hunk does not match the pristine file")
             if tag == " ":
                 out.append(old[pos])
                 pos += 1
@@ -294,17 +328,37 @@ def module_resolver(path):
 _PARSED = {}
 
 
+def parse_src(text):
+    return ast.parse(text.encode("utf-8", "surrogateescape"))
+
+
 def parse_cached(text):
     t = _PARSED.get(text)
     if t is None:
-        try:
-            t = ast.parse(text)
-        except UnicodeEncodeError:
-            if not RAWBIN:
-                raise
-            t = ast.parse(text.encode("utf-8", "surrogateescape"))
-        _PARSED[text] = t
+        t = _PARSED[text] = parse_src(text)
     return t
+
+
+_SOURCE_HEADER = re.compile(r"(?:[^\r\n]*(?:\r\n?|\n|$)){2}")
+
+
+def source_encoding(header):
+    stream = StringIO(header, newline=None)
+    name, _ = detect_encoding(lambda: stream.readline().encode("utf-8", "replace"))
+    return lookup(name).name
+
+
+def encoding_changes_ast(old_text, new_text):
+    old_header = _SOURCE_HEADER.match(old_text)[0]
+    new_header = _SOURCE_HEADER.match(new_text)[0]
+    if old_header == new_header:
+        return False
+    try:
+        if source_encoding(old_header) == source_encoding(new_header):
+            return False
+        return ast.dump(parse_cached(old_text)) != ast.dump(parse_cached(new_text))
+    except SyntaxError:
+        return False
 
 
 def _isdoc(st):
@@ -528,7 +582,7 @@ def new_side_lines(hunks):
 
 def strip_ast(text, resolve=None):
     try:
-        tree = ast.parse(text)
+        tree = parse_src(text)
     except SyntaxError:
         return None
     if DOC[0]:
@@ -536,6 +590,59 @@ def strip_ast(text, resolve=None):
     if CANON:
         tree = _Canon(resolve).visit(tree)
     return ast.dump(tree, annotate_fields=False, include_attributes=False)
+
+
+def _is_future(st):
+    return isinstance(st, ast.ImportFrom) and st.module == "__future__" and not st.level
+
+
+def _touching(stmts, lines):
+    out = []
+    for st in stmts:
+        first = min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", ())])
+        i = bisect.bisect_left(lines, first)
+        if i < len(lines) and lines[i] <= st.end_lineno:
+            out.extend(_touching(st.body, lines) if isinstance(st, ast.ClassDef) else [st])
+    return out
+
+
+def compile_bad(tree, lines):
+    body = tree.body
+    head = 1 if body and _isdoc(body[0]) else 0
+    while head < len(body) and _is_future(body[head]):
+        head += 1
+    if any(_is_future(st) for st in body[head:]):
+        return True
+    try:
+        compile(ast.Module(body=body[:head] + _touching(body[head:], sorted(lines)), type_ignores=[]), "<check>", "exec", dont_inherit=True)
+    except (SyntaxError, ValueError):
+        return True
+    return False
+
+
+def _defs(body, pre=""):
+    for st in body:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield pre + st.name, st
+            yield from _defs(st.body, pre + st.name + ".")
+        else:
+            for sub in [getattr(st, k, ()) for k in ("body", "orelse", "finalbody")] + [h.body for h in getattr(st, "handlers", ())]:
+                if isinstance(sub, list):
+                    yield from _defs(sub, pre)
+
+
+def doc_moved(units, new_text, changed):
+    docs = [node for _, _, _, _, node in units.spans if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _isdoc(node.body[0]) and any(node.body[0].lineno <= ln <= node.body[0].end_lineno for ln in changed)]
+    if not docs:
+        return []
+    old_q = {id(n): q for q, n in _defs(units.tree.body)}
+    new_q = dict(_defs(parse_cached(new_text).body))
+    out = []
+    for node in docs:
+        nn = new_q.get(old_q.get(id(node)))
+        if nn is None or not _isdoc(nn.body[0]) and (len(node.body) < 2 or ast.dump(nn.body[0]) != ast.dump(node.body[1])):
+            out.append(range(node.body[1].lineno, node.body[1].end_lineno + 1) if len(node.body) > 1 else range(node.lineno, node.end_lineno + 1))
+    return out
 
 
 class Units:
@@ -725,9 +832,28 @@ def module_test_files(path, cov):
     return out
 
 
+def bytes_observed(old_text, new_text):
+    if old_text is None or new_text is None:
+        return True
+    try:
+        new_text.encode("utf-8")
+        return source_encoding(_SOURCE_HEADER.match(old_text)[0]) != source_encoding(_SOURCE_HEADER.match(new_text)[0])
+    except (UnicodeError, SyntaxError, LookupError):
+        return True
+
+
+SOURCE_READERS = {"sqlglot/typing/": ("tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata",)}
+
+
 def candidates_for(f, old_text, new_text, cov, notes):
     r = _candidates_for(f, old_text, new_text, cov, notes)
     r = r if isinstance(r, dict) else full(r)
+    for pre, readers in SOURCE_READERS.items() if SRCREAD and bytes_observed(old_text, new_text) else ():
+        if any(p.startswith(pre) and p.endswith(".py") for p in (f["old"], f["path"])):
+            notes.append("source-read:" + pre)
+            hit = full(n for n, tid in cov.ids.items() if tid in readers)
+            FORCE_LIST.update(hit)
+            merge(r, hit)
     if FIXLIST and f["path"].startswith("tests/") and not f["path"].endswith(".py") and "/tpc-" not in f["path"]:
         FORCE_LIST.update(n for n in r if n not in FRACTION_OK)
     return r
@@ -807,7 +933,7 @@ def _setup_raw(tf):
     entry = _read_tree(os.path.join(SRC, tf))
     if entry[1] is None:
         try:
-            entry[1] = ast.parse(entry[0])
+            entry[1] = parse_src(entry[0])
         except SyntaxError:
             entry[1] = False
     tree = entry[1]
@@ -887,8 +1013,8 @@ def _setup_index(cov):
     return _SETUP_INDEX
 
 
-def tpc_lazy(patched):
-    return LAZYEXEC and not any(r in ("tests/helpers.py", "sqlglot/executor/table.py", "tests/test_executor.py") or "/tpc-" in r and not (LAZYTABLES and r.endswith(".sql") and fixture_loads(r, c)) for r, c in patched.items())
+def tpc_lazy(patched, notes=()):
+    return LAZYEXEC and not any(r in ("tests/helpers.py", "sqlglot/executor/table.py", "tests/test_executor.py") and not (r == "tests/helpers.py" and "helper-clean" in notes) or "/tpc-" in r and not (LAZYTABLES and r.endswith(".sql") and fixture_loads(r, c)) for r, c in patched.items())
 
 
 def fixture_loads(path, text):
@@ -1086,7 +1212,7 @@ def importers(mod, names, root_dir):
                 continue
             if entry[1] is None:
                 try:
-                    entry[1] = ast.parse(text)
+                    entry[1] = parse_src(text)
                 except SyntaxError:
                     entry[1] = False
             tree = entry[1]
@@ -1121,7 +1247,9 @@ def test_dependents(path, f, old_text, new_text):
     try:
         names = top_names(parse_cached(old_text)) if old_text is not None else {}
         newn = set(top_names(parse_cached(new_text))) if new_text is not None else set()
-    except SyntaxError:
+        if new_text is not None and compile_bad(parse_cached(new_text), new_side_lines(f["hunks"])):
+            names = {}
+    except (SyntaxError, ValueError):
         names, newn = {}, set()
     removed, anchors = changed_old_lines(f["hunks"])
     changed = removed | anchors
@@ -1138,17 +1266,6 @@ def test_dependents(path, f, old_text, new_text):
                 todo.append(g)
     hit.discard(path)
     return hit
-
-
-COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
-
-
-def _cookie(text):
-    for line in text.split("\n", 2)[:2]:
-        m = COOKIE.match(line)
-        if m:
-            return m[1]
-    return None
 
 
 def package_scanners(cov):
@@ -1195,7 +1312,7 @@ def _fn_head(node):
     return ast.dump(type(node)(**{**{k: getattr(node, k, None) for k in node._fields}, "body": []}))
 
 
-def support_dependents(path, old_text, new_text, cov):
+def support_dependents(path, old_text, new_text, cov, notes):
     if old_text is None or new_text is None:
         return None
     try:
@@ -1204,15 +1321,16 @@ def support_dependents(path, old_text, new_text, cov):
         return None
     if len(a.body) != len(b.body):
         return None
-    spans = []
+    spans, names = [], set()
     for x, y in zip(a.body, b.body):
         if ast.dump(x) == ast.dump(y):
             continue
         if not isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(x) is not type(y) or _fn_head(x) != _fn_head(y):
             return None
-        if shared_writes(a, set(range(x.lineno, x.end_lineno + 1)), old_text) or shared_writes(b, set(range(y.lineno, y.end_lineno + 1)), new_text):
+        if shared_writes(a, set(range(x.lineno, x.end_lineno + 1)), old_text) or shared_writes(b, set(range(y.lineno, y.end_lineno + 1)), new_text) or compile_bad(b, range(y.lineno, y.end_lineno + 1)):
             return None
         spans.append((min([x.lineno] + [d.lineno for d in x.decorator_list]), x.end_lineno))
+        names.add(x.name)
 
     def hit(m, rec):
         for i in rec[1]:
@@ -1221,7 +1339,234 @@ def support_dependents(path, old_text, new_text, cov):
                 return True
         return False
 
-    return closure_hits(cov, hit)
+    dep = closure_hits(cov, hit)
+    if HELPERS and dep and PATCH_FILES == [path] and not ambient(a) and not ambient(b):
+        return replay_dependents(path, old_text, new_text, spans, names, dep, cov, notes)
+    return dep
+
+
+PATCH_FILES = []
+_CALLS = []
+AMBIENT = {"environ", "getenv", "getcwd", "argv", "modules", "time", "random", "uuid", "datetime", "now", "monotonic", "perf_counter", "stdin", "_getframe", "currentframe", "globals"}
+
+
+def ambient(tree):
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for x in ast.walk(fn):
+                if isinstance(x, ast.Name) and x.id in AMBIENT or isinstance(x, ast.Attribute) and x.attr in AMBIENT or isinstance(x, (ast.Global, ast.Nonlocal)):
+                    return True
+    return False
+
+
+class _ModPickler(pickle.Pickler):
+    def persistent_id(self, obj):
+        return obj.__name__ if isinstance(obj, types.ModuleType) else None
+
+
+class _ModUnpickler(pickle.Unpickler):
+    def persistent_load(self, name):
+        return importlib.import_module(name)
+
+
+def support_dumps(obj):
+    buf = io.BytesIO()
+    try:
+        _ModPickler(buf, 4).dump(obj)
+    except Exception:
+        return None
+    return buf.getvalue()
+
+
+def support_module(rel, text):
+    mod = types.ModuleType(modname_of(rel))
+    mod.__file__ = os.path.join(SRC, rel)
+    exec(compile(text, mod.__file__, "exec"), mod.__dict__)
+    return mod
+
+
+def support_outcome(fn, blob):
+    try:
+        kw = _ModUnpickler(io.BytesIO(blob)).load()
+        out = []
+        try:
+            r = fn(**kw)
+            if inspect.isgenerator(r):
+                for x in r:
+                    out.append(x)
+            else:
+                out.append(r)
+        except BaseException as e:
+            out.append((type(e).__qualname__, repr(e.args)))
+        return support_dumps((out, kw))
+    except Exception:
+        return None
+
+
+def support_digest(raw):
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _replay_child(path, old_text, new_text, names, blobs):
+    sys.path.insert(0, SRC)
+    os.chdir(SRC)
+    full = os.path.join(SRC, path)
+    mon = sys.monitoring
+    boot, lines = [], set()
+
+    def on_start(code, offset):
+        if code.co_filename != full:
+            return mon.DISABLE
+        lines.add(code.co_firstlineno)
+        if code.co_qualname in names:
+            boot.append((code.co_qualname, support_dumps(dict(sys._getframe(1).f_locals))))
+
+    mon.use_tool_id(mon.PROFILER_ID, "replay")
+    mon.register_callback(mon.PROFILER_ID, mon.events.PY_START, on_start)
+    mon.set_events(mon.PROFILER_ID, mon.events.PY_START)
+    old = support_module(path, old_text)
+    mon.set_events(mon.PROFILER_ID, 0)
+    new = support_module(path, new_text)
+
+    def state(mod):
+        return {k: support_dumps(v) for k, v in vars(mod).items() if not k.startswith("__") and not isinstance(v, (types.FunctionType, type))}
+
+    def same(name, blob):
+        a = support_outcome(getattr(old, name, None), blob)
+        b = support_outcome(getattr(new, name, None), blob)
+        return [bool(a) and a == b, a and support_digest(a), a and b and a != b and name == "load_sql_fixture_pairs" and support_items(a, b)]
+
+    def truth(mod, k):
+        try:
+            return bool(getattr(mod, k))
+        except Exception:
+            return None
+
+    a, b = state(old), state(new)
+    drift = None if None in a.values() or None in b.values() else sorted(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
+    if not drift and not all(blob and same(name, blob)[0] for name, blob in boot):
+        drift = None
+    calls = {cid: same(name, blob) for cid, (name, blob, hot) in blobs.items() if hot or drift}
+    return {"drift": drift, "truth": {k: [truth(old, k), truth(new, k)] for k in drift or ()}, "lines": sorted(lines), "calls": calls}
+
+
+def support_items(a, b):
+    (xs, kx), (ys, ky) = _ModUnpickler(io.BytesIO(a)).load(), _ModUnpickler(io.BytesIO(b)).load()
+    if kx != ky or len(xs) != len(ys) or not all(type(x) is tuple and len(x) == 3 for x in xs + ys):
+        return None
+    return [kx.get("filename"), [j + 1 for j, (x, y) in enumerate(zip(xs, ys)) if support_dumps(x) is None or support_dumps(x) != support_dumps(y)]]
+
+
+def support_replay(path, old_text, new_text, names, blobs):
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            signal.alarm(20)
+            null = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(null, 1)
+            os.dup2(null, 2)
+            res = _replay_child(path, old_text, new_text, names, blobs)
+            with os.fdopen(w, "w") as fh:
+                json.dump(res, fh)
+        finally:
+            os._exit(0)
+    os.close(w)
+    with os.fdopen(r) as fh:
+        data = fh.read()
+    os.waitpid(pid, 0)
+    return json.loads(data) if data else None
+
+
+def replay_dependents(path, old_text, new_text, spans, names, dep, cov, notes):
+    if not _CALLS:
+        try:
+            with gzip.open(os.path.join(HERE, "helpercalls.json.gz"), "rt") as fh:
+                _CALLS.append(json.load(fh))
+        except OSError:
+            _CALLS.append(None)
+    doc, m = _CALLS[0], _CLOSURE[0]
+    if doc is None:
+        return dep
+
+    def touched(lines):
+        return {ln for ln in lines if any(lo <= ln <= hi for lo, hi in spans)}
+
+    calls = {i: c for i, c in enumerate(doc["calls"]) if c[0] == path}
+    hot = {i for i, c in calls.items() if touched(c[4])}
+    per, dirty = {}, set(doc["dirty"])
+    for n in dep:
+        ids, rec = None if cov.ids[n] in dirty else doc["tests"].get(cov.ids[n]), m["tests"].get(cov.ids[n])
+        if ids is not None and rec and not rec[3]:
+            per[n] = [i for i in ids if i in calls]
+    blobs = {str(i): (calls[i][1], base64.b64decode(calls[i][2]), i in hot) for ids in per.values() for i in ids if calls[i][2]}
+    res = support_replay(path, old_text, new_text, names, blobs)
+    if res is None or res["drift"] is None:
+        return dep
+    out = full(set(dep) - set(per))
+    if HELPERS2 and not res["drift"]:
+        notes.append("helper-clean")
+    if res["drift"]:
+        hot = set(calls)
+        direct = set(importers(modname_of(path), set(res["drift"]), "tests"))
+        files, todo = set(direct), list(direct)
+        while todo:
+            for g in set(importers(modname_of(todo.pop()), None, "tests")) - files:
+                files.add(g)
+                todo.append(g)
+        for tf in files:
+            if not (HELPERS2 and tf in direct and skip_only(tf, res["drift"], res["truth"])):
+                out.update((n, None) for n in cov.by_file.get(tf, []) if n in dep)
+    for n, ids in per.items():
+        got = set(res["lines"]).union(*(calls[i][4] for i in ids))
+        want = {int(m["code"][i].rpartition(":")[2]) for i in m["tests"][cov.ids[n]][1] if m["code"][i].startswith(path + ":")}
+        bad = [(res["calls"].get(str(i)), calls[i][3]) for i in ids if i in hot and res["calls"].get(str(i)) != [True, calls[i][3], False]]
+        keys = None if not touched(want) <= got else (loader_keys(n, bad, cov) if HELPERS2 else None) if bad else set()
+        if keys is None or keys:
+            merge(out, {n: keys})
+    return out
+
+
+def skip_only(tf, drift, truth):
+    if any(truth.get(k) != [False, True] for k in drift):
+        return False
+    try:
+        tree = ast.parse(_read_tree(os.path.join(SRC, tf))[0])
+    except SyntaxError:
+        return False
+    ok = set()
+    for node in tree.body:
+        for inner in [node] + (node.body if isinstance(node, ast.ClassDef) else []):
+            for d in getattr(inner, "decorator_list", ()):
+                if isinstance(d, ast.Call) and d.args and isinstance(d.args[0], ast.Name) and d.args[0].id in drift and (isinstance(inner, ast.ClassDef) if inner is node else isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef))):
+                    f = d.func
+                    if isinstance(f, ast.Attribute) and f.attr == "skipIf" and isinstance(f.value, ast.Name) and f.value.id == "unittest":
+                        ok.add(id(d.args[0]))
+    return all(id(x) in ok for x in ast.walk(tree) if isinstance(x, ast.Name) and x.id in drift) and not any(isinstance(x, ast.Attribute) and x.attr in drift for x in ast.walk(tree))
+
+
+def loader_keys(n, bad, cov):
+    keys = set()
+    for r, dig in bad:
+        if not r or r[1] != dig or not isinstance(r[2], list) or not isinstance(r[2][0], str) or not r[2][1]:
+            return None
+        fx = "tests/fixtures/" + r[2][0]
+        folder = os.path.dirname(fx)
+        if fx != os.path.join(folder, os.path.basename(folder) + ".sql") or not os.path.exists(os.path.join(SRC, fx)):
+            return None
+        direct, setup = {cov.idx_to_num[i] for i in cov.fixtures.get(fx, []) if cov.idx_to_num[i] is not None}, class_setup_readers(fx, cov)
+        if n not in direct | setup:
+            if n in class_setup_readers(fx, cov, False):
+                continue
+            return None
+        k = query_unit_keys(cov, n, set(r[2][1]), os.path.basename(folder)) if TPCQ and (TPCQ2 or n not in direct) else None
+        if k is None:
+            return None
+        keys |= k
+    if keys:
+        FRACTION_OK.add(n)
+    return keys
 
 
 def _exported(tree):
@@ -1244,7 +1589,7 @@ def _plain_def(node, lazy):
 
 def _inert_change(old_text, new_text):
     try:
-        a, b = ast.parse(old_text), ast.parse(new_text)
+        a, b = parse_src(old_text), parse_src(new_text)
     except (SyntaxError, ValueError):
         return False
     if any(isinstance(n, ast.ImportFrom) and any(x.name == "*" for x in n.names) for n in a.body):
@@ -1285,7 +1630,7 @@ def _side_effects(text):
     if text is None:
         return []
     try:
-        tree = ast.parse(text)
+        tree = parse_src(text)
     except (SyntaxError, ValueError):
         return []
     return sorted(ast.dump(n) for n in tree.body if _risky(n))
@@ -1328,6 +1673,9 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         every = full(n for n in cov.idx_to_num if n is not None)
         FORCE_LIST.update(every)
         return every
+    if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")) and not (path.startswith("tests/") and os.path.basename(path).startswith("test_")) and old_text is not None and new_text is not None and encoding_changes_ast(old_text, new_text):
+        notes.append("source-encoding-changed")
+        return full(n for n in cov.idx_to_num if n is not None)
     if path.startswith("sqlglot/") and path.endswith(".py") or CLOSURE and f["old"].startswith("sqlglot/") and f["old"].endswith(".py"):
         if f["deleted"] or (f["old"] and f["old"] != path):
             gone = gone_dependents(f["old"], cov) if CLOSURE else None
@@ -1338,16 +1686,11 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             return full(n for n in cov.idx_to_num if n is not None)
         if new_text is not None:
             try:
-                parse_cached(new_text)
-            except SyntaxError:
+                if compile_bad(parse_cached(new_text), new_side_lines(f["hunks"])):
+                    raise SyntaxError("compile")
+            except (SyntaxError, ValueError):
                 notes.append("new-unparsable")
                 return full(n for n in cov.idx_to_num if n is not None)
-            if _cookie(new_text) != _cookie(old_text or ""):
-                try:
-                    ast.parse(new_text.encode("utf-8", "surrogateescape"))
-                except (SyntaxError, LookupError, UnicodeError, ValueError):
-                    notes.append("bad-coding")
-                    return full(n for n in cov.idx_to_num if n is not None)
         extra = {}
         if old_text is not None and new_text is not None:
             try:
@@ -1379,8 +1722,9 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         if old_text is None:
             notes.append("newfile")
             return merge(merge(cov.tests_touching_file(path), full(module_test_files(path, cov))), full(package_scanners(cov)))
+        changed = {ln for h in f["hunks"] for part in changed_old_lines([h]) for ln in part}
         try:
-            units = Units(old_text, {ln for h in f["hunks"] for part in changed_old_lines([h]) for ln in part})
+            units = Units(old_text, changed)
         except SyntaxError:
             notes.append("old-unparsable")
             return merge(cov.tests_touching_file(path), extra)
@@ -1395,16 +1739,18 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         lam = LAMBDAS and new_units is not None and lambda_only(path, units, new_units, f["hunks"])
         if lam:
             notes.append("lambda-only")
+        for span in doc_moved(units, new_text, changed) if DOCFN else ():
+            notes.append("doc-moved")
+            merge(out, cov.tests_for_lines(path, span))
         site = CACHE_SITES.get(path)
         if site:
-            touched = {ln for h in f["hunks"] for part in changed_old_lines([h]) for ln in part}
-            if any(a <= ln <= b for a, b in site["lazy"] for ln in touched):
+            if any(a <= ln <= b for a, b in site["lazy"] for ln in changed):
                 notes.append("lazy-getattr")
                 every = full(n for n in cov.idx_to_num if n is not None)
                 FORCE_LIST.update(every)
                 return every
             for fill, readers in site["memo"]:
-                if any(a <= ln <= b for a, b in fill for ln in touched):
+                if any(a <= ln <= b for a, b in fill for ln in changed):
                     notes.append("memo-site")
                     merge(out, full(cov.tests_for_lines(path, readers)))
         for h in f["hunks"]:
@@ -1462,7 +1808,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         if INERT and os.path.basename(path) != "__init__.py" and not importers(modname_of(path), None, "tests") and not importers(modname_of(path), None, "sqlglot"):
             notes.append("test-support-unimported")
             return set()
-        dep = support_dependents(path, old_text, new_text, cov) if CLOSURE and f["old"] == path and not f["deleted"] and not f["new_file"] else None
+        dep = support_dependents(path, old_text, new_text, cov, notes) if CLOSURE and f["old"] == path and not f["deleted"] and not f["new_file"] else None
         if dep is not None:
             notes.append("closure-support:%d" % len(dep))
             return dep
@@ -1722,6 +2068,9 @@ def preimport(libs=True):
             pass
 
 
+POOL_FAULT = []
+
+
 class LazyFuture:
     def __init__(self, fn, args, kwargs):
         self.fn, self.args, self.kwargs = fn, args, kwargs
@@ -1730,10 +2079,24 @@ class LazyFuture:
     def _force(self):
         if self.state is None:
             try:
-                args, kwargs = pickle.loads(pickle.dumps((self.args, self.kwargs)))
-                self.state = (True, pickle.loads(pickle.dumps(self.fn(*args, **kwargs))))
+                fn, args, kwargs = pickle.loads(pickle.dumps((self.fn, self.args, self.kwargs)))
             except BaseException as e:
                 self.state = (False, e)
+                return self.state
+            try:
+                out = (True, contextvars.Context().run(fn, *args, **kwargs))
+            except BaseException as e:
+                out = (False, e)
+            try:
+                blob = pickle.dumps(out[1])
+            except BaseException as e:
+                self.state = (False, e)
+                return self.state
+            try:
+                self.state = (out[0], pickle.loads(blob))
+            except BaseException:
+                POOL_FAULT.append(self)
+                self.state = out
         return self.state
 
     def result(self, timeout=None):
@@ -1762,13 +2125,14 @@ class LazyFuture:
 class SyncExecutor:
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
         if initializer:
-            initializer(*pickle.loads(pickle.dumps(initargs)))
+            initializer, initargs = pickle.loads(pickle.dumps((initializer, initargs)))
+            initializer(*initargs)
 
     def submit(self, fn, *args, **kwargs):
         return LazyFuture(fn, args, kwargs)
 
     def map(self, fn, *iterables, **kw):
-        return map(fn, *iterables)
+        return (self.submit(fn, *a).result() for a in zip(*iterables))
 
     def shutdown(self, wait=True, **kw):
         pass
@@ -1871,7 +2235,7 @@ def partial_purge(root):
 CHILD_MEMO = None
 _MEMO = []
 MEMO_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-MEMO_BAD = ("shared-write", "toplevel", "newfile", "deleted-or-renamed", "unparsable", "bad-coding", "error:", "itf-error")
+MEMO_BAD = ("shared-write", "toplevel", "newfile", "deleted-or-renamed", "unparsable", "error:", "itf-error")
 MEMO_IMPORT = ("importtime", "newtop:", "itf")
 
 
@@ -1961,6 +2325,8 @@ def memo_ok(patched, hunks_by, old_by, notes, warm_lines):
                 return False
         elif rel.startswith("tests/fixtures/") and "/tpc-" not in rel:
             continue
+        elif rel == "tests/helpers.py" and "helper-clean" in notes:
+            mode = "state"
         elif rel.startswith("tests/") and os.path.basename(rel).startswith("test_") and rel.endswith(".py") and rel != "tests/test_executor.py":
             continue
         else:
@@ -2497,7 +2863,7 @@ def lean_run(order, stop, optcache, budgets, total):
     return bad
 
 
-def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None):
+def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None, token=""):
     if DEBUG:
         import faulthandler
         faulthandler.enable()
@@ -2507,6 +2873,12 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None):
     if not DEBUG:
         os.dup2(devnull, 2)
     os.environ["SKIP_INTEGRATION"] = "0"
+    try:
+        os.setpgid(0, 0)
+        with open("/proc/self/oom_score_adj", "w") as fh:
+            fh.write("1000")
+    except OSError:
+        pass
     install_futures()
     if mode is not None and mode[0] == "swap":
         import builtins
@@ -2560,9 +2932,9 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None):
     flagged = set()
 
     def emit(tag, tid):
-        if tag in ("F", "X", "K"):
+        if tag in ("F", "X", "K", "I"):
             flagged.add(tid)
-        out.write(f"{tag} {tid}\n")
+        out.write(f"{token}{tag} {tid}\n")
 
     class Timeout(BaseException):
         pass
@@ -2588,11 +2960,14 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None):
             try:
                 signal.setitimer(signal.ITIMER_REAL, 20.0, 0.5)
                 importlib.import_module(modname)
-            except BaseException:
+            except BaseException as e:
                 for tid in tids:
-                    emit("F", tid)
+                    emit("I", tid)
+                if not isinstance(e, Exception):
+                    emit("A", modname)
             finally:
                 signal.setitimer(signal.ITIMER_REAL, 0)
+    emit("G", "-")
     case_to_id = {}
     failed = set()
     subfailed = set()
@@ -2605,8 +2980,10 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None):
         try:
             m = __import__(mod, fromlist=["_"])
             c = getattr(m, cls)(meth)
-        except BaseException:
+        except BaseException as e:
             emit("F", tid)
+            if not isinstance(e, Exception):
+                emit("A", tid)
             continue
         case_to_id[id(c)] = tid
         cases.append(c)
@@ -2624,6 +3001,10 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None):
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_REAL, 0)
             tid = case_to_id.get(id(test))
+            if tid and (hung or POOL_FAULT):
+                failed.add(tid)
+                subfailed.add(tid)
+                POOL_FAULT.clear()
             if tid in failed and tid not in subfailed and ustate["skipped"] and not hung:
                 failed.discard(tid)
                 recheck.append(tid)
@@ -2883,12 +3264,22 @@ class Job:
         self.current = None
         self.done = False
         self.buf = b""
+        self.sticky = set()
+        self.abort = False
+        self.collected = False
+        self.known = set(tests) | {MEMO_TEST}
+        self.token = os.urandom(8).hex() + " "
         r, w = os.pipe()
-        pid = os.fork()
+        try:
+            pid = os.fork()
+        except OSError:
+            os.close(r)
+            os.close(w)
+            raise
         if pid == 0:
             os.close(r)
             try:
-                child_run(root, tests, timeouts, w, sel or {}, mode, lean)
+                child_run(root, tests, timeouts, w, sel or {}, mode, lean, self.token)
             except BaseException:
                 if DEBUG:
                     import traceback
@@ -2896,6 +3287,10 @@ class Job:
             finally:
                 os._exit(1)
         os.close(w)
+        try:
+            os.setpgid(pid, pid)
+        except OSError:
+            pass
         self.pid = pid
         self.fd = r
 
@@ -2905,17 +3300,34 @@ class Job:
             self.finish()
             return
         self.buf += data
+        token = self.token.encode()
         while b"\n" in self.buf:
             line, self.buf = self.buf.split(b"\n", 1)
-            tag, tid = line.decode().split(" ", 1)
+            if not line.startswith(token):
+                continue
+            try:
+                tag, tid = line[len(token):].decode().split(" ", 1)
+            except ValueError:
+                continue
+            if tag in ("S", "P", "F") and tid not in self.known:
+                continue
             if tag == "S":
                 self.current = tid
             elif tag in ("P", "F"):
                 self.status[tid] = tag
                 self.current = None
             elif tag == "C":
-                t, c = tid.rsplit(" ", 1)
-                self.tcpu[t] = float(c)
+                t, _, c = tid.rpartition(" ")
+                try:
+                    self.tcpu[t] = float(c)
+                except ValueError:
+                    pass
+            elif tag == "I":
+                self.sticky.add(tid)
+            elif tag == "A":
+                self.abort = True
+            elif tag == "G":
+                self.collected = True
             elif tag == "X":
                 self.broken = True
             elif tag == "Q":
@@ -2923,7 +3335,8 @@ class Job:
             elif tag == "K":
                 self.klass_fail = getattr(self, "klass_fail", set()) | {tid}
             elif tag == "D":
-                pass
+                self.finish()
+                return
 
     def cpu_now(self):
         try:
@@ -2949,6 +3362,10 @@ class Job:
         except OSError:
             pass
         self.cpu = 0.0
+        try:
+            os.killpg(self.pid, signal.SIGKILL)
+        except OSError:
+            pass
         try:
             _, st, ru = os.wait4(self.pid, 0)
             self.cpu = ru.ru_utime + ru.ru_stime
@@ -2976,181 +3393,189 @@ def main():
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
     plans = []
     memo_warm = None
-    work = [(c, DYNSKIP) for c in commits]
-    for cid, dynskip in work:
-        deferred = False
-        text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape").read()
-        FRACTION_OK.clear()
-        FORCE_LIST.clear()
-        notes = []
-        cands = {}
-        patched = {}
-        hunks_by = {}
-        old_by = {}
-        ok = True
+
+    def blind_plan(cid, notes):
+        return {"cid": cid, "hunks": {}, "old": {}, "patched": {}, "light": [], "heavy": set(num_to_id), "notes": notes, "ok": False, "sel": {}, "cap": 0.0, "memo": False, "touched": set(), "strict": False, "lean": None, "fallback": None, "picks": None, "price": 0, "gain": 0}
+
+    for cid in commits:
+        if time.monotonic() > T0 + PLAN_FRAC * BUDGET_FRAC * wall_span(len(commits)):
+            log(cid, "plan budget spent")
+            plans.append(blind_plan(cid, ["late"]))
+            continue
         try:
-            files = parse_patch(text)
-            for f in files:
-                if f.get("binary"):
-                    notes.append("binary:" + f["path"])
-                    for q in {f["old"], f["path"]}:
-                        r = candidates_for(dict(f, path=q, old=q, deleted=True, new_file=False, hunks=[]), None, None, cov, notes)
-                        FORCE_LIST.update(r)
-                        merge(cands, r)
-                    continue
-                src = os.path.join(SRC, f["old"])
-                old_text = None
-                if not f["new_file"] and os.path.exists(src):
-                    with open(src, encoding="utf-8", newline="") as fh:
-                        old_text = fh.read()
-                new_text = None if f["deleted"] else apply_file(old_text or "", f["hunks"])
-                patched[f["path"]] = new_text
-                hunks_by[f["path"]] = f["hunks"]
-                old_by[f["path"]] = old_text
-                if f["old"] != f["path"]:
-                    patched[f["old"]] = None
-                    if PATHRULES and not f["old"].startswith("sqlglot/"):
-                        merge(cands, candidates_for(dict(f, path=f["old"], deleted=True, hunks=[]), old_text, None, cov, notes))
-                merge(cands, candidates_for(f, old_text, new_text, cov, notes))
-        except Exception as e:
-            ok = False
-            notes.append(f"error:{type(e).__name__}:{e}")
-            cands = full(num_to_id)
-        if IMPORTT and "importtime" in notes:
+            text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape").read()
+            FRACTION_OK.clear()
+            FORCE_LIST.clear()
+            notes = []
+            cands = {}
+            patched = {}
+            hunks_by = {}
+            old_by = {}
+            ok = True
             try:
-                os.environ.setdefault("IMPORTTIME_SQLGLOT", SRC)
-                os.environ.setdefault("IMPORTTIME_MAPS", os.path.join(HERE, "itmaps"))
-                import importtime as itf
-                if ITF_UNITS:
-                    extra, info = itf.extra_candidates_units(text, root=SRC, with_info=True, allow_dynamic=not dynskip)
-                    deferred = dynskip and bool(info.get("needs_dynamic") or (info.get("import_time") and not info.get("confident", True)) or "import-body" in notes)
-                    whole = "import-body" in notes
-                    for n, keys in extra.items():
-                        if n in num_to_id:
-                            keys = None if whole else keys
-                            if keys is not None:
-                                FRACTION_OK.add(n)
-                            merge(cands, {n: keys})
-                else:
-                    extra, info = itf.extra_candidates(text, root=SRC, with_info=True)
-                    merge(cands, full(n for n in extra if n in num_to_id))
-                if "import-body" in notes and "dynamic_paths" not in info and not deferred:
-                    dyn, dinfo = itf.dynamic_extra_candidates(text, root=SRC, items=True)
-                    if dinfo.get("error"):
-                        raise RuntimeError("dynamic")
-                    notes.append("dynamic:%d" % len(dyn))
-                    merge(cands, full(n for n in itf.items_to_units(dyn) if n in num_to_id))
-                notes.append("itf:%d%s" % (len(extra), "" if info.get("confident", True) else ":unconfident"))
+                files = parse_patch(text)
+                PATCH_FILES[:] = [f["path"] for f in files]
+                for f in files:
+                    if f.get("binary"):
+                        notes.append("binary:" + f["path"])
+                        for q in {f["old"], f["path"]}:
+                            r = candidates_for(dict(f, path=q, old=q, deleted=True, new_file=False, hunks=[]), None, None, cov, notes)
+                            FORCE_LIST.update(r)
+                            merge(cands, r)
+                        continue
+                    src = os.path.join(SRC, f["old"])
+                    old_text = None
+                    if not f["new_file"] and os.path.exists(src):
+                        with open(src, encoding="utf-8", newline="") as fh:
+                            old_text = fh.read()
+                    new_text = None if f["deleted"] else apply_file(old_text or "", f["hunks"])
+                    patched[f["path"]] = new_text
+                    hunks_by[f["path"]] = f["hunks"]
+                    old_by[f["path"]] = old_text
+                    if f["old"] != f["path"]:
+                        patched[f["old"]] = None
+                        if PATHRULES and not f["old"].startswith("sqlglot/"):
+                            merge(cands, candidates_for(dict(f, path=f["old"], deleted=True, hunks=[]), old_text, None, cov, notes))
+                    merge(cands, candidates_for(f, old_text, new_text, cov, notes))
             except Exception as e:
-                notes.append(f"itf-error:{type(e).__name__}")
+                ok = False
+                notes.append(f"error:{type(e).__name__}:{e}")
                 cands = full(num_to_id)
-        for n, keys in cands.items():
-            word = _MP_TESTS.get(num_to_id[n].rsplit("::", 1)[-1])
-            if word and keys:
-                for k in list(keys):
-                    m = _QKEY.match(k)
-                    if k.startswith("f:"):
-                        keys.add("s:%r" % (("%s %d" % (word, int(k[2:]) + 1), []),))
-                    elif m and m.group(1) == word:
-                        keys.add("f:%d" % (int(m.group(2)) - 1))
-        if DEBUG_N in cands:
-            log(cid, "dbg", DEBUG_N, "keys", None if cands[DEBUG_N] is None else len(cands[DEBUG_N]), "fracok", DEBUG_N in FRACTION_OK, None if cands[DEBUG_N] is None else sorted(cands[DEBUG_N])[:5])
-        cached = TPCREF and LAZYTABLES and tpc_lazy(patched)
-        memo_n = id_to_num.get(MEMO_TEST)
-        if MEMO and memo_n in cands:
-            if memo_warm is None:
-                memo_warm = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
-            use_memo = memo_ok(patched, hunks_by, old_by, notes, memo_warm)
-        else:
-            use_memo = False
-        touched = set()
-        if use_memo:
-            use_memo, touched = use_memo
-            fx = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
-            if fx in patched and all(r == fx or "noop:" + r in notes or not (r.startswith("sqlglot/") or "/tpc-" in r or r in ("tests/helpers.py", "tests/test_executor.py")) for r in patched):
+            encoding_fallback = "source-encoding-changed" in notes
+            if encoding_fallback:
+                cands = full(num_to_id)
+            if IMPORTT and "importtime" in notes:
                 try:
-                    known = {(q, tuple(sorted(m.items()))) for (q, m), _ in _pairs(old_by[fx])}
-                    fresh = [i + 1 for i, ((q, m), _) in enumerate(_pairs(patched[fx])) if (q, tuple(sorted(m.items()))) not in known]
-                except Exception:
-                    fresh = None
-                if fresh is not None:
-                    keys = {"f:%d" % (i - 1) for i in fresh} | {"s:%r" % (("tpc-ds %d" % i, []),) for i in fresh}
-                    if cands[memo_n] is None or keys < cands[memo_n]:
-                        cands[memo_n] = keys
-                    notes.append("memo-fresh:%d" % len(fresh))
-            notes.append("memo:%s:%d" % (use_memo, len(touched)))
-
-        def est(n, memo=True):
-            c = runcpu.get(num_to_id[n], 0)
-            if memo and use_memo and n == memo_n:
-                pre, run = memo_data()["pre"]["ds"], memo_data()["run"]["ds"]
-                keys = set(pre) if cands[n] is None else set(cands[n])
-                return min(c, UNIT_K * sum(pre.get(k, 0) + (run.get(k, 0) if k in touched else 0) for k in keys) + FRAC_C)
-            if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
-                return c
-            u = cached and unitcpu["units"].get(num_to_id[n])
-            if u:
-                return min(c, UNIT_K * sum(u.get(k, 0) for k in cands[n]) + FRAC_C)
-            return min(c, c * FRAC_K * len(cands[n]) / cov.nunits[n] + FRAC_C)
-
-        def decide(price=None):
-            def cost(n):
-                return price if price is not None and n == memo_n else est(n)
-
-            heavy = {n for n in cands if n in FORCE_LIST or ms[n] >= HEAVY_MS or (LISTRULE and cost(n) * 1000 > ms[n] + 2000)}
-            light = sorted(set(cands) - heavy)
-            whole = split_cost(sorted(cands), ms)
-            cap = whole - split_cost(sorted(heavy), ms)
-            over = RUN_O_RE if ("importtime" in notes or any(not r.endswith(".py") for r in patched)) else RUN_O
-            if light and (RUN_K * sum(cost(n) for n in light) + over) * 1000 >= cap:
-                return set(cands), [], cap, "blind"
-            if price is None and light and memo_n in light and est(memo_n, False) * 1000 > ms[memo_n] + 2000 and (RUN_K * sum(est(n) for n in light if n != memo_n) + over) * 1000 >= whole - split_cost(sorted(heavy | {memo_n}), ms):
-                spend = RUN_K * sum(est(n) * (1 if n == memo_n else MEMO_K) for n in light) + over
-                if spend * 1000 >= cap:
-                    return set(cands), [], cap, "blind:memo"
-            return heavy, light, cap, None
-
-        heavy, light, cap, blind = decide()
-        if deferred:
-            if blind and split_cost(sorted(num_to_id), ms) - split_cost(sorted(cands), ms) <= DYNSKIP_MS:
-                cands = full(num_to_id)
-                notes.append("dynskip")
-                heavy, light, cap, blind = decide()
+                    os.environ.setdefault("IMPORTTIME_SQLGLOT", SRC)
+                    os.environ.setdefault("IMPORTTIME_MAPS", os.path.join(HERE, "itmaps"))
+                    import importtime as itf
+                    if ITF_UNITS:
+                        extra, info = itf.extra_candidates_units(text, root=SRC, with_info=True)
+                        whole = "import-body" in notes
+                        for n, keys in extra.items():
+                            if n in num_to_id:
+                                keys = None if whole else keys
+                                if keys is not None:
+                                    FRACTION_OK.add(n)
+                                merge(cands, {n: keys})
+                    else:
+                        extra, info = itf.extra_candidates(text, root=SRC, with_info=True)
+                        merge(cands, full(n for n in extra if n in num_to_id))
+                    if "import-body" in notes and "dynamic_paths" not in info:
+                        dyn, dinfo = itf.dynamic_extra_candidates(text, root=SRC, items=True)
+                        if dinfo.get("error"):
+                            raise RuntimeError("dynamic")
+                        notes.append("dynamic:%d" % len(dyn))
+                        merge(cands, full(n for n in itf.items_to_units(dyn) if n in num_to_id))
+                    rc = re.match(r"rc=(-?\d+) ", info.get("dynamic_error") or "")
+                    if rc and (int(rc[1]) < 0 or not info["dynamic_error"][rc.end():].strip()):
+                        raise RuntimeError("dynamic killed")
+                    notes.append("itf:%d%s" % (len(extra), "" if info.get("confident", True) else ":unconfident"))
+                except Exception as e:
+                    notes.append(f"itf-error:{type(e).__name__}")
+                    cands = full(num_to_id)
+            for n, keys in cands.items():
+                word = _MP_TESTS.get(num_to_id[n].rsplit("::", 1)[-1])
+                if word and keys:
+                    for k in list(keys):
+                        m = _QKEY.match(k)
+                        if k.startswith("f:"):
+                            keys.add("s:%r" % (("%s %d" % (word, int(k[2:]) + 1), []),))
+                        elif m and m.group(1) == word:
+                            keys.add("f:%d" % (int(m.group(2)) - 1))
+            if DEBUG_N in cands:
+                log(cid, "dbg", DEBUG_N, "keys", None if cands[DEBUG_N] is None else len(cands[DEBUG_N]), "fracok", DEBUG_N in FRACTION_OK, None if cands[DEBUG_N] is None else sorted(cands[DEBUG_N])[:5])
+            cached = TPCREF and LAZYTABLES and tpc_lazy(patched, notes)
+            memo_n = id_to_num.get(MEMO_TEST)
+            if MEMO and memo_n in cands:
+                if memo_warm is None:
+                    memo_warm = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
+                use_memo = memo_ok(patched, hunks_by, old_by, notes, memo_warm)
             else:
-                log(cid, "dynskip retry")
-                work.append((cid, False))
-                continue
-        lean = fallback = picks = None
-        u = lean_cost() if LEAN and ok and cached and memo_n in heavy and memo_n not in FORCE_LIST and _lean_meta() else None
-        if u and lean_gate(notes, patched, old_by, hunks_by):
-            need = lean_need(cov, memo_n, patched, hunks_by, notes, u)
-            optcache = not any(r in _lean_meta()["optfiles"] for r in patched if "noop:" + r not in notes)
-            if CANARY_K:
-                chosen = canary_pick(need, u, CANARY_K)
-                order = lean_order(need, u, chosen)
-                price = CANARY_SCALE * sum(u[q] for q in chosen) + FRAC_C
-            else:
-                order = lean_order(need, u)
-                price = LEAN_OPT_COST if optcache else LEAN_COST
-            if LEANCAL:
-                picks = {k: [int(q[2:]) for q in canary_pick(need, u, k)] for k in (0, 2, 4, 8)}
-            h2, l2, c2, b2 = decide(price)
-            saving = (split_cost(sorted(h2 | {memo_n}), ms) - split_cost(sorted(h2), ms)) / 1000
-            if memo_n in l2 and price < saving or LEANCAL:
-                fallback = {"light": light, "heavy": heavy, "cap": cap / 1000, "notes": ([blind] if blind else []) + notes, "sel": {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}, "lean": None, "fallback": None, "price": 0}
-                heavy, light, cap, blind = (h2 - {memo_n}, sorted(set(l2) | {memo_n}), 1e9, b2) if LEANCAL else (h2, l2, c2, b2)
-                if blind:
-                    heavy, light, blind = heavy - {memo_n}, [memo_n], None
-                notes = notes + ["lean%s%s:%.1f" % (":k%d" % CANARY_K if CANARY_K else "", ":opt" if optcache else "", saving)]
-                lean = (order, optcache, {} if LEANCAL else {int(q[2:]): BUDGET_K * c + BUDGET_C for q, c in u.items()}, 1e6 if LEANCAL else saving / LEAN_SCALE)
-        if blind:
-            notes.insert(0, blind)
-        sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light if not (lean and n == memo_n)}
-        runs_memo = memo_n in light and not lean
-        plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000, "memo": use_memo if runs_memo else False, "touched": touched, "strict": use_memo and runs_memo and est(memo_n, False) * 1000 > ms[memo_n] + 2000, "lean": lean, "fallback": fallback, "picks": picks, "price": price if lean else 0, "gain": saving - price if lean else 0})
-        log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4], "memo:%s:%d" % (use_memo, len(touched)) if use_memo else "")
+                use_memo = False
+            touched = set()
+            if use_memo:
+                use_memo, touched = use_memo
+                fx = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+                if fx in patched and all(r == fx or "noop:" + r in notes or not (r.startswith("sqlglot/") or "/tpc-" in r or r in ("tests/helpers.py", "tests/test_executor.py")) for r in patched):
+                    try:
+                        known = {(q, tuple(sorted(m.items()))) for (q, m), _ in _pairs(old_by[fx])}
+                        fresh = [i + 1 for i, ((q, m), _) in enumerate(_pairs(patched[fx])) if (q, tuple(sorted(m.items()))) not in known]
+                    except Exception:
+                        fresh = None
+                    if fresh is not None:
+                        keys = {"f:%d" % (i - 1) for i in fresh} | {"s:%r" % (("tpc-ds %d" % i, []),) for i in fresh}
+                        if cands[memo_n] is None or keys < cands[memo_n]:
+                            cands[memo_n] = keys
+                        notes.append("memo-fresh:%d" % len(fresh))
+                notes.append("memo:%s:%d" % (use_memo, len(touched)))
 
-    room = LEAN_ROOM * PARALLEL * BUDGET_FRAC * min(270.0, 180.0 * max(1.0, len(commits) / 40.0))
+            def est(n, memo=True):
+                c = runcpu.get(num_to_id[n], 0)
+                if memo and use_memo and n == memo_n:
+                    pre, run = memo_data()["pre"]["ds"], memo_data()["run"]["ds"]
+                    keys = set(pre) if cands[n] is None else set(cands[n])
+                    return min(c, UNIT_K * sum(pre.get(k, 0) + (run.get(k, 0) if k in touched else 0) for k in keys) + FRAC_C)
+                if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
+                    return c
+                u = cached and unitcpu["units"].get(num_to_id[n])
+                if u:
+                    return min(c, UNIT_K * sum(u.get(k, 0) for k in cands[n]) + FRAC_C)
+                return min(c, c * FRAC_K * len(cands[n]) / cov.nunits[n] + FRAC_C)
+
+            def decide(price=None):
+                def cost(n):
+                    return price if price is not None and n == memo_n else est(n)
+
+                heavy = {n for n in cands if n in FORCE_LIST or ms[n] >= HEAVY_MS or (LISTRULE and cost(n) * 1000 > ms[n] + 2000)}
+                light = sorted(set(cands) - heavy)
+                whole = split_cost(sorted(cands), ms)
+                cap = whole - split_cost(sorted(heavy), ms)
+                over = RUN_O_RE if ("importtime" in notes or any(not r.endswith(".py") for r in patched)) else RUN_O
+                if light and (encoding_fallback or (RUN_K * sum(cost(n) for n in light) + over) * 1000 >= cap):
+                    return set(cands), [], cap, "blind"
+                if price is None and light and memo_n in light and est(memo_n, False) * 1000 > ms[memo_n] + 2000 and (RUN_K * sum(est(n) for n in light if n != memo_n) + over) * 1000 >= whole - split_cost(sorted(heavy | {memo_n}), ms):
+                    spend = RUN_K * sum(est(n) * (1 if n == memo_n else MEMO_K) for n in light) + over
+                    if spend * 1000 >= cap:
+                        return set(cands), [], cap, "blind:memo"
+                return heavy, light, cap, None
+
+            heavy, light, cap, blind = decide()
+            lean = fallback = picks = None
+            u = lean_cost() if LEAN and ok and cached and memo_n in heavy and memo_n not in FORCE_LIST and _lean_meta() else None
+            if u and lean_gate(notes, patched, old_by, hunks_by):
+                need = lean_need(cov, memo_n, patched, hunks_by, notes, u)
+                optcache = not any(r in _lean_meta()["optfiles"] for r in patched if "noop:" + r not in notes)
+                if CANARY_K:
+                    chosen = canary_pick(need, u, CANARY_K)
+                    order = lean_order(need, u, chosen)
+                    price = CANARY_SCALE * sum(u[q] for q in chosen) + FRAC_C
+                else:
+                    order = lean_order(need, u)
+                    price = LEAN_OPT_COST if optcache else LEAN_COST
+                if LEANCAL:
+                    picks = {k: [int(q[2:]) for q in canary_pick(need, u, k)] for k in (0, 2, 4, 8)}
+                h2, l2, c2, b2 = decide(price)
+                saving = (split_cost(sorted(h2 | {memo_n}), ms) - split_cost(sorted(h2), ms)) / 1000
+                if memo_n in l2 and price < saving or LEANCAL:
+                    fallback = {"light": light, "heavy": heavy, "cap": cap / 1000, "notes": ([blind] if blind else []) + notes, "sel": {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}, "lean": None, "fallback": None, "price": 0}
+                    heavy, light, cap, blind = (h2 - {memo_n}, sorted(set(l2) | {memo_n}), 1e9, b2) if LEANCAL else (h2, l2, c2, b2)
+                    if blind:
+                        heavy, light, blind = heavy - {memo_n}, [memo_n], None
+                    notes = notes + ["lean%s%s:%.1f" % (":k%d" % CANARY_K if CANARY_K else "", ":opt" if optcache else "", saving)]
+                    lean = (order, optcache, {} if LEANCAL else {int(q[2:]): BUDGET_K * c + BUDGET_C for q, c in u.items()}, 1e6 if LEANCAL else saving / LEAN_SCALE)
+            if blind:
+                notes.insert(0, blind)
+            sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light if not (lean and n == memo_n)}
+            runs_memo = memo_n in light and not lean
+            plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000, "memo": use_memo if runs_memo else False, "touched": touched, "strict": use_memo and runs_memo and est(memo_n, False) * 1000 > ms[memo_n] + 2000, "lean": lean, "fallback": fallback, "picks": picks, "price": price if lean else 0, "gain": saving - price if lean else 0})
+            log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4], "memo:%s:%d" % (use_memo, len(touched)) if use_memo else "")
+        except Exception as e:
+            log(cid, "plan failed", repr(e)[:300])
+            plans[:] = [q for q in plans if q["cid"] != cid]
+            plans.append(blind_plan(cid, ["error:plan:%s" % type(e).__name__]))
+
+    room = LEAN_ROOM * PARALLEL * BUDGET_FRAC * wall_span(len(commits))
     spent = sum(p["price"] for p in plans)
     for p in sorted((p for p in plans if p["fallback"] and not LEANCAL), key=lambda p: p["gain"]):
         if spent <= room:
@@ -3167,98 +3592,111 @@ def main():
         return
     if os.environ.get("BR_PLANONLY"):
         return
-    imap = json.load(gzip.open(os.path.join(HERE, "importmap.json.gz"), "rt"))
-    mod_tids = {}
-    for n, tid in num_to_id.items():
-        mod_tids.setdefault(tid.split("::")[0][:-3].replace("/", "."), []).append(tid)
-    for p in plans:
-        mask = 0
-        for rel, content in p["patched"].items():
-            if not rel.endswith(".py") or not rel.startswith(("sqlglot/", "tests/")) or "gone:" + rel in p["notes"]:
-                continue
-            if content is None or p["old"].get(rel) is None:
-                mask = -1
-                break
-            if "noop:" + rel in p["notes"]:
-                continue
-            fm = imap["files"].get(rel, {})
-            removed, anchors = changed_old_lines(p["hunks"][rel])
-            for ln in removed | anchors:
-                mask |= fm.get(str(ln), 0)
-            if NEWTOP and "newtop:" + rel in p["notes"]:
-                for v in fm.values():
-                    mask |= v
-        mods = imap["modules"]
-        chosen = mods if mask == -1 else [m for i, m in enumerate(mods) if mask >> i & 1]
-        p["collect"] = {m: mod_tids.get(m, []) for m in chosen} if COLLECT and chosen else None
-        if p["collect"]:
-            log(p["cid"], "collect", len(chosen))
-    for p in plans:
-        p["probe"] = p["collect"] is not None or (PROBE and "importtime" in p["notes"])
-    for p in plans:
-        p["runs"] = [n for n in p["light"] if not (p["lean"] and num_to_id[n] == MEMO_TEST)]
-    heavy_libs = ("tests/test_executor.py", "tests/test_optimizer.py")
-    needs_libs = any(num_to_id[n].startswith(heavy_libs) for p in plans for n in p["runs"]) or any(m in ("tests.test_executor", "tests.test_optimizer") for p in plans for m in (p["collect"] or ()))
-    if LAZYPANDAS:
-        needs_exec = any(num_to_id[n].startswith("tests/test_executor.py") for p in plans for n in p["runs"]) or any(m == "tests.test_executor" for p in plans for m in (p["collect"] or ()))
-        if not needs_exec:
-            sys.modules["pandas.testing"] = _LazyPandasTesting("pandas.testing")
-            needs_libs = False
-            try:
-                import duckdb
-            except Exception:
-                pass
-    if any(p["light"] or p.get("probe") for p in plans):
-        preimport(needs_libs or not LEANIMP)
-    log("preimported cpu=%.2f" % time.process_time())
-    zyg = None
-    if ZYGOTE and any(p["light"] or p.get("probe") for p in plans):
-        import zygote
-        install_futures()
-        warm_ids = sorted({num_to_id[n] for p in plans for n in p["runs"]})
-        table_attrs = {"tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls", "cached_execute", "subtestHelper", "_mp_execute"}
-        reach = {}
-        for _, _, classes in _setup_index(cov):
-            for _, _, tattrs in classes:
-                reach.update(tattrs)
-
-        def needs_tables(n):
-            if not num_to_id[n].startswith("tests/test_executor.py::TestExecutor::"):
-                return False
-            r = reach.get(n)
-            return not LAZYEXEC or r is None or bool(r & table_attrs)
-
-        exec_commits = sum(1 for p in plans if any(needs_tables(n) for n in p["runs"]))
-        opt_commits = sum(1 for p in plans if any(num_to_id[n].startswith("tests/test_optimizer.py::TestOptimizer::") for n in p["light"]))
-        zygote.warm(SRC, warm_ids, (TPCWARM or not (TPCREF and LAZYTABLES)) and exec_commits >= (3 if LAZYTABLES else 2 if LAZYEXEC or LEANIMP else 1), OPTWARM and opt_commits >= 2)
-        if PARTIAL:
-            load_edges()
-        warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
-        code_idx = zygote.code_index({os.path.join(SRC, r) for p in plans for r in p["patched"] if r.endswith(".py")})
-        zyg = (zygote, warm_lines, code_idx)
-        if GCFREEZE:
-            _PARSED.clear()
-            gc.collect()
-            gc.freeze()
-        log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
-    if GCOFF:
-        gc.freeze()
-        gc.enable()
     results = {}
-    pending = [p for p in plans if p["light"] or p["probe"]]
-    for p in plans:
-        if not p["light"] and not p["probe"]:
-            results[p["cid"]] = set(p["heavy"])
-    pending.sort(key=lambda p: -sum(ms[n] for n in p["light"]))
     running = []
-    queue = list(pending)
-    end = T0 + BUDGET_FRAC * min(270.0, 180.0 * max(1.0, len(commits) / 40.0))
-    while queue or running:
-        while queue and len(running) < PARALLEL:
-            p = queue.pop(0)
-            if time.monotonic() > end - 5:
-                results[p["cid"]] = set(p["heavy"]) | set(p["light"])
-                continue
+
+    def listing(p):
+        if p.get("probe", True) and "importtime" in p["notes"]:
+            return set(num_to_id)
+        return set(p["heavy"]) | set(p["light"]) | {id_to_num[t] for tids in (p.get("collect") or {}).values() for t in tids}
+
+    try:
+        imap = json.load(gzip.open(os.path.join(HERE, "importmap.json.gz"), "rt"))
+        mod_tids = {}
+        for n, tid in num_to_id.items():
+            mod_tids.setdefault(tid.split("::")[0][:-3].replace("/", "."), []).append(tid)
+        for p in plans:
+            mask = 0
+            for rel, content in p["patched"].items():
+                if not rel.endswith(".py") or not rel.startswith(("sqlglot/", "tests/")) or "gone:" + rel in p["notes"]:
+                    continue
+                if content is None or p["old"].get(rel) is None:
+                    mask = -1
+                    break
+                if "noop:" + rel in p["notes"]:
+                    continue
+                fm = imap["files"].get(rel, {})
+                removed, anchors = changed_old_lines(p["hunks"][rel])
+                for ln in removed | anchors:
+                    mask |= fm.get(str(ln), 0)
+                if NEWTOP and "newtop:" + rel in p["notes"]:
+                    for v in fm.values():
+                        mask |= v
+            mods = imap["modules"]
+            chosen = mods if mask == -1 else [m for i, m in enumerate(mods) if mask >> i & 1]
+            p["collect"] = {m: mod_tids.get(m, []) for m in chosen} if COLLECT and chosen else None
+            if p["collect"]:
+                log(p["cid"], "collect", len(chosen))
+        for p in plans:
+            p["probe"] = (p["collect"] is not None or (PROBE and "importtime" in p["notes"])) and len(p["heavy"]) < len(num_to_id)
+        for p in plans:
+            p["runs"] = [n for n in p["light"] if not (p["lean"] and num_to_id[n] == MEMO_TEST)]
+        heavy_libs = ("tests/test_executor.py", "tests/test_optimizer.py")
+        needs_libs = any(num_to_id[n].startswith(heavy_libs) for p in plans for n in p["runs"]) or any(m in ("tests.test_executor", "tests.test_optimizer") for p in plans for m in (p["collect"] or ()))
+        if LAZYPANDAS:
+            needs_exec = any(num_to_id[n].startswith("tests/test_executor.py") for p in plans for n in p["runs"]) or any(m == "tests.test_executor" for p in plans for m in (p["collect"] or ()))
+            if not needs_exec:
+                sys.modules["pandas.testing"] = _LazyPandasTesting("pandas.testing")
+                needs_libs = False
+                try:
+                    import duckdb
+                except Exception:
+                    pass
+        if any(p["light"] or p.get("probe") for p in plans):
+            preimport(needs_libs or not LEANIMP)
+        log("preimported cpu=%.2f" % time.process_time())
+        zyg = None
+        if ZYGOTE and any(p["light"] or p.get("probe") for p in plans):
+            import zygote
+            install_futures()
+            warm_ids = sorted({num_to_id[n] for p in plans for n in p["runs"]})
+            table_attrs = {"tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls", "cached_execute", "subtestHelper", "_mp_execute"}
+            reach = {}
+            for _, _, classes in _setup_index(cov):
+                for _, _, tattrs in classes:
+                    reach.update(tattrs)
+
+            def needs_tables(n):
+                if not num_to_id[n].startswith("tests/test_executor.py::TestExecutor::"):
+                    return False
+                r = reach.get(n)
+                return not LAZYEXEC or r is None or bool(r & table_attrs)
+
+            exec_commits = sum(1 for p in plans if any(needs_tables(n) for n in p["runs"]))
+            opt_commits = sum(1 for p in plans if any(num_to_id[n].startswith("tests/test_optimizer.py::TestOptimizer::") for n in p["light"]))
+            zygote.warm(SRC, warm_ids, (TPCWARM or not (TPCREF and LAZYTABLES)) and exec_commits >= (3 if LAZYTABLES else 2 if LAZYEXEC or LEANIMP else 1), OPTWARM and opt_commits >= 2)
+            if PARTIAL:
+                load_edges()
+            warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
+            code_idx = zygote.code_index({os.path.join(SRC, r) for p in plans for r in p["patched"] if r.endswith(".py")})
+            zyg = (zygote, warm_lines, code_idx)
+            if GCFREEZE:
+                _PARSED.clear()
+                gc.collect()
+                gc.freeze()
+            log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
+        if GCOFF:
+            gc.freeze()
+            gc.enable()
+        pending = [p for p in plans if p["light"] or p["probe"]]
+        for p in plans:
+            if not p["light"] and not p["probe"]:
+                results[p["cid"]] = set(p["heavy"])
+        pending.sort(key=lambda p: -sum(ms[n] for n in p["light"]))
+        queue = list(pending)
+        end = T0 + BUDGET_FRAC * wall_span(len(commits))
+
+        def write_overlay(p, mode, root):
+            if THINOV and mode is not None and mode[0] == "swap":
+                for rel in mode[3]:
+                    os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+                    with open(os.path.join(root, rel), "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+                        fh.write(p["patched"][rel])
+            else:
+                build_overlay(root, p["patched"])
+
+        def start(p):
+            global CHILD_LAZY, CHILD_PATCHED, CHILD_MEMO
             root = os.path.join(TMP, "ov", p["cid"])
             slot = False
             ids = [num_to_id[n] for n in p["runs"]]
@@ -3286,81 +3724,102 @@ def main():
                         if rel in zmod.WARM_OPENED:
                             ok = False
                         nonpy.append(rel)
-                if ok:
+                if ok and not p["probe"]:
                     mode = ("swap", swaps, code_idx, nonpy)
                 log(p["cid"], "mode", mode[0])
             try:
                 rmtree(root)
-                if THINOV and mode is not None and mode[0] == "swap":
-                    for rel in mode[3]:
-                        os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
-                        with open(os.path.join(root, rel), "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
-                            fh.write(p["patched"][rel])
-                else:
-                    if REUSEOV:
-                        slot = True
-                        root = SLOTS.pop() if SLOTS else root
-                    build_overlay(root, p["patched"])
+                if REUSEOV and not (THINOV and mode is not None and mode[0] == "swap"):
+                    slot = True
+                    root = SLOTS.pop() if SLOTS else root
+                write_overlay(p, mode, root)
             except Exception as e:
                 log(p["cid"], "overlay failed", repr(e))
-                results[p["cid"]] = set(num_to_id)
-                continue
-            global CHILD_LAZY, CHILD_PATCHED, CHILD_MEMO
+                import tempfile
+                slot = False
+                root = os.path.join(tempfile.mkdtemp(prefix="ovr", dir=TMP), p["cid"])
+                write_overlay(p, mode, root)
             CHILD_PATCHED = list(p["patched"])
             CHILD_MEMO = (memo_blobs(p["touched"]), memo_data()["drop"], memo_state() if p["memo"] == "state" else None, p["strict"] and MEMO_MISS + 2 * sum(memo_data()["run"]["ds"].get(k, 0) for k in p["touched"])) if p["memo"] else None
-            CHILD_LAZY = tpc_lazy(p["patched"])
-            p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode, p["lean"])
+            CHILD_LAZY = tpc_lazy(p["patched"], p["notes"])
             p["root"] = root
             p["slot"] = slot
-            running.append(p)
-        fds = [p["job"].fd for p in running]
-        r, _, _ = select.select(fds, [], [], 0.5)
-        for p in list(running):
-            job = p["job"]
-            if job.fd in r:
-                job.feed()
-            if p["memo"] and not job.done and job.status.get(MEMO_TEST) == "F":
-                fail = {id_to_num[t] for t, v in job.status.items() if v == "F"} | set(p["heavy"])
-                if split_cost(sorted(fail | set(p["light"])), ms) <= split_cost(sorted(fail), ms):
-                    log(p["cid"], "memo test failed, listing the rest")
+            p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode, p["lean"])
+
+        while queue or running:
+            while queue and len(running) < PARALLEL:
+                p = queue.pop(0)
+                if time.monotonic() > end - 5:
+                    results[p["cid"]] = listing(p)
+                    continue
+                try:
+                    start(p)
+                except Exception as e:
+                    log(p["cid"], "start failed", repr(e))
+                    results[p["cid"]] = listing(p)
+                    continue
+                running.append(p)
+            fds = [p["job"].fd for p in running]
+            r, _, _ = select.select(fds, [], [], 0.5)
+            for p in list(running):
+                job = p["job"]
+                if job.fd in r:
+                    job.feed()
+                if p["memo"] and not job.done and job.status.get(MEMO_TEST) == "F":
+                    fail = {id_to_num[t] for t, v in job.status.items() if v == "F"} | set(p["heavy"])
+                    if split_cost(sorted(fail | set(p["light"])), ms) <= split_cost(sorted(fail), ms):
+                        log(p["cid"], "memo test failed, listing the rest")
+                        job.kill()
+                        p["listall"] = True
+                if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
+                    log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
                     job.kill()
-                    p["listall"] = True
-            if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
-                log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
-                job.kill()
-                if p["probe"]:
-                    job.broken = True
-            if job.done:
-                running.remove(p)
-                fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
-                for kq in getattr(job, "klass_fail", ()):
-                    mod, _, cname = kq.rpartition(".")
-                    pre = "%s.py::%s::" % (mod.replace(".", "/"), cname)
-                    fail |= {n for n, t in num_to_id.items() if t.startswith(pre)}
-                if getattr(job, "broken", False):
-                    log(p["cid"], "patched module does not import")
-                    fail = set(num_to_id)
-                unresolved = job.unresolved()
-                if unresolved:
-                    log(p["cid"], "unresolved", len(unresolved), "current", job.current, "exit", getattr(job, "exit", None))
-                    fail |= {id_to_num[t] for t in unresolved}
-                if p["lean"] and job.status.get(MEMO_TEST) != "P":
-                    fail.add(id_to_num[MEMO_TEST])
-                if p["lean"] and CANARY_K and fail - {id_to_num[MEMO_TEST]}:
-                    fail.add(id_to_num[MEMO_TEST])
-                if p["lean"] and LEANCAL:
-                    log(p["cid"], "leancal", json.dumps({"full": getattr(job, "lean", None), "picks": p["picks"], "other": sorted(fail - {id_to_num[MEMO_TEST]}), "status": job.status.get(MEMO_TEST), "cpu": job.tcpu.get(MEMO_TEST)}))
-                results[p["cid"]] = fail | set(p["heavy"]) | (set(p["light"]) if p.get("listall") else set())
-                if p["slot"]:
-                    release_slot(p["root"], p["patched"])
-                else:
-                    rmtree(p["root"])
-                top = sorted(job.tcpu.items(), key=lambda kv: -kv[1])[:4]
-                log(p["cid"], "testcpu=%.2f" % sum(job.tcpu.values()), "top", " ".join("%s:%.2f" % (t.split("::")[-1], c) for t, c in top))
-                log(p["cid"], "fail", sorted(fail), "heavy", sorted(p["heavy"]), "cpu=%.2f" % job.cpu, "t=%.1f" % (time.monotonic() - T0))
+                    if p["probe"]:
+                        job.broken = True
+                if job.done:
+                    running.remove(p)
+                    fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
+                    for kq in getattr(job, "klass_fail", ()):
+                        mod, _, cname = kq.rpartition(".")
+                        pre = "%s.py::%s::" % (mod.replace(".", "/"), cname)
+                        fail |= {n for n, t in num_to_id.items() if t.startswith(pre)}
+                    fail |= {id_to_num[t] for t in job.sticky if t in id_to_num}
+                    if getattr(job, "broken", False) or job.abort or p["probe"] and not job.collected:
+                        log(p["cid"], "patched module does not import", job.abort, job.collected)
+                        fail = set(num_to_id)
+                    unresolved = job.unresolved()
+                    if unresolved:
+                        log(p["cid"], "unresolved", len(unresolved), "current", job.current, "exit", getattr(job, "exit", None))
+                        fail |= {id_to_num[t] for t in unresolved}
+                    if p["lean"] and job.status.get(MEMO_TEST) != "P":
+                        fail.add(id_to_num[MEMO_TEST])
+                    if p["lean"] and CANARY_K and fail - {id_to_num[MEMO_TEST]}:
+                        fail.add(id_to_num[MEMO_TEST])
+                    if p["lean"] and LEANCAL:
+                        log(p["cid"], "leancal", json.dumps({"full": getattr(job, "lean", None), "picks": p["picks"], "other": sorted(fail - {id_to_num[MEMO_TEST]}), "status": job.status.get(MEMO_TEST), "cpu": job.tcpu.get(MEMO_TEST)}))
+                    results[p["cid"]] = fail | set(p["heavy"]) | (set(p["light"]) if p.get("listall") else set())
+                    try:
+                        if p["slot"]:
+                            release_slot(p["root"], p["patched"])
+                        else:
+                            rmtree(p["root"])
+                    except OSError as e:
+                        log(p["cid"], "cleanup failed", repr(e))
+                    top = sorted(job.tcpu.items(), key=lambda kv: -kv[1])[:4]
+                    log(p["cid"], "testcpu=%.2f" % sum(job.tcpu.values()), "top", " ".join("%s:%.2f" % (t.split("::")[-1], c) for t, c in top))
+                    log(p["cid"], "fail", sorted(fail), "heavy", sorted(p["heavy"]), "cpu=%.2f" % job.cpu, "t=%.1f" % (time.monotonic() - T0))
+    except BaseException as e:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        log("loop failed", repr(e)[:300])
+        for p in running:
+            p["job"].kill()
+        for p in plans:
+            if p["cid"] not in results:
+                results[p["cid"]] = listing(p)
+    signal.setitimer(signal.ITIMER_REAL, 0)
     log("loop done cpu=%.2f" % time.process_time())
     for cid in commits:
-        workers = split(sorted(results.get(cid, set())), ms)
+        workers = split(sorted(results.get(cid, set(num_to_id))), ms)
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
         WRITTEN.add(cid)
     sys.stdout.flush()
@@ -3371,19 +3830,33 @@ def main():
 WRITTEN = set()
 
 
+class Watchdog(BaseException):
+    pass
+
+
+def on_watchdog(signum, frame):
+    raise Watchdog()
+
+
 def fallback():
-    tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
-    nums = [t["number"] for t in tests]
+    try:
+        nums = [t["number"] for t in json.load(open(os.path.join(DATA, "tests.json")))["tests"]]
+    except BaseException:
+        nums = []
     for p in sorted(os.listdir(os.path.join(DATA, "commits"))):
         if p.endswith(".patch") and p[:-6] not in WRITTEN:
             sys.stdout.write(json.dumps({"commit": p[:-6], "workers": [nums[i::8] for i in range(8)]}) + "\n")
+            WRITTEN.add(p[:-6])
     sys.stdout.flush()
 
 
 if __name__ == "__main__":
     try:
+        signal.signal(signal.SIGALRM, on_watchdog)
+        signal.setitimer(signal.ITIMER_REAL, WATCHDOG * wall_span(sum(1 for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))))
         main()
     except BaseException as e:
+        signal.setitimer(signal.ITIMER_REAL, 0)
         log("main failed", repr(e))
         fallback()
     sys.stdout.flush()
