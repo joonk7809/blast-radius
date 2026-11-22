@@ -1362,7 +1362,7 @@ def memo_ok(patched, hunks_by, old_by, notes, warm_lines):
             if changed & warm_lines.get(rel, set()) or not all(zygote.in_body(tree.body, ln) for ln in changed):
                 mode = "state"
             hit = set()
-            exact = _replaced_lines(hunks_by[rel])
+            removed, inserts = _replaced_lines(hunks_by[rel])
             for q, first, last in spans:
                 if (rel, q, first) in d["exec"]:
                     inside = {ln for ln in changed if first <= ln <= last}
@@ -1372,10 +1372,15 @@ def memo_ok(patched, hunks_by, old_by, notes, warm_lines):
             if hit:
                 seen = d["lines"].get(rel, {})
                 stmts = [n for n in ast.walk(tree) if isinstance(n, ast.stmt)]
-                for ln in hit & exact:
+                check = set()
+                for ln in hit & removed:
                     for a, b in _stmt_span(stmts, ln):
-                        for x in range(a, b + 1):
-                            touched |= seen.get(x, set())
+                        check.update(range(a, b + 1))
+                for ln in inserts:
+                    if ln in hit or ln - 1 in hit:
+                        check |= _insert_lines(stmts, ln)
+                for x in check:
+                    touched |= seen.get(x, set())
         elif rel == "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql":
             if content is None or old is None:
                 return False
@@ -1391,21 +1396,40 @@ def memo_ok(patched, hunks_by, old_by, notes, warm_lines):
 
 
 def _replaced_lines(hunks):
-    out = set()
+    removed, inserts = set(), set()
     for h in hunks:
         ln = h["old_start"] if h["old_len"] else h["old_start"] + 1
         repl = False
         for tag, _ in h["lines"]:
             if tag == "-":
-                out.add(ln)
+                removed.add(ln)
                 ln += 1
                 repl = True
             elif tag == "+":
                 if not repl:
-                    out.update((ln - 1, ln))
+                    inserts.add(ln)
             else:
                 ln += 1
                 repl = False
+    return removed, inserts
+
+
+def _insert_lines(stmts, ln):
+    funcs = [n for n in stmts if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.lineno < ln <= n.end_lineno + 1]
+    if not funcs:
+        return {ln - 1, ln}
+    f = max(funcs, key=lambda n: n.lineno)
+    starts = {n.lineno for n in stmts}
+    if ln > f.end_lineno or ln not in starts:
+        return set(range(f.lineno, f.end_lineno + 1))
+    out = set()
+    for a, b in _stmt_span(stmts, ln):
+        out.update(range(a, b + 1))
+    prev = max((n.end_lineno for n in stmts if f.lineno < n.lineno and n.end_lineno < ln), default=None)
+    for n in stmts:
+        if prev is not None and n.end_lineno == prev and f.lineno < n.lineno:
+            for a, b in _stmt_span(stmts, n.lineno):
+                out.update(range(a, b + 1))
     return out
 
 
