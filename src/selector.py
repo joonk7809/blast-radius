@@ -1,5 +1,6 @@
 import ast
 import bisect
+import builtins
 import enum
 import gc
 import gzip
@@ -95,6 +96,13 @@ LEAN_WALL = float(os.environ.get("BR_LEAN_WALL", "90"))
 LEAN_OPT_COST = float(os.environ.get("BR_LEAN_OPT_COST", "12.0"))
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
+PATHRULES = os.environ.get("BR_PATHRULES", "1") == "1"
+TESTSIDE = os.environ.get("BR_TESTSIDE", "1") == "1"
+LAZYGONE = os.environ.get("BR_LAZYGONE", "1") == "1"
+INERT = os.environ.get("BR_INERT", "1") == "1"
+RAWBIN = os.environ.get("BR_RAWBIN", "1") == "1"
+PYTEST_CFG = ("conftest.py", "pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml", "tox.ini")
+PYTEST_DIRS = ("", "tests", "tests/dialects")
 if GCOFF:
     gc.disable()
 
@@ -103,14 +111,35 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+def _unquote(s):
+    if len(s) > 1 and s[0] == '"' and s[-1] == '"':
+        return ast.literal_eval("b" + s.encode("utf-8", "surrogateescape").decode("latin-1")).decode("utf-8", "surrogateescape")
+    return s
+
+
+def _header_paths(rest):
+    m = re.fullmatch(r'("(?:[^"\\]|\\.)*"|a/\S+) ("(?:[^"\\]|\\.)*"|b/\S+)', rest)
+    if m:
+        a, b = _unquote(m.group(1)), _unquote(m.group(2))
+        return a[2:], b[2:]
+    half = (len(rest) - 1) // 2
+    if rest[:2] == "a/" and rest[half:half + 3] == " b/" and rest[2:half] == rest[half + 3:]:
+        return rest[2:half], rest[2:half]
+    raise ValueError("bad diff header")
+
+
 def parse_patch(text):
     files = []
     cur = None
     hunk = None
     for line in text.splitlines(keepends=True):
         if line.startswith("diff --git "):
-            m = re.match(r"diff --git a/(\S+) b/(\S+)", line)
-            cur = {"old": m.group(1), "path": m.group(2), "hunks": [], "new_file": False, "deleted": False}
+            if RAWBIN:
+                old, new = _header_paths(line[11:].rstrip("\n").rstrip("\r"))
+            else:
+                m = re.match(r"diff --git a/(\S+) b/(\S+)", line)
+                old, new = m.group(1), m.group(2)
+            cur = {"old": old, "path": new, "hunks": [], "new_file": False, "deleted": False}
             files.append(cur)
             hunk = None
             continue
@@ -121,6 +150,8 @@ def parse_patch(text):
                 cur["new_file"] = True
             elif line.startswith("deleted file mode"):
                 cur["deleted"] = True
+            elif RAWBIN and (line.startswith("GIT binary patch") or line.startswith("Binary files ")):
+                cur["binary"] = True
             elif line.startswith("--- ") or line.startswith("+++ ") or line.startswith("index ") or line.startswith("similarity") or line.startswith("rename "):
                 pass
         m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
@@ -262,7 +293,13 @@ _PARSED = {}
 def parse_cached(text):
     t = _PARSED.get(text)
     if t is None:
-        t = _PARSED[text] = ast.parse(text)
+        try:
+            t = ast.parse(text)
+        except UnicodeEncodeError:
+            if not RAWBIN:
+                raise
+            t = ast.parse(text.encode("utf-8", "surrogateescape"))
+        _PARSED[text] = t
     return t
 
 
@@ -1183,8 +1220,90 @@ def support_dependents(path, old_text, new_text, cov):
     return closure_hits(cov, hit)
 
 
+def _exported(tree):
+    out = set(top_names(tree))
+    if LAZYGONE and any(isinstance(n, ast.FunctionDef) and n.name == "__getattr__" for n in tree.body):
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                out.update(n.value for n in ast.walk(node.value) if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier())
+    return out
+
+
+def _plain_def(node, lazy):
+    if not isinstance(node, ast.FunctionDef) or node.decorator_list:
+        return False
+    a = node.args
+    if not all(isinstance(d, ast.Constant) for d in a.defaults + [d for d in a.kw_defaults if d is not None]):
+        return False
+    return lazy or (node.returns is None and all(x.annotation is None for x in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg] if x is not None))
+
+
+def _inert_change(old_text, new_text):
+    try:
+        a, b = ast.parse(old_text), ast.parse(new_text)
+    except (SyntaxError, ValueError):
+        return False
+    if any(isinstance(n, ast.ImportFrom) and any(x.name == "*" for x in n.names) for n in a.body):
+        return False
+    da = [ast.dump(n) for n in a.body]
+    lazy = any(isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(x.name == "annotations" for x in n.names) for n in b.body)
+    taken = set(top_names(a)) | set(dir(builtins))
+    i = 0
+    for node in b.body:
+        if i < len(da) and ast.dump(node) == da[i]:
+            i += 1
+        elif not _plain_def(node, lazy) or node.name in taken or node.name.startswith("__"):
+            return False
+        else:
+            taken.add(node.name)
+    return i == len(da)
+
+
+def _risky(node):
+    if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.Pass)):
+        return False
+    if isinstance(node, ast.ClassDef):
+        return any(_risky(n) for n in node.body)
+    if isinstance(node, ast.Expr):
+        return not isinstance(node.value, ast.Constant)
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        return not all(isinstance(x, (ast.Name, ast.Tuple, ast.List, ast.Starred, ast.expr_context)) for t in targets for x in ast.walk(t))
+    if isinstance(node, ast.If):
+        test = ast.dump(node.test)
+        if "'__name__'" in test and "'__main__'" in test:
+            return False
+        return any(isinstance(n, ast.Call) for n in ast.walk(node.test)) or any(_risky(n) for n in node.body + node.orelse)
+    return True
+
+
+def _side_effects(text):
+    if text is None:
+        return []
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return []
+    return sorted(ast.dump(n) for n in tree.body if _risky(n))
+
+
+def _pytest_config(path, old_text, new_text):
+    folder, base = os.path.split(path)
+    if folder not in PYTEST_DIRS:
+        return False
+    if base in PYTEST_CFG:
+        return True
+    marker = {"setup.cfg": "[tool:pytest]", "pyproject.toml": "[tool.pytest"}.get(base)
+    return bool(marker) and any(marker in (t or "") for t in (old_text, new_text))
+
+
 def _candidates_for(f, old_text, new_text, cov, notes):
     path = f["path"]
+    if PATHRULES and _pytest_config(path, old_text, new_text):
+        notes.append("pytest-config")
+        every = full(n for n in cov.idx_to_num if n is not None)
+        FORCE_LIST.update(every)
+        return every
     if path.startswith("sqlglot/") and path.endswith(".py") or CLOSURE and f["old"].startswith("sqlglot/") and f["old"].endswith(".py"):
         if f["deleted"] or (f["old"] and f["old"] != path):
             gone = gone_dependents(f["old"], cov) if CLOSURE else None
@@ -1208,7 +1327,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         extra = {}
         if old_text is not None and new_text is not None:
             try:
-                gone = set(top_names(parse_cached(old_text))) - set(top_names(parse_cached(new_text)))
+                gone = _exported(parse_cached(old_text)) - _exported(parse_cached(new_text))
             except SyntaxError:
                 gone = set()
             if gone:
@@ -1299,6 +1418,11 @@ def _candidates_for(f, old_text, new_text, cov, notes):
     if path.startswith("tests/") and path.endswith(".py"):
         if os.path.basename(path).startswith("test_"):
             notes.append("testfile")
+            if TESTSIDE and _side_effects(old_text) != _side_effects(new_text):
+                notes.append("test-side-effect")
+                every = full(n for n in cov.idx_to_num if n is not None)
+                FORCE_LIST.update(every)
+                return every
             out = set(cov.by_file.get(path, []))
             if any(tag == "+" and "xfail" in line for h in f["hunks"] for tag, line in h["lines"]):
                 notes.append("xfail")
@@ -1308,6 +1432,12 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                 notes.append("test-dependents:%d" % len(hit))
                 out.update(n for tf in hit for n in cov.by_file.get(tf, []))
             return out
+        if INERT and old_text is not None and new_text is not None and _inert_change(old_text, new_text):
+            notes.append("test-support-inert")
+            return set()
+        if INERT and os.path.basename(path) != "__init__.py" and not importers(modname_of(path), None, "tests") and not importers(modname_of(path), None, "sqlglot"):
+            notes.append("test-support-unimported")
+            return set()
         dep = support_dependents(path, old_text, new_text, cov) if CLOSURE and f["old"] == path and not f["deleted"] and not f["new_file"] else None
         if dep is not None:
             notes.append("closure-support:%d" % len(dep))
@@ -1343,6 +1473,10 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                 pass
         return out
     notes.append("other:" + path)
+    if PATHRULES and path.startswith("sqlglotc/"):
+        r = set(cov.by_file.get("tests/test_sqlglotc.py", []))
+        FORCE_LIST.update(r)
+        return r
     return set()
 
 
@@ -2831,6 +2965,13 @@ def main():
         try:
             files = parse_patch(text)
             for f in files:
+                if f.get("binary"):
+                    notes.append("binary:" + f["path"])
+                    for q in {f["old"], f["path"]}:
+                        r = candidates_for(dict(f, path=q, old=q, deleted=True, new_file=False, hunks=[]), None, None, cov, notes)
+                        FORCE_LIST.update(r)
+                        merge(cands, r)
+                    continue
                 src = os.path.join(SRC, f["old"])
                 old_text = None
                 if not f["new_file"] and os.path.exists(src):
@@ -2842,6 +2983,8 @@ def main():
                 old_by[f["path"]] = old_text
                 if f["old"] != f["path"]:
                     patched[f["old"]] = None
+                    if PATHRULES and not f["old"].startswith("sqlglot/"):
+                        merge(cands, candidates_for(dict(f, path=f["old"], deleted=True, hunks=[]), old_text, None, cov, notes))
                 merge(cands, candidates_for(f, old_text, new_text, cov, notes))
         except Exception as e:
             ok = False
