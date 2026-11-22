@@ -32,9 +32,6 @@ T["setup"] = time.process_time() - t0
 S.install(sx)
 fails, modes, budget_hit = [], {}, False
 if setup_err is None:
-    fr = S.frames()
-    if fr is not None:
-        k.cache = fr
     inst = k("test_execute_tpcds")
     te._schema, te._tables = te.TPCDS_SCHEMA, k.tpcds_tables
     parsed = []

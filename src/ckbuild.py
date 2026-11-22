@@ -124,7 +124,6 @@ for _ in range(2):
         setup_cov[key] = {("setup", -1)}
 sx.optimize, sx.Plan, sx.PythonExecutor, sx.ensure_tables, sx.ensure_schema = h_opt, h_plan, HPX, h_et, h_es
 queries = {}
-frames = {}
 
 
 def sweep(lin, record):
@@ -141,25 +140,31 @@ def sweep(lin, record):
         state["q"] = i
         t0 = time.process_time()
         res = sx.execute(e, schema=te.TPCDS_SCHEMA, tables=arg)
-        qt = time.process_time() - t0
-        setcur(None)
-        nat = real_px(tables=real_et(arg)).execute(real_plan(real_opt(pickle.loads(pickle.dumps(te.parse_one(sql))), te.TPCDS_SCHEMA, leave_tables_isolated=True)))
-        if nat.columns != res.columns or nat.rows != res.rows:
-            raise SystemExit("pinned AST result differs on query %d" % i)
-        qt = time.process_time() - t0
         setcur(None)
         if record:
+            nat = real_px(tables=real_et(arg)).execute(real_plan(real_opt(pickle.loads(pickle.dumps(te.parse_one(sql))), te.TPCDS_SCHEMA, leave_tables_isolated=True)))
+            if nat.columns != res.columns or nat.rows != res.rows:
+                raise SystemExit("pinned AST result differs on query %d" % i)
+            qt = time.process_time() - t0
             recd = state["recd"]
             pp = real_plan(pickle.loads(state["o"]))
             queries[i] = {"planblob": pickle.dumps((pp, ck.step_sigs(pp)), protocol=5), "pdig": state["pdig"], "schema": state["schema"], "kw": state["kw"], "opt": state["o"], "osql": state["osql"], "sigs": sorted(state["sigs"].values()), "steps": recd.steps, "result": pickle.dumps(res, protocol=5), "qtime": qt, "tables": sorted(arg)}
-            inst = k("test_execute_tpcds")
-            frames[sql] = inst.cached_execute(sql, tpch=False)
-            inst.subtestHelper(i, res, tpch=False)
 
 
+rec = os.path.join(OUT, "rec.pkl")
+pid = os.fork()
+if pid == 0:
+    sweep(False, True)
+    with open(rec, "wb") as fh:
+        pickle.dump(queries, fh, protocol=5)
+    os._exit(0)
 sweep(True, False)
 sweep(True, False)
-sweep(False, True)
+if os.waitpid(pid, 0)[1]:
+    raise SystemExit("record sweep failed")
+with open(rec, "rb") as fh:
+    queries = pickle.load(fh)
+os.remove(rec)
 a, b = cov
 lines = {}
 for key in set(a) | set(b):
@@ -180,7 +185,7 @@ mon.set_events(tool, 0)
 mon.free_tool_id(tool)
 base = {n: ck.content_state(t) for n, t in k.tpcds_tables.items()}
 with open(os.path.join(OUT, "ck2.pkl"), "wb") as fh:
-    pickle.dump({"queries": queries, "lines": lines, "base": base, "frames": frames}, fh, protocol=5)
+    pickle.dump({"queries": queries, "lines": lines, "base": base}, fh, protocol=5)
 with open(os.path.join(OUT, "lines.pkl"), "wb") as fh:
     pickle.dump((lines, sorted(queries)), fh, protocol=5)
 st = [r for q in queries.values() for r in q["steps"].values()]

@@ -98,9 +98,6 @@ class Session(Reach):
         self.base_dirty = False
         self.spent = 0.0
 
-    def frames(self):
-        return dict(self.D["frames"]) if self.only_sqlglot else None
-
     def order_hint(self, sentinels=(8, 5, 96)):
         hot = sorted(self.hot())
         return [q for q in sentinels if q in self.Q] + [q for q in hot if q not in sentinels]
