@@ -188,6 +188,6 @@ base = {n: ck.content_state(t) for n, t in k.tpcds_tables.items()}
 with open(os.path.join(OUT, "ck2.pkl"), "wb") as fh:
     pickle.dump({"queries": queries, "lines": lines, "base": base}, fh, protocol=5)
 with open(os.path.join(OUT, "lines.pkl"), "wb") as fh:
-    pickle.dump((lines, sorted(queries)), fh, protocol=5)
+    pickle.dump((lines, sorted(queries), {(q, s): r["cost"] for q, x in queries.items() for s, r in x["steps"].items()}), fh, protocol=5)
 st = [r for q in queries.values() for r in q["steps"].values()]
 print("queries", len(queries), "steps", len(st), "snapMB", sum(r["bytes"] for r in st) / 1e6, "ALL", sum(1 for v in lines.values() if v == "ALL"), "OPTALL", sum(1 for v in lines.values() if v == "OPTALL"), "IMPORT", sum(1 for v in lines.values() if v == "IMPORT"), "oalias", sum(r["oalias"] for r in st), "shared", sum(r["ndeps"] > 1 for r in st))

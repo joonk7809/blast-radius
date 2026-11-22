@@ -115,7 +115,9 @@ CKHOOKS = os.environ.get("BR_CKHOOKS", "1") == "1"
 LEANWIDE = os.environ.get("BR_LEANWIDE", "0") == "1"
 CK_C = float(os.environ.get("BR_CK_C", "1.5"))
 CK_K = float(os.environ.get("BR_CK_K", "0.5"))
-CK_R = float(os.environ.get("BR_CK_R", "0.25"))
+CK_P = float(os.environ.get("BR_CK_P", "0.45"))
+CK_S = float(os.environ.get("BR_CK_S", "1.25"))
+CK_B = float(os.environ.get("BR_CK_B", "2.0"))
 CK_BUDGET = float(os.environ.get("BR_CK_BUDGET", "1e9"))
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
@@ -1993,12 +1995,12 @@ def ck_price(text, u, native):
     if not _CKL:
         with open(os.path.join(HERE, "tpc", "ck", "lines.pkl"), "rb") as fh:
             _CKL.append(pickle.load(fh))
-    lines, queries = _CKL[0]
+    lines, queries, cost = _CKL[0]
     r = _ckhooks().Reach(lines, queries, text, SRC)
     if r.allq or r.imp:
         return native, False
     rerun = r.frame | r.opt_q
-    est = CK_C + min(CK_BUDGET, sum((CK_K if q in rerun else CK_R) * u.get("f:%d" % q, 0) for q in r.hot()))
+    est = CK_C + min(CK_BUDGET, CK_K * sum(u.get("f:%d" % q, 0) for q in rerun) + CK_P * sum(u.get("f:%d" % q, 0) for q in r.plan_q - rerun) + CK_S * sum(cost.get(x, 0) for x in r.touched if x[0] not in rerun) + (CK_B if r.setup_hit or not r.only_sqlglot else 0))
     return (est, True) if est < native else (native, False)
 
 
@@ -3929,8 +3931,6 @@ def main():
                 if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
                     log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
                     job.kill()
-                    if p["probe"]:
-                        job.broken = True
                 if job.done:
                     running.remove(p)
                     fail = {id_to_num[t] for t, s in job.status.items() if s == "F"}
