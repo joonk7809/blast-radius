@@ -9,9 +9,7 @@ COPY src /app
 RUN python -c "import gzip,lzma,shutil;shutil.copyfileobj(lzma.open('/app/covsets.bin.xz'),open('/app/covsets.bin','wb'));shutil.copyfileobj(gzip.open('/app/covmeta.json.gz'),open('/app/covmeta.json','wb'))" \
  && rm /app/covsets.bin.xz /app/covmeta.json.gz \
  && cd /app && python -c "import json,selector;selector.build_setup_cache('/app/setupidx.pkl',sorted({t.split('::')[0] for t in json.load(open('/app/covmeta.json'))['tests']}))" \
- && mkdir /app/tpc && python -c "import selector;selector.build_tpc_cache('/app/tpc')" \
- && python /app/memo.py /sqlglot /app/tpc/memo.pkl \
- && python /app/memo.py state /sqlglot /app/tpc/memo.pkl /app/tpc/state.pkl \
+ && mkdir /app/tpc && (python /app/ckbuild.py /sqlglot /app/tpc/ck & python -c "import selector;selector.build_tpc_cache('/app/tpc')" && python /app/memo.py /sqlglot /app/tpc/memo.pkl && python /app/memo.py state /sqlglot /app/tpc/memo.pkl /app/tpc/state.pkl; s=$?; wait $! && exit $s) \
  && python -c "import glob,gzip,shutil;[shutil.copyfileobj(gzip.open(f),open(f[:-3],'wb')) for f in glob.glob('/app/itmaps/*.json.gz')]" \
  && python -c "import glob,json,marshal;[open(f + '.m','wb').write(marshal.dumps(json.load(open(f)))) for f in glob.glob('/app/itmaps/*.json')]" \
  && python -m compileall -q /app >/dev/null \
