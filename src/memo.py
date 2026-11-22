@@ -1,15 +1,20 @@
 import enum
+import functools
 import hashlib
 import itertools
 import os
 import pickle
+import logging
+import re
 import sys
 import time
 import types
 
 KINDS = (("ds", "tpc-ds", "test_execute_tpcds", "tpcds_tables"), ("h", "tpc-h", "test_execute_tpch", "tpch_tables"))
+t_TypeVar = type(__import__("typing").TypeVar("T"))
 SKIP_SLOTS = ("parent", "arg_key", "index", "_hash")
 POSITION = ("line", "col", "start", "end")
+DERIVED = ("_DISPATCH_CACHE",)
 
 
 class Opaque(Exception):
@@ -87,6 +92,140 @@ def digest(expression, tables, drop=()):
     except (Opaque, RecursionError):
         return None
     return hashlib.sha256("\x00".join(out).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _canon(v, out, seen, depth):
+    t = type(v)
+    if v is None or t in (bool, int, float, str, bytes, complex):
+        out.append("%s:%r" % (t.__name__, v))
+        return
+    if depth > 40:
+        raise Opaque()
+    if isinstance(v, (type, types.ModuleType)):
+        out.append("T:%s.%s" % (getattr(v, "__module__", ""), getattr(v, "__qualname__", v.__name__)))
+        return
+    if id(v) in seen:
+        out.append("cycle")
+        return
+    seen.add(id(v))
+    try:
+        if t in (list, tuple):
+            out.append("%s[%d" % (t.__name__, len(v)))
+            for x in v:
+                _canon(x, out, seen, depth + 1)
+            out.append("]")
+        elif t is dict:
+            out.append("dict[%d" % len(v))
+            for k, x in v.items():
+                _canon(k, out, seen, depth + 1)
+                _canon(x, out, seen, depth + 1)
+            out.append("]")
+        elif t in (set, frozenset):
+            parts = []
+            for x in v:
+                o = []
+                _canon(x, o, set(seen), depth + 1)
+                parts.append("\x01".join(o))
+            out.append("%s{%s}" % (t.__name__, "\x02".join(sorted(parts))))
+        elif isinstance(v, enum.Enum):
+            out.append("E:%s.%s.%s" % (t.__module__, t.__qualname__, v.name))
+        elif t is types.FunctionType:
+            out.append("F:%s.%s" % (v.__module__, v.__qualname__))
+            _canon(code_key(v.__code__), out, seen, depth + 1)
+            _canon(v.__defaults__, out, seen, depth + 1)
+            _canon(v.__kwdefaults__, out, seen, depth + 1)
+            _canon(tuple(c.cell_contents if _filled(c) else Opaque for c in v.__closure__ or ()), out, seen, depth + 1)
+            _canon(dict(vars(v)), out, seen, depth + 1)
+        elif t in (types.BuiltinFunctionType, types.WrapperDescriptorType, types.MethodDescriptorType):
+            out.append("B:%s.%s" % (getattr(v, "__module__", None) or type(getattr(v, "__self__", None)).__name__, v.__qualname__))
+        elif t is types.MethodType:
+            out.append("M")
+            _canon(v.__func__, out, seen, depth + 1)
+            _canon(v.__self__, out, seen, depth + 1)
+        elif t in (staticmethod, classmethod):
+            out.append("S:" + t.__name__)
+            _canon(v.__func__, out, seen, depth + 1)
+        elif t is property:
+            out.append("P")
+            _canon((v.fget, v.fset, v.fdel), out, seen, depth + 1)
+        elif t in (types.MemberDescriptorType, types.GetSetDescriptorType, types.ClassMethodDescriptorType):
+            out.append("D:%s" % v.__qualname__)
+        elif t in (types.GenericAlias, t_TypeVar) or isinstance(v, logging.Logger):
+            out.append("%s:%r" % (t.__name__, v))
+        elif t in (type({}.values()), type({}.keys())):
+            _canon(list(v), out, seen, depth + 1)
+        elif t is re.Pattern:
+            out.append("R:%r:%d" % (v.pattern, v.flags))
+        elif t is functools.partial:
+            out.append("partial")
+            _canon((v.func, v.args, v.keywords), out, seen, depth + 1)
+        elif t.__module__.startswith("sqlglot") and (hasattr(v, "__dict__") or _slots(t)):
+            out.append("I:%s.%s" % (t.__module__, t.__qualname__))
+            for name in _slots(t):
+                _canon(getattr(v, name, Opaque), out, seen, depth + 1)
+            _canon(dict(getattr(v, "__dict__", {})), out, seen, depth + 1)
+        else:
+            r = repr(v)
+            if " at 0x" in r or not t.__module__ or t.__module__.startswith("sqlglot"):
+                raise Opaque()
+            out.append("r:%s.%s:%s" % (t.__module__, t.__qualname__, r))
+    finally:
+        seen.discard(id(v))
+
+
+def _filled(cell):
+    try:
+        cell.cell_contents
+    except ValueError:
+        return False
+    return True
+
+
+def code_key(c):
+    return (c.co_code, tuple(code_key(x) if isinstance(x, types.CodeType) else x for x in c.co_consts), c.co_names, c.co_freevars)
+
+
+def owners(mods):
+    for mname, mod in list(mods.items()):
+        if mod is None or not (mname == "sqlglot" or mname.startswith("sqlglot.")):
+            continue
+        d = getattr(mod, "__dict__", None)
+        if d is None:
+            continue
+        yield mname, "", d
+        stack = [v for v in list(d.values()) if isinstance(v, type) and v.__module__ == mname]
+        done = set()
+        while stack:
+            k = stack.pop()
+            if id(k) in done:
+                continue
+            done.add(id(k))
+            kd = vars(k)
+            yield mname, k.__qualname__, kd
+            stack.extend(v for v in list(kd.values()) if isinstance(v, type) and v.__module__ == mname and v.__qualname__.startswith(k.__qualname__ + "."))
+
+
+def _hash(v):
+    o = []
+    try:
+        _canon(v, o, set(), 0)
+    except (Opaque, RecursionError):
+        return None
+    return hashlib.sha256("\x00".join(o).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def state(names, mods, skip=()):
+    out = {}
+    for mname, qual, d in owners(mods):
+        if mname in skip:
+            continue
+        for k in [k for k in d if type(k) is str and k not in DERIVED and (k in names or k.endswith("_sql") and not k.startswith("_"))]:
+            v = d[k]
+            if type(v) is dict and v and all(isinstance(x, type) for x in v.values()):
+                out[(mname, qual, k)] = frozenset((_hash(x), _hash(y)) for x, y in v.items() if y.__module__.startswith("sqlglot"))
+            else:
+                out[(mname, qual, k)] = _hash(v)
+    return out
 
 
 class Hooks:
@@ -232,8 +371,35 @@ def build(src, out_path):
         if d:
             memo.setdefault(kind, {})[d] = blob
     with open(out_path, "wb") as fh:
-        pickle.dump({"memo": memo, "pre": pre, "exec": sorted(seen), "drop": drop}, fh)
+        pickle.dump({"memo": memo, "pre": pre, "exec": sorted(seen), "drop": drop, "names": sorted(names | consts)}, fh)
+
+
+def build_state(src, memo_path, out_path):
+    sys.path.insert(0, src)
+    os.chdir(src)
+    import importlib
+    import pkgutil
+    import sqlglot
+    from sqlglot.dialects.dialect import Dialect, Dialects
+    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        try:
+            importlib.import_module(m.name)
+        except Exception:
+            pass
+    for d in Dialects:
+        try:
+            Dialect.get_or_raise(d.value)
+        except Exception:
+            pass
+    import tests.test_executor
+    with open(memo_path, "rb") as fh:
+        names = set(pickle.load(fh)["names"])
+    with open(out_path, "wb") as fh:
+        pickle.dump(state(names, sys.modules), fh)
 
 
 if __name__ == "__main__":
-    build(sys.argv[1], sys.argv[2])
+    if sys.argv[1] == "state":
+        build_state(*sys.argv[2:])
+    else:
+        build(sys.argv[1], sys.argv[2])

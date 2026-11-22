@@ -1300,7 +1300,8 @@ CHILD_PATCHED = []
 CHILD_MEMO = None
 _MEMO = []
 MEMO_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-MEMO_BAD = ("importtime", "shared-write", "toplevel", "newtop:", "newfile", "deleted-or-renamed", "unparsable", "bad-coding", "error:", "itf")
+MEMO_BAD = ("shared-write", "toplevel", "newfile", "deleted-or-renamed", "unparsable", "bad-coding", "error:", "itf-error")
+MEMO_IMPORT = ("importtime", "newtop:", "itf")
 
 
 def memo_data():
@@ -1313,6 +1314,12 @@ def memo_data():
         except (OSError, pickle.UnpicklingError, EOFError, KeyError):
             _MEMO.append(None)
     return _MEMO[0]
+
+
+def memo_state():
+    d = memo_data()
+    with open(os.path.join(HERE, "tpc", "state.pkl"), "rb") as fh:
+        return (set(d["names"]), pickle.load(fh))
 
 
 def _code_spans(code, out):
@@ -1329,6 +1336,7 @@ def memo_ok(patched, hunks_by, old_by, notes, warm_lines):
     if d is None or any(n.startswith(MEMO_BAD) for n in notes):
         return False
     import zygote
+    mode = "state" if any(n.startswith(MEMO_IMPORT) for n in notes) else "plain"
     for rel, content in patched.items():
         old = old_by.get(rel)
         if "noop:" + rel in notes:
@@ -1344,9 +1352,9 @@ def memo_ok(patched, hunks_by, old_by, notes, warm_lines):
             except (SyntaxError, ValueError):
                 return False
             if changed & warm_lines.get(rel, set()) or not all(zygote.in_body(tree.body, ln) for ln in changed):
-                return False
+                mode = "state"
             for q, first, last in spans:
-                if (rel, q, first) in d["exec"] and any(first <= ln <= last for ln in changed):
+                if (rel, q, first) in d["exec"] and (q == "<module>" or any(first <= ln <= last for ln in changed)):
                     return False
         elif rel == "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql":
             if content is None or old is None:
@@ -1357,21 +1365,44 @@ def memo_ok(patched, hunks_by, old_by, notes, warm_lines):
             continue
         else:
             return False
-    return True
+    if mode == "state" and not os.path.exists(os.path.join(HERE, "tpc", "state.pkl")):
+        return False
+    return mode
 
 
-def install_memo(blobs, drop, ustate):
+def state_diff(names, pristine, checked):
+    import memo
+    mods = {m: v for m, v in sys.modules.items() if m not in checked and (m == "sqlglot" or m.startswith("sqlglot.")) and v is not None}
+    if not mods:
+        return False
+    checked.update(mods)
+    known = {k[0] for k in pristine}
+    now = memo.state(names, mods)
+    for k, h in now.items():
+        p = pristine.get(k)
+        if k[0] not in known or h is None or (p != h if type(h) is not frozenset or type(p) is not frozenset else not h <= p):
+            if DEBUG:
+                log("state differs", k)
+            return True
+    return any(k[0] in mods and k[1] and k not in now for k in pristine)
+
+
+def install_memo(blobs, drop, check, strict, ustate):
     import sqlglot.executor as ex
     sys.path.insert(0, HERE)
     import memo
     spent = [0.0]
+    checked = set()
+    bad = []
 
     def lookup(d, expression, raw):
         if ustate.get("tid") != MEMO_TEST:
             return None
-        hit = blobs.get(d) if d else None
-        if hit is None:
-            if spent[0] > MEMO_MISS:
+        if check is not None and not bad and state_diff(check[0], check[1], checked):
+            bad.append(1)
+        hit = blobs.get(d) if d and not bad else None
+        if hit is None and strict:
+            if spent[0] > MEMO_MISS or bad:
                 ustate["skipped"] = False
                 raise RuntimeError("memo budget")
             hooks.t0 = time.process_time()
@@ -1933,7 +1964,7 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None):
                 if UNITS and TPCPARSE:
                     defer_mp_parse(k, ustate)
     if CHILD_MEMO is not None:
-        install_memo(CHILD_MEMO[0], CHILD_MEMO[1], ustate)
+        install_memo(*CHILD_MEMO, ustate)
     suite = unittest.TestSuite(cases)
     try:
         suite.run(Result())
@@ -2128,11 +2159,11 @@ def main():
         else:
             use_memo = False
         if use_memo:
-            notes.append("memo")
+            notes.append("memo:" + use_memo)
 
-        def est(n):
+        def est(n, memo=True):
             c = runcpu.get(num_to_id[n], 0)
-            if use_memo and n == memo_n:
+            if memo and use_memo and n == memo_n:
                 pre = memo_data()["pre"]["ds"]
                 return min(c, UNIT_K * sum(pre.values() if cands[n] is None else (pre.get(k, 0) for k in cands[n])) + FRAC_C)
             if not (UNITEST or n in FRACTION_OK) or cands[n] is None or not cov.nunits.get(n):
@@ -2151,8 +2182,8 @@ def main():
             notes.insert(0, "blind")
             heavy, light = set(cands), []
         sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light}
-        plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000, "memo": use_memo and memo_n in light})
-        log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4], "memo" if use_memo else "")
+        plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000, "memo": use_memo if memo_n in light else False, "strict": use_memo and memo_n in light and est(memo_n, False) * 1000 > ms[memo_n] + 2000})
+        log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4], "memo:%s" % use_memo if use_memo else "")
 
     log("planned cpu=%.2f" % time.process_time())
     if STATIC:
@@ -2286,7 +2317,7 @@ def main():
                 log(p["cid"], "mode", mode[0])
             global CHILD_LAZY, CHILD_PATCHED, CHILD_MEMO
             CHILD_PATCHED = list(p["patched"])
-            CHILD_MEMO = (memo_data()["memo"].get("ds", {}), memo_data()["drop"]) if p["memo"] else None
+            CHILD_MEMO = (memo_data()["memo"].get("ds", {}), memo_data()["drop"], memo_state() if p["memo"] == "state" else None, p["strict"]) if p["memo"] else None
             CHILD_LAZY = tpc_lazy(p["patched"])
             p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode)
             p["root"] = root
