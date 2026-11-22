@@ -3527,6 +3527,86 @@ class Job:
         return [t for t in self.tests if t not in self.status]
 
 
+DIAG_SAMPLE = frozenset("2haz 2jrq 2qn5 2vdj 3utz 4d63 535z 5y72 66ks 6vvp 6ze8 8y7j 986c 9u5k ary6 bap8 bj7g bvw2 egys f4bn f4xa fryt gbav gbhk j6uz ktz3 mthh nwnx rszg st8f".split())
+
+
+def _bucket(x, edges):
+    return sum(x >= e for e in edges)
+
+
+def diag_code(p, workers, memo_n, ms, split_cost):
+    listed = {n for w in workers for n in w}
+    conf = p.get("conf", set()) & listed
+    u = split_cost(sorted(listed), ms) - split_cost(sorted(conf), ms)
+    notes = p.get("notes", [])
+    leannote = next((x for x in notes if x.startswith("lean")), "")
+    if p.get("killed") or p.get("unres") or p.get("broken"):
+        cat, sub = 7, 3 if p.get("broken") else p.get("killed", 0)
+    elif p.get("lean") and ":ck" in leannote:
+        info = (p.get("ckinfo") or "").split(" ", 1)[1:]
+        try:
+            ck = json.loads(info[0]) if info else {}
+        except ValueError:
+            ck = {}
+        cat, sub = 6, (1 if ck.get("nogo") else 0) + (2 if ck.get("fb") else 0)
+    elif p.get("lean"):
+        cat, sub = 5, (1 if ":opt" in leannote else 0) + (2 if ":wide" in leannote else 0)
+    elif p.get("memo") in ("plain", "state"):
+        cat, sub = 3 if p["memo"] == "plain" else 4, _bucket(len(p.get("touched", ())), (1, 6, 21))
+    elif notes and notes[0].startswith("blind"):
+        cat, sub = 1, 1 if notes[0] == "blind:memo" else 0
+    elif set(p.get("heavy", ())) & listed:
+        cat, sub = 2, 0
+    else:
+        cat, sub = 0, 0
+    heavy = {n for n in listed - conf if ms[n] >= 2000}
+    hv = (1 if memo_n in heavy else 0) + (2 if heavy - {memo_n} else 0)
+    cpu = _bucket(p.get("cpu", 0.0), (1, 3, 6, 12, 25))
+    ub = _bucket(u, (3500, 8000, 20000))
+    return u, cat, sub, cpu, hv, ub
+
+
+def diag_pad(out, by_cid, memo_n, ms, split_cost):
+    rows = []
+    for cid, workers in out.items():
+        if cid not in DIAG_SAMPLE and cid in by_cid:
+            code = diag_code(by_cid[cid], workers, memo_n, ms, split_cost)
+            if code[0] >= 2500:
+                rows.append((-code[0], cid, code))
+    rows.sort()
+    for _, cid, code in rows:
+        log(cid, "diagres2 u=%d cat=%d sub=%d cpu=%d heavy=%d ub=%d" % code)
+    c0 = c1 = 0
+    if rows:
+        _, cat, sub, cpu, hv, ub = rows[0][2]
+        c0 = cat + 8 * (sub + 4 * (cpu + 6 * (hv + 4 * ub)))
+    if len(rows) > 1:
+        _, cat, _, cpu, _, _ = rows[1][2]
+        c1 = cat + 8 * cpu
+    total = min(len(rows), 3) + 4 * (c0 + 3072 * c1)
+    rem = total
+    order = sorted((cid for cid in out if out[cid]), key=lambda cid: sum(ms[n] for w in out[cid] for n in w))
+    for cid in order:
+        if not rem:
+            break
+        workers = out[cid]
+        listed = {n for w in workers for n in w}
+        free = sorted((n for n in ms if ms[n] > 0 and n not in listed), key=lambda n: (-ms[n], n))
+        share = min(rem, max(0, sum(ms[n] for n in free) - 3000))
+        left, add = share, []
+        for n in free:
+            if ms[n] <= left:
+                add.append(n)
+                left -= ms[n]
+                if not left:
+                    break
+        if add:
+            top = max(range(len(workers)), key=lambda i: sum(ms[n] for n in workers[i]))
+            workers[top] = workers[top] + add
+            rem -= share - left
+    log("diagres2 total=%d placed=%d rows=%d" % (total, total - rem, len(rows)))
+
+
 def main():
     tests_doc = json.load(open(os.path.join(DATA, "tests.json")))
     tests = tests_doc["tests"]
@@ -3928,6 +4008,7 @@ def main():
                         p["listall"] = True
                 if not job.done and (time.monotonic() > min(job.deadline, end) or job.cpu_now() > p["cap"] + 2.0):
                     log(p["cid"], "killed cpu=%.2f cap=%.2f" % (job.cpu_now(), p["cap"]))
+                    p["killed"] = 1 if job.cpu_now() > p["cap"] + 2.0 else 2
                     job.kill()
                     if p["probe"]:
                         job.broken = True
@@ -3939,6 +4020,11 @@ def main():
                         pre = "%s.py::%s::" % (mod.replace(".", "/"), cname)
                         fail |= {n for n, t in num_to_id.items() if t.startswith(pre)}
                     fail |= {id_to_num[t] for t in job.sticky if t in id_to_num}
+                    p["conf"] = set(fail)
+                    p["unres"] = bool(job.unresolved())
+                    p["broken"] = bool(getattr(job, "broken", False) or job.abort or p["probe"] and not job.collected)
+                    p["cpu"] = job.cpu
+                    p["ckinfo"] = getattr(job, "lean", None)
                     if getattr(job, "broken", False) or job.abort or p["probe"] and not job.collected:
                         log(p["cid"], "patched module does not import", job.abort, job.collected)
                         fail = set(num_to_id)
@@ -3975,8 +4061,11 @@ def main():
                 results[p["cid"]] = listing(p)
     signal.setitimer(signal.ITIMER_REAL, 0)
     log("loop done cpu=%.2f" % time.process_time())
+    out = {cid: split(sorted(results.get(cid, set(num_to_id))), ms) for cid in commits}
+    by_cid = {p["cid"]: p for p in plans}
+    diag_pad(out, by_cid, id_to_num.get(MEMO_TEST), ms, split_cost)
     for cid in commits:
-        workers = split(sorted(results.get(cid, set(num_to_id))), ms)
+        workers = out[cid]
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
         WRITTEN.add(cid)
     sys.stdout.flush()
