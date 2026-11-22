@@ -4,6 +4,7 @@ import sys
 import time
 
 SRC, OUT = sys.argv[1], sys.argv[2]
+REF = pickle.load(open(sys.argv[3], "rb"))["ds"] if len(sys.argv) > 3 and os.path.exists(sys.argv[3]) else {}
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SRC)
 os.chdir(SRC)
@@ -82,7 +83,7 @@ def h_opt(expression, schema, **kw):
     setcur(("opt", state["q"]))
     o = real_opt(expression, schema, **kw)
     setcur(("frame", state["q"]))
-    state["o"] = pickle.dumps(o, protocol=5)
+    state["o"] = ck.dumps(o)
     o = pickle.loads(state["o"])
     state["osql"] = o.sql(pretty=True)
     return o
@@ -144,15 +145,18 @@ def sweep(lin, record):
         qt = time.process_time() - t0
         setcur(None)
         if record:
-            nat = real_px(tables=real_et(arg)).execute(real_plan(real_opt(pickle.loads(pickle.dumps(te.parse_one(sql))), te.TPCDS_SCHEMA, leave_tables_isolated=True)))
-            if nat.columns != res.columns or nat.rows != res.rows:
-                raise SystemExit("pinned AST result differs on query %d" % i)
+            pn = real_plan(real_opt(pickle.loads(pickle.dumps(te.parse_one(sql))), te.TPCDS_SCHEMA, leave_tables_isolated=True))
+            pp = real_plan(pickle.loads(state["o"]))
+            ns, ps = ck.step_sigs(pn), ck.step_sigs(pp)
+            if sorted(ns.values()) != sorted(ps.values()) or ns[pn.root] != ps[pp.root] or ck.plan_ctes(pn) != ck.plan_ctes(pp):
+                raise SystemExit("pinned AST plan differs on query %d" % i)
             setcur(None)
             recd = state["recd"]
-            pp = real_plan(pickle.loads(state["o"]))
-            ps = ck.step_sigs(pp)
-            queries[i] = {"planblob": pickle.dumps((pp, ps), protocol=5), "root": ps[pp.root], "ctes": ck.plan_ctes(pp), "pdig": state["pdig"], "schema": state["schema"], "kw": state["kw"], "opt": state["o"], "osql": state["osql"], "sigs": sorted(state["sigs"].values()), "steps": recd.steps, "result": pickle.dumps(res, protocol=5), "qtime": qt, "tables": sorted(arg)}
+            queries[i] = {"planblob": ck.dumps((pp, ps)), "root": ps[pp.root], "ctes": ck.plan_ctes(pp), "pdig": state["pdig"], "schema": state["schema"], "kw": state["kw"], "opt": state["o"], "osql": state["osql"], "sigs": sorted(state["sigs"].values()), "steps": recd.steps, "result": pickle.dumps(res, protocol=5), "qtime": qt, "tables": sorted(arg)}
             inst = k("test_execute_tpcds")
+            d = te.transpile(sql, write="duckdb")[0]
+            if sql not in k.cache and d in REF:
+                k.cache[sql] = pickle.loads(REF[d])
             frames[sql] = inst.cached_execute(sql, tpch=False)
             inst.subtestHelper(i, res, tpch=False)
 
