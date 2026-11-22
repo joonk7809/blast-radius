@@ -6,6 +6,7 @@ import enum
 import gc
 import gzip
 import importlib
+import importlib.util
 import json
 import logging
 import marshal
@@ -111,6 +112,7 @@ INERT = os.environ.get("BR_INERT", "1") == "1"
 RAWBIN = os.environ.get("BR_RAWBIN", "1") == "1"
 PYTEST_CFG = ("conftest.py", "pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml", "tox.ini")
 PYTEST_DIRS = ("", "tests", "tests/dialects")
+XUNIT_NAMES = {"setUpModule", "tearDownModule", "setup_module", "teardown_module", "setup_package", "teardown_package", "setup", "teardown", "load_tests", "setup_function", "teardown_function", "setup_method", "teardown_method", "setup_class", "teardown_class"}
 if GCOFF:
     gc.disable()
 
@@ -1365,7 +1367,7 @@ def _inert_change(old_text, new_text):
     for node in b.body:
         if i < len(da) and ast.dump(node) == da[i]:
             i += 1
-        elif not _plain_def(node, lazy) or node.name in taken or node.name.startswith("__"):
+        elif not _plain_def(node, lazy) or node.name in taken or node.name.startswith(("__", "test", "Test", "pytest_")) or node.name in XUNIT_NAMES:
             return False
         else:
             taken.add(node.name)
@@ -1410,8 +1412,28 @@ def _pytest_config(path, old_text, new_text):
     return bool(marker) and any(marker in (t or "") for t in (old_text, new_text))
 
 
+def _shadows_module(path):
+    head = path.split("/")[0]
+    if not path.endswith(".py") or head in ("sqlglot", "tests", "sqlglotc"):
+        return False
+    if "/" in path and path != head + "/__init__.py" and not os.path.exists(os.path.join(SRC, head, "__init__.py")):
+        return False
+    name = head[:-3] if "/" not in path else head
+    if name in sys.stdlib_module_names:
+        return True
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return True
+
+
 def _candidates_for(f, old_text, new_text, cov, notes):
     path = f["path"]
+    if PATHRULES and (_shadows_module(path) or f["old"] and _shadows_module(f["old"])):
+        notes.append("shadows-module")
+        every = full(n for n in cov.idx_to_num if n is not None)
+        FORCE_LIST.update(every)
+        return every
     if PATHRULES and _pytest_config(path, old_text, new_text):
         notes.append("pytest-config")
         every = full(n for n in cov.idx_to_num if n is not None)
@@ -1546,7 +1568,7 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                 notes.append("test-dependents:%d" % len(hit))
                 out.update(n for tf in hit for n in cov.by_file.get(tf, []))
             return out
-        if INERT and old_text is not None and new_text is not None and _inert_change(old_text, new_text):
+        if INERT and os.path.basename(path) not in ("__init__.py", "conftest.py") and old_text is not None and new_text is not None and _inert_change(old_text, new_text):
             notes.append("test-support-inert")
             return set()
         if INERT and os.path.basename(path) != "__init__.py" and not importers(modname_of(path), None, "tests") and not importers(modname_of(path), None, "sqlglot"):
