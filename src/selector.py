@@ -88,6 +88,7 @@ CLOSURE = os.environ.get("BR_CLOSURE", "1") == "1"
 IMPORTBODY = os.environ.get("BR_IMPORTBODY", "1") == "1"
 CACHESITE = os.environ.get("BR_CACHESITE", "1") == "1"
 HELPERS = os.environ.get("BR_HELPERS", "1") == "1"
+LEANHDR = os.environ.get("BR_LEANHDR", "1") == "1"
 HELPERS2 = os.environ.get("BR_HELPERS2", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
 PLAN_FRAC = float(os.environ.get("BR_PLAN_FRAC", "0.35"))
@@ -1878,11 +1879,28 @@ def _outer_fns(nodes, pre=""):
     return out
 
 
-def _fn_at(fns, ln):
+def _fn_at(fns, ln, header=False):
     for q, fn in fns:
-        if fn.body[0].lineno <= ln <= fn.end_lineno:
+        top = min([fn.lineno] + [d.lineno for d in fn.decorator_list]) if header else fn.body[0].lineno
+        if top <= ln <= fn.end_lineno:
             return q, fn
     return None
+
+
+def new_side_split(hunks):
+    plus, anchors = set(), set()
+    for h in hunks:
+        ln = h["new_start"]
+        for tag, _ in h["lines"]:
+            if tag == "+":
+                plus.add(ln)
+                ln += 1
+            elif tag == "-":
+                anchors.add(ln)
+                anchors.add(ln - 1)
+            else:
+                ln += 1
+    return plus, anchors
 
 
 def lean_gate(notes, patched, old_by, hunks_by):
@@ -1905,11 +1923,12 @@ def lean_gate(notes, patched, old_by, hunks_by):
         removed, anchors = changed_old_lines(hunks_by[rel])
         old_fns = _outer_fns(parse_cached(old).body)
         by_q = dict(old_fns)
-        for text, lines, fns in ((old, removed | anchors, old_fns), (new, new_side_lines(hunks_by[rel]), None)):
+        plus, new_anchors = new_side_split(hunks_by[rel])
+        for text, lines, pinned, fns in ((old, removed | anchors, anchors - removed, old_fns), (new, plus | new_anchors, new_anchors - plus, None)):
             src = text.split("\n")
             fns = fns or _outer_fns(parse_cached(text).body)
             for ln in lines:
-                hit = _fn_at(fns, ln)
+                hit = _fn_at(fns, ln, LEANHDR and ln in pinned)
                 if hit is None:
                     if 0 < ln <= len(src) and src[ln - 1].strip():
                         return False
