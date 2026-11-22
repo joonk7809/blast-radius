@@ -94,9 +94,11 @@ class Parsed:
 
 
 class Session(Reach):
-    def __init__(self, store, pristine, patch_text, budget=None, force_native=False):
-        with open(os.path.join(store, "ck2.pkl"), "rb") as fh:
-            self.D = pickle.load(fh)
+    def __init__(self, store, pristine, patch_text, budget=None, force_native=False, D=None):
+        if D is None:
+            with open(os.path.join(store, "ck2.pkl"), "rb") as fh:
+                D = pickle.load(fh)
+        self.D = D
         self.store, self.budget = store, budget
         self.Q = self.D["queries"]
         self.by_pdig = {r["pdig"]: i for i, r in self.Q.items()}

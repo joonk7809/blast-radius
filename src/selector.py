@@ -119,6 +119,7 @@ CK_P = float(os.environ.get("BR_CK_P", "0.45"))
 CK_S = float(os.environ.get("BR_CK_S", "1.25"))
 CK_B = float(os.environ.get("BR_CK_B", "2.0"))
 CK_BUDGET = float(os.environ.get("BR_CK_BUDGET", "1e9"))
+LEANPRE = os.environ.get("BR_LEANPRE", "1") == "1"
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
 PATHRULES = os.environ.get("BR_PATHRULES", "1") == "1"
@@ -2946,11 +2947,36 @@ def _over_budget(signum, frame):
 
 
 _CKINFO = []
+_LEANPRE = {}
+
+
+def _table_code(mod):
+    owners = [mod] + [v for _, v in sorted(vars(mod).items()) if isinstance(v, type) and v.__module__ == mod.__name__]
+    return [(o.__name__, k, v, getattr(v, "__code__", None)) for o in owners for k, v in sorted(vars(o).items()) if callable(v) or isinstance(v, (classmethod, staticmethod, property))]
+
+
+def lean_preload(ck):
+    import sqlglot.executor.table as tm
+    with open(os.path.join(HERE, "tpc", "lean.pkl"), "rb") as fh:
+        ref = pickle.load(fh)
+    tables = {}
+    for table in ref["schema"]:
+        with open(os.path.join(HERE, "tpc", "ds.%s.m" % table), "rb") as fh:
+            tables[table] = tm.Table(columns=ref["schema"][table], rows=marshal.loads(fh.read()))
+    _LEANPRE.update(ref=ref, tables=pickle.loads(pickle.dumps(tables)), mod=tm, code=_table_code(tm))
+    if ck:
+        with open(os.path.join(HERE, "tpc", "ck", "ck2.pkl"), "rb") as fh:
+            _LEANPRE["ck"] = pickle.load(fh)
 
 
 def lean_run(order, stop, optcache, budgets, total, ck=None, duck=False):
-    with open(os.path.join(HERE, "tpc", "lean.pkl"), "rb") as fh:
-        ref = pickle.load(fh)
+    import sqlglot.executor.table as tm
+    pre = _LEANPRE if _LEANPRE and sys.modules.get("sqlglot.executor.table") is _LEANPRE["mod"] and _table_code(tm) == _LEANPRE["code"] else {}
+    if pre:
+        ref = pre["ref"]
+    else:
+        with open(os.path.join(HERE, "tpc", "lean.pkl"), "rb") as fh:
+            ref = pickle.load(fh)
     queries, schema = ref["queries"], ref["schema"]
     from sqlglot import find_tables, parse_one
     import sqlglot.executor as X
@@ -2960,12 +2986,15 @@ def lean_run(order, stop, optcache, budgets, total, ck=None, duck=False):
     signal.signal(signal.SIGVTALRM, _over_budget)
     signal.signal(signal.SIGPROF, _over_budget)
     signal.setitimer(signal.ITIMER_PROF, total)
-    tables = {}
-    for kind, names in (("h", ref["hschema"]), ("ds", schema)):
-        for table in names:
-            with open(os.path.join(HERE, "tpc", "%s.%s.m" % (kind, table)), "rb") as fh:
-                tables[kind, table] = Table(columns=names[table], rows=marshal.loads(fh.read()))
-    tables = pickle.loads(pickle.dumps({t: v for (kind, t), v in tables.items() if kind == "ds"}))
+    if pre:
+        tables = pre["tables"]
+    else:
+        tables = {}
+        for kind, names in (("h", ref["hschema"]), ("ds", schema)):
+            for table in names:
+                with open(os.path.join(HERE, "tpc", "%s.%s.m" % (kind, table)), "rb") as fh:
+                    tables[kind, table] = Table(columns=names[table], rows=marshal.loads(fh.read()))
+        tables = pickle.loads(pickle.dumps({t: v for (kind, t), v in tables.items() if kind == "ds"}))
     if optcache:
         real, opt = X.optimize, ref["opt"]
 
@@ -2979,7 +3008,7 @@ def lean_run(order, stop, optcache, budgets, total, ck=None, duck=False):
         X.optimize = cached
     if ck is not None:
         ckhooks = _ckhooks()
-        S = ckhooks.Session(os.path.join(HERE, "tpc", "ck"), SRC, ck, min(total, CK_BUDGET))
+        S = ckhooks.Session(os.path.join(HERE, "tpc", "ck"), SRC, ck, min(total, CK_BUDGET), D=pre.get("ck"))
         S.install(X)
         first = [i for i in S.order_hint() if i in order]
         order = first + [i for i in order if i not in first]
@@ -3837,6 +3866,8 @@ def main():
             warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
             code_idx = zygote.code_index({os.path.join(SRC, r) for p in plans for r in p["patched"] if r.endswith(".py")})
             zyg = (zygote, warm_lines, code_idx)
+            if LEANPRE and any(p["lean"] for p in plans):
+                lean_preload(any(p["lean"][4] is not None for p in plans if p["lean"]))
             if GCFREEZE:
                 _PARSED.clear()
                 gc.collect()
