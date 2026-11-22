@@ -111,9 +111,9 @@ LEAN_SEED = [int(x) for x in os.environ.get("BR_LEAN_SEED", "8,5,96").split(",")
 LEAN_MEM = int(float(os.environ.get("BR_LEAN_MEM_MB", "512")) * 1048576)
 LEAN_WALL = float(os.environ.get("BR_LEAN_WALL", "90"))
 LEAN_OPT_COST = float(os.environ.get("BR_LEAN_OPT_COST", "12.0"))
-CKHOOKS = os.environ.get("BR_CKHOOKS", "0") == "1"
+CKHOOKS = os.environ.get("BR_CKHOOKS", "1") == "1"
 LEANWIDE = os.environ.get("BR_LEANWIDE", "0") == "1"
-CK_C = float(os.environ.get("BR_CK_C", "2.0"))
+CK_C = float(os.environ.get("BR_CK_C", "1.5"))
 CK_K = float(os.environ.get("BR_CK_K", "0.5"))
 CK_R = float(os.environ.get("BR_CK_R", "0.25"))
 T0 = time.monotonic()
@@ -1994,7 +1994,7 @@ def ck_price(text, u, native):
     r = _ckhooks().Reach(lines, queries, text, SRC)
     if r.allq or r.imp:
         return native
-    rerun = r.frame | r.plan_q | r.opt_q
+    rerun = r.frame | r.opt_q
     return min(native, CK_C + sum((CK_K if q in rerun else CK_R) * u.get("f:%d" % q, 0) for q in r.hot()))
 
 
@@ -3005,7 +3005,7 @@ def lean_run(order, stop, optcache, budgets, total, ck=None, duck=False):
     signal.setitimer(signal.ITIMER_PROF, 0)
     if ck is not None:
         S.restore()
-        _CKINFO.append(json.dumps({"spent": round(S.spent, 3), "nogo": S.nogo, "fb": S.fb[:8], "stats": S.stats}, separators=(",", ":")))
+        _CKINFO.append(json.dumps({"spent": round(S.spent, 3), "nogo": S.nogo, "fb": S.fb[:8], "stats": S.stats, "T": {k: round(v, 3) for k, v in S.T.items()}}, separators=(",", ":")))
     return bad
 
 
@@ -3701,7 +3701,7 @@ def main():
                 else:
                     order = lean_order(need, u)
                     price = LEAN_OPT_COST if optcache else LEAN_COST
-                    if CKHOOKS:
+                    if CKHOOKS and narrow:
                         price = ck_price(text, u, price)
                 if LEANCAL:
                     picks = {k: [int(q[2:]) for q in canary_pick(need, u, k)] for k in (0, 2, 4, 8)}
@@ -3712,8 +3712,8 @@ def main():
                     heavy, light, cap, blind = (h2 - {memo_n}, sorted(set(l2) | {memo_n}), 1e9, b2) if LEANCAL else (h2, l2, c2, b2)
                     if blind:
                         heavy, light, blind = heavy - {memo_n}, [memo_n], None
-                    notes = notes + ["lean%s%s%s%s:%.1f" % (":k%d" % CANARY_K if CANARY_K else "", ":opt" if optcache else "", ":wide" if wide else "", ":ck%.1f" % price if CKHOOKS else "", saving)]
-                    lean = (order, optcache, {} if LEANCAL else {int(q[2:]): BUDGET_K * c + BUDGET_C for q, c in u.items()}, 1e6 if LEANCAL else saving / LEAN_SCALE, text if CKHOOKS else None, wide)
+                    notes = notes + ["lean%s%s%s%s:%.1f" % (":k%d" % CANARY_K if CANARY_K else "", ":opt" if optcache else "", ":wide" if wide else "", ":ck%.1f" % price if CKHOOKS and narrow else "", saving)]
+                    lean = (order, optcache, {} if LEANCAL else {int(q[2:]): BUDGET_K * c + BUDGET_C for q, c in u.items()}, 1e6 if LEANCAL else saving / LEAN_SCALE, text if CKHOOKS and narrow else None, wide)
             if blind:
                 notes.insert(0, blind)
             sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light if not (lean and n == memo_n)}
@@ -3958,7 +3958,7 @@ def main():
                     top = sorted(job.tcpu.items(), key=lambda kv: -kv[1])[:4]
                     log(p["cid"], "testcpu=%.2f" % sum(job.tcpu.values()), "top", " ".join("%s:%.2f" % (t.split("::")[-1], c) for t, c in top))
                     log(p["cid"], "fail", sorted(fail), "heavy", sorted(p["heavy"]), "cpu=%.2f" % job.cpu, "t=%.1f" % (time.monotonic() - T0))
-                    if p["lean"] and CKHOOKS:
+                    if p["lean"] and p["lean"][4] is not None:
                         log(p["cid"], "lean", job.status.get(MEMO_TEST), job.tcpu.get(MEMO_TEST), getattr(job, "lean", None))
     except BaseException as e:
         signal.setitimer(signal.ITIMER_REAL, 0)
