@@ -1,6 +1,7 @@
 import ast
 import bisect
 import enum
+import gc
 import gzip
 import importlib
 import json
@@ -67,6 +68,9 @@ COLLECT = os.environ.get("BR_COLLECT", "1") == "1"
 IMPORTT = os.environ.get("BR_IMPORTT", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
 T0 = time.monotonic()
+GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
+if GCOFF:
+    gc.disable()
 
 
 def log(*a):
@@ -2240,11 +2244,13 @@ def main():
         code_idx = zygote.code_index({os.path.join(SRC, r) for p in plans for r in p["patched"] if r.endswith(".py")})
         zyg = (zygote, warm_lines, code_idx)
         if GCFREEZE:
-            import gc
             _PARSED.clear()
             gc.collect()
             gc.freeze()
         log("zygote warm done t=%.1f cpu=%.2f" % (time.monotonic() - T0, time.process_time()))
+    if GCOFF:
+        gc.freeze()
+        gc.enable()
     results = {}
     pending = [p for p in plans if p["light"] or p["probe"]]
     for p in plans:
