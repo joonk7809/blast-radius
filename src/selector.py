@@ -74,6 +74,8 @@ PROBE = os.environ.get("BR_PROBE", "1") == "1"
 COLLECT = os.environ.get("BR_COLLECT", "1") == "1"
 IMPORTT = os.environ.get("BR_IMPORTT", "1") == "1"
 CLOSURE = os.environ.get("BR_CLOSURE", "1") == "1"
+IMPORTBODY = os.environ.get("BR_IMPORTBODY", "1") == "1"
+CACHESITE = os.environ.get("BR_CACHESITE", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
@@ -486,6 +488,7 @@ class Units:
         return out or [(0, enc[0], enc[1], enc[3], enc[4])]
 
 
+CACHE_SITES = json.load(open(os.path.join(HERE, "cachesites.json"))) if CACHESITE else {}
 IMPORT_LAMBDAS = {tuple(x) for x in json.load(open(os.path.join(HERE, "importlambdas.json")))} if LAMBDAS else set()
 
 
@@ -1177,6 +1180,8 @@ def _candidates_for(f, old_text, new_text, cov, notes):
             return merge(cov.tests_touching_file(path), extra)
         out = {}
         importtime = False
+        at_import = set(cov.files.get(path, {}).get("import", ())) if IMPORTBODY else set()
+        body = False
         try:
             new_units = Units(new_text, added_new_lines(f["hunks"]))
         except SyntaxError:
@@ -1184,6 +1189,18 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         lam = LAMBDAS and new_units is not None and lambda_only(path, units, new_units, f["hunks"])
         if lam:
             notes.append("lambda-only")
+        site = CACHE_SITES.get(path)
+        if site:
+            touched = {ln for h in f["hunks"] for part in changed_old_lines([h]) for ln in part}
+            if any(a <= ln <= b for a, b in site["lazy"] for ln in touched):
+                notes.append("lazy-getattr")
+                every = full(n for n in cov.idx_to_num if n is not None)
+                FORCE_LIST.update(every)
+                return every
+            for fill, readers in site["memo"]:
+                if any(a <= ln <= b for a, b in fill for ln in touched):
+                    notes.append("memo-site")
+                    merge(out, full(cov.tests_for_lines(path, readers)))
         for h in f["hunks"]:
             hr, ha = changed_old_lines([h])
             found = {ln: units.unit_for(ln) for ln in sorted(hr | ha)}
@@ -1193,6 +1210,8 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                     merge(out, cov.tests_for_lines(path, range(first, last + 1)))
                     if not runtime and not (lam and isinstance(node, ast.Lambda)):
                         importtime = True
+                    elif runtime and not at_import.isdisjoint(range(first, last + 1)):
+                        body = True
         for ln in added_new_lines(f["hunks"]) if new_units is not None else ():
             u = new_units.unit_for(ln)
             if u is None or u[3] or lam and isinstance(u[4], ast.Lambda):
@@ -1206,7 +1225,9 @@ def _candidates_for(f, old_text, new_text, cov, notes):
         if SHARED and new_units is not None and shared_writes(parse_cached(new_text), set(added_new_lines(f["hunks"])), new_text):
             notes.append("shared-write")
             return full(n for n in cov.idx_to_num if n is not None)
-        if importtime:
+        if body:
+            notes.append("import-body")
+        if importtime or body:
             notes.append("importtime")
             if not IMPORTT:
                 merge(out, cov.tests_touching_file(path))
@@ -2495,14 +2516,22 @@ def main():
                 import importtime as itf
                 if ITF_UNITS:
                     extra, info = itf.extra_candidates_units(text, root=SRC, with_info=True)
+                    whole = "import-body" in notes
                     for n, keys in extra.items():
                         if n in num_to_id:
+                            keys = None if whole else keys
                             if keys is not None:
                                 FRACTION_OK.add(n)
                             merge(cands, {n: keys})
                 else:
                     extra, info = itf.extra_candidates(text, root=SRC, with_info=True)
                     merge(cands, full(n for n in extra if n in num_to_id))
+                if "import-body" in notes and "dynamic_paths" not in info:
+                    dyn, dinfo = itf.dynamic_extra_candidates(text, root=SRC, items=True)
+                    if dinfo.get("error"):
+                        raise RuntimeError("dynamic")
+                    notes.append("dynamic:%d" % len(dyn))
+                    merge(cands, full(n for n in itf.items_to_units(dyn) if n in num_to_id))
                 notes.append("itf:%d%s" % (len(extra), "" if info.get("confident", True) else ":unconfident"))
             except Exception as e:
                 notes.append(f"itf-error:{type(e).__name__}")

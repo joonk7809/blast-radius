@@ -7,7 +7,7 @@ import selector, zygote
 selector.preimport()
 selector.install_futures()
 tests = json.load(open("/data/tests.json"))["tests"]
-zygote.warm("/sqlglot", [t["id"] for t in tests])
+zygote.warm("/sqlglot", [t["id"] for t in tests], True, True)
 cov.stop()
 data = cov.get_data()
 out = {}
