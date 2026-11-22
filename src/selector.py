@@ -50,6 +50,7 @@ UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 DOCSTRIP = os.environ.get("BR_DOCSTRIP", "1") == "1"
 DOC = [False]
+SEGPARSE = os.environ.get("BR_SEGPARSE", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
 RUN_K = float(os.environ.get("BR_RUN_K", "1.0"))
@@ -1402,6 +1403,7 @@ def partial_purge(root):
     return sorted((dead & ours) - gone - {n for n in dead if n.startswith("tests")}, key=lambda n: n.count("."))
 STMT_OF = {}
 _STMT_TREES = {}
+_STMT_LINES = {}
 
 
 def _stmt_tree(path):
@@ -1412,13 +1414,70 @@ def _stmt_tree(path):
     return t
 
 
-def _skippable(st, local):
+def _stmt_lines(path):
+    t = _STMT_LINES.get(path)
+    if t is None:
+        with open(path, encoding="utf-8") as fh:
+            t = _STMT_LINES[path] = fh.readlines()
+    return t
+
+
+def _code_end(code):
+    end = max((p[1] for p in code.co_positions() if p[1] is not None), default=code.co_firstlineno)
+    return max([end] + [_code_end(c) for c in code.co_consts if isinstance(c, types.CodeType)])
+
+
+def _stmt_node(path, cls, meth, code):
+    line = code.co_firstlineno
+    if SEGPARSE and code.co_qualname == cls + "." + meth and code.co_filename.endswith("/" + path):
+        try:
+            lines = _stmt_lines(os.path.join(SRC, path))
+            end = _code_end(code)
+            indent = len(lines[line - 1]) - len(lines[line - 1].lstrip())
+            rest = next((x for x in lines[end:] if x.strip() and not x.lstrip().startswith("#")), "")
+            if rest and len(rest) - len(rest.lstrip()) > indent:
+                import inspect
+                end = line - 1 + len(inspect.getblock(lines[line - 1:]))
+            tree = ast.parse("\n" * (line - 2) + "class _:\n" + "".join(lines[line - 1:end]))
+            f = tree.body[0].body[0]
+            if len(tree.body) == 1 and len(tree.body[0].body) == 1 and isinstance(f, ast.FunctionDef) and f.name == meth:
+                return None if f.decorator_list or f.lineno != line else f
+        except Exception:
+            pass
+    node = None
+    for c in _stmt_tree(os.path.join(SRC, path)).body:
+        if isinstance(c, ast.ClassDef) and c.name == cls:
+            for f in c.body:
+                if isinstance(f, ast.FunctionDef) and f.name == meth and not f.decorator_list and f.lineno == line:
+                    node = f
+    return node
+
+
+def _scan(node):
+    ids, stores = set(), set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if type(n) is ast.Name:
+            ids.add(n.id)
+            if isinstance(n.ctx, (ast.Store, ast.Del)):
+                stores.add(n.id)
+        for f in n._fields:
+            v = getattr(n, f, None)
+            if type(v) is list:
+                stack.extend(x for x in v if isinstance(x, ast.AST))
+            elif isinstance(v, ast.AST):
+                stack.append(v)
+    return ids, stores
+
+
+def _skippable(st, ids, local):
     if not isinstance(st, ast.Expr) or not isinstance(st.value, ast.Call):
         return False
     f = st.value.func
     if not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "self"):
         return False
-    return not any(isinstance(n, ast.Name) and n.id in local for n in ast.walk(st))
+    return not ids & local
 
 
 def stmt_filter(case, tid, allowed, patched):
@@ -1432,27 +1491,23 @@ def stmt_filter(case, tid, allowed, patched):
     code = getattr(fn, "__code__", None)
     if code is None or code.co_freevars or "super" in code.co_names or "__class__" in code.co_names:
         return False
-    tree = _stmt_tree(os.path.join(SRC, path))
-    node = None
-    for c in tree.body:
-        if isinstance(c, ast.ClassDef) and c.name == cls:
-            for f in c.body:
-                if isinstance(f, ast.FunctionDef) and f.name == meth and not f.decorator_list and f.lineno == code.co_firstlineno:
-                    node = f
+    node = _stmt_node(path, cls, meth, code)
     if node is None:
         return False
     need = {int(k[2:]) for k in allowed if k.startswith("t:")} | {smap[k] for k in allowed if k in smap}
-    local = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del))} | {a.arg for a in ast.walk(node.args) if isinstance(a, ast.arg) and a.arg != "self"}
+    scans = [_scan(st) for st in node.body]
+    local = {a.arg for a in ast.walk(node.args) if isinstance(a, ast.arg) and a.arg != "self"}
+    local |= {n for part in (node.args, node.returns) if part is not None for n in _scan(part)[1]}
+    local |= {n for _, stores in scans for n in stores}
     body = []
     for i, st in enumerate(node.body):
-        if i in need or not _skippable(st, local):
+        if i in need or not _skippable(st, scans[i][0], local):
             body.append(st)
         else:
             body.append(ast.copy_location(ast.Pass(), st))
     new = ast.FunctionDef(name=node.name, args=node.args, body=body, decorator_list=[], returns=node.returns, type_comment=None, type_params=[])
     ast.copy_location(new, node)
     mod = ast.Module(body=[new], type_ignores=[])
-    ast.fix_missing_locations(mod)
     ns = {}
     exec(compile(mod, code.co_filename, "exec"), sys.modules[type(case).__module__].__dict__, ns)
     setattr(case, meth, types.MethodType(ns[meth], case))
