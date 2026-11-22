@@ -1756,6 +1756,8 @@ def _candidates_for(f, old_text, new_text, cov, notes):
                     merge(out, full(cov.tests_for_lines(path, readers)))
         for h in f["hunks"]:
             hr, ha = changed_old_lines([h])
+            if LEANHDR:
+                ha -= _body_head_anchors(h, units)
             found = {ln: units.unit_for(ln) for ln in sorted(hr | ha)}
             gap = GAPS and not any(found.values())
             for ln, u in found.items():
@@ -1901,6 +1903,21 @@ def new_side_split(hunks):
             else:
                 ln += 1
     return plus, anchors
+
+
+def _body_head_anchors(h, units):
+    out = set()
+    ln = h["old_start"] if h["old_len"] else h["old_start"] + 1
+    prev = " "
+    for tag, _ in h["lines"]:
+        if tag == "+" and prev == " ":
+            u = units.unit_for(ln - 1)
+            if u and not u[3] and isinstance(u[4], (ast.FunctionDef, ast.AsyncFunctionDef)) and u[4].body[0].lineno == ln > u[4].lineno:
+                out.add(ln - 1)
+        if tag != "+":
+            ln += 1
+        prev = tag if tag != "+" or prev == " " else prev
+    return out
 
 
 def lean_gate(notes, patched, old_by, hunks_by):
