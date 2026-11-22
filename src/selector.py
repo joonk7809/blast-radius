@@ -101,7 +101,7 @@ LEAN = os.environ.get("BR_LEAN", "1") == "1"
 CANARY_K = int(os.environ.get("BR_CANARY_K", "0"))
 CANARY_SCALE = float(os.environ.get("BR_CANARY_SCALE", "0.65"))
 LEAN_COST = float(os.environ.get("BR_LEAN_COST", "15.5"))
-LEAN_SCALE = float(os.environ.get("BR_LEAN_SCALE", "1.3"))
+LEAN_SCALE = float(os.environ.get("BR_LEAN_SCALE", "1.0"))
 BUDGET_K = float(os.environ.get("BR_LEAN_BUDGET_K", "3.0"))
 BUDGET_C = float(os.environ.get("BR_LEAN_BUDGET_C", "0.3"))
 LEAN_ROOM = float(os.environ.get("BR_LEAN_ROOM", "0.5"))
