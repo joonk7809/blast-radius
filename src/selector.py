@@ -89,7 +89,7 @@ IMPORTBODY = os.environ.get("BR_IMPORTBODY", "1") == "1"
 CACHESITE = os.environ.get("BR_CACHESITE", "1") == "1"
 HELPERS = os.environ.get("BR_HELPERS", "0") == "1"
 LEANHDR = os.environ.get("BR_LEANHDR", "1") == "1"
-LEANOPT = os.environ.get("BR_LEANOPT", "0") == "1"
+LEANOPT = os.environ.get("BR_LEANOPT", "1") == "1"
 HELPERS2 = os.environ.get("BR_HELPERS2", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
 PLAN_FRAC = float(os.environ.get("BR_PLAN_FRAC", "0.35"))
@@ -2697,6 +2697,10 @@ def _plan_sig(plan):
     return len(out), sorted(map(repr, out))
 
 
+def _ast_shape(e):
+    return [(type(n).__name__, sorted((k, type(v).__name__, len(v) if isinstance(v, list) else -1) for k, v in n.args.items())) for n in e.walk()]
+
+
 def lean_reference(te, k):
     import sqlglot.executor as X
     real = X.optimize
@@ -2730,7 +2734,8 @@ def lean_reference(te, k):
         X.optimize = real
     from sqlglot.planner import Plan
     for key, out in check:
-        if _plan_sig(Plan(pickle.loads(opt[key]))) != _plan_sig(Plan(out)):
+        got = pickle.loads(opt[key])
+        if _ast_shape(got) != _ast_shape(out) or _plan_sig(Plan(got)) != _plan_sig(Plan(out)):
             raise SystemExit("lean optcache: cached optimized AST plans differently from optimize()")
     root = os.path.abspath(SRC) + os.sep
     return {"schema": te.TPCDS_SCHEMA, "hschema": te.TPCH_SCHEMA, "queries": queries, "opt": opt, "optfiles": sorted(os.path.relpath(f, root) for f in files if os.path.abspath(f).startswith(root) and os.path.isfile(f))}
