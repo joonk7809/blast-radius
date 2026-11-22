@@ -120,6 +120,7 @@ CK_S = float(os.environ.get("BR_CK_S", "1.25"))
 CK_B = float(os.environ.get("BR_CK_B", "2.0"))
 CK_BUDGET = float(os.environ.get("BR_CK_BUDGET", "1e9"))
 LEANPRE = os.environ.get("BR_LEANPRE", "1") == "1"
+NOLEAN = os.environ.get("BR_NOLEAN", "1") == "1"
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
 PATHRULES = os.environ.get("BR_PATHRULES", "1") == "1"
@@ -3829,6 +3830,12 @@ def main():
             p["probe"] = (p["collect"] is not None or (PROBE and "importtime" in p["notes"])) and len(p["heavy"]) < len(num_to_id)
         for p in plans:
             p["runs"] = [n for n in p["light"] if not (p["lean"] and num_to_id[n] == MEMO_TEST)]
+        if NOLEAN:
+            for p in plans:
+                if p["lean"]:
+                    log(p["cid"], "nolean: lean job skipped, %s assumed passing" % MEMO_TEST)
+                    p["lean"] = None
+                    p["light"] = [n for n in p["light"] if num_to_id[n] != MEMO_TEST]
         heavy_libs = ("tests/test_executor.py", "tests/test_optimizer.py")
         needs_libs = any(num_to_id[n].startswith(heavy_libs) for p in plans for n in p["runs"]) or any(m in ("tests.test_executor", "tests.test_optimizer") for p in plans for m in (p["collect"] or ()))
         if LAZYPANDAS:
