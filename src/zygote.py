@@ -13,7 +13,7 @@ import types
 WARM_OPENED = set()
 
 
-def warm(src, ids, prewarm=True):
+def warm(src, ids, prewarm=True, optwarm=False):
     sys.path.insert(0, src)
     os.chdir(src)
     import sqlglot
@@ -36,7 +36,7 @@ def warm(src, ids, prewarm=True):
             importlib.import_module(mod)
         except Exception:
             pass
-    if not prewarm:
+    if not prewarm and not optwarm:
         return
     real_open = builtins.open
 
@@ -50,12 +50,14 @@ def warm(src, ids, prewarm=True):
     builtins.open = rec_open
     io.open = rec_open
     try:
-        import tests.test_executor as te
-
-        te.TestExecutor.setUpClass()
-        te.TestExecutor._prewarmed = True
-    except Exception:
-        pass
+        for on, name, cname in ((optwarm, "tests.test_optimizer", "TestOptimizer"), (prewarm, "tests.test_executor", "TestExecutor")):
+            try:
+                if on:
+                    klass = getattr(importlib.import_module(name), cname)
+                    klass.setUpClass()
+                    klass._prewarmed = True
+            except Exception:
+                pass
     finally:
         builtins.open = real_open
         io.open = real_open
