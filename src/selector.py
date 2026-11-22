@@ -123,8 +123,8 @@ CK_BUDGET = float(os.environ.get("BR_CK_BUDGET", "1e9"))
 LEANPRE = os.environ.get("BR_LEANPRE", "1") == "1"
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
-MEMO_KILL_K = float(os.environ.get("BR_MEMO_KILL_K", "1.5"))
-MEMO_KILL_C = float(os.environ.get("BR_MEMO_KILL_C", "2.0"))
+MEMO_KILL_K = float(os.environ.get("BR_MEMO_KILL_K", "1.25"))
+MEMO_KILL_C = float(os.environ.get("BR_MEMO_KILL_C", "1.0"))
 PATHRULES = os.environ.get("BR_PATHRULES", "1") == "1"
 TESTSIDE = os.environ.get("BR_TESTSIDE", "1") == "1"
 LAZYGONE = os.environ.get("BR_LAZYGONE", "1") == "1"
