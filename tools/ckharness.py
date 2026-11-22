@@ -7,7 +7,7 @@ import time
 SRC, STORE, PATCH = sys.argv[1], sys.argv[2], sys.argv[3]
 MODE = sys.argv[4] if len(sys.argv) > 4 else "ck"
 BUDGET = float(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] != "-" else None
-HERE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+HERE = os.environ.get("CK_SRC") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, HERE)
 import ckhooks
 
