@@ -115,6 +115,7 @@ LEANWIDE = os.environ.get("BR_LEANWIDE", "0") == "1"
 CK_C = float(os.environ.get("BR_CK_C", "1.5"))
 CK_K = float(os.environ.get("BR_CK_K", "0.5"))
 CK_R = float(os.environ.get("BR_CK_R", "0.25"))
+CK_BUDGET = float(os.environ.get("BR_CK_BUDGET", "2.0"))
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
 PATHRULES = os.environ.get("BR_PATHRULES", "1") == "1"
@@ -1992,9 +1993,9 @@ def ck_price(text, u, native):
     lines, queries = _CKL[0]
     r = _ckhooks().Reach(lines, queries, text, SRC)
     if r.allq or r.imp:
-        return native
+        return float("inf")
     rerun = r.frame | r.opt_q
-    return min(native, CK_C + sum((CK_K if q in rerun else CK_R) * u.get("f:%d" % q, 0) for q in r.hot()))
+    return min(native, CK_C + min(CK_BUDGET, sum((CK_K if q in rerun else CK_R) * u.get("f:%d" % q, 0) for q in r.hot())))
 
 
 def lean_cost():
@@ -2920,7 +2921,7 @@ def lean_run(order, stop, optcache, budgets, total, ck=None, duck=False):
         X.optimize = cached
     if ck is not None:
         ckhooks = _ckhooks()
-        S = ckhooks.Session(os.path.join(HERE, "tpc", "ck"), SRC, ck, total)
+        S = ckhooks.Session(os.path.join(HERE, "tpc", "ck"), SRC, ck, min(total, CK_BUDGET))
         S.install(X)
         first = [i for i in S.order_hint() if i in order]
         order = first + [i for i in order if i not in first]
