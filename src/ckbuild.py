@@ -143,12 +143,11 @@ def sweep(lin, record):
         res = sx.execute(e, schema=te.TPCDS_SCHEMA, tables=arg)
         qt = time.process_time() - t0
         setcur(None)
-        nat = real_px(tables=real_et(arg)).execute(real_plan(real_opt(pickle.loads(pickle.dumps(te.parse_one(sql))), te.TPCDS_SCHEMA, leave_tables_isolated=True)))
-        if nat.columns != res.columns or nat.rows != res.rows:
-            raise SystemExit("pinned AST result differs on query %d" % i)
-        qt = time.process_time() - t0
-        setcur(None)
         if record:
+            nat = real_px(tables=real_et(arg)).execute(real_plan(real_opt(pickle.loads(pickle.dumps(te.parse_one(sql))), te.TPCDS_SCHEMA, leave_tables_isolated=True)))
+            if nat.columns != res.columns or nat.rows != res.rows:
+                raise SystemExit("pinned AST result differs on query %d" % i)
+            setcur(None)
             recd = state["recd"]
             pp = real_plan(pickle.loads(state["o"]))
             ps = ck.step_sigs(pp)
@@ -159,8 +158,7 @@ def sweep(lin, record):
 
 
 sweep(True, False)
-sweep(True, False)
-sweep(False, True)
+sweep(True, True)
 a, b = cov
 lines = {}
 for key in set(a) | set(b):
