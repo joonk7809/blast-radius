@@ -50,6 +50,7 @@ UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 DOCSTRIP = os.environ.get("BR_DOCSTRIP", "1") == "1"
 DOC = [False]
+OPTWARM = os.environ.get("BR_OPTWARM", "1") == "1"
 SEGPARSE = os.environ.get("BR_SEGPARSE", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
@@ -2364,7 +2365,8 @@ def main():
             return not LAZYEXEC or r is None or bool(r & table_attrs)
 
         exec_commits = sum(1 for p in plans if any(needs_tables(n) for n in p["light"]))
-        zygote.warm(SRC, warm_ids, (TPCWARM or not (TPCREF and LAZYTABLES)) and exec_commits >= (3 if LAZYTABLES else 2 if LAZYEXEC or LEANIMP else 1))
+        opt_commits = sum(1 for p in plans if any(num_to_id[n].startswith("tests/test_optimizer.py::TestOptimizer::") for n in p["light"]))
+        zygote.warm(SRC, warm_ids, (TPCWARM or not (TPCREF and LAZYTABLES)) and exec_commits >= (3 if LAZYTABLES else 2 if LAZYEXEC or LEANIMP else 1), OPTWARM and opt_commits >= 2)
         if PARTIAL:
             load_edges()
         warm_lines = {p: set(v) for p, v in json.load(open(os.path.join(HERE, "warmmap.json"))).items()}
