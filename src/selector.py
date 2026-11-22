@@ -68,7 +68,7 @@ OPTWARM = os.environ.get("BR_OPTWARM", "1") == "1"
 SEGPARSE = os.environ.get("BR_SEGPARSE", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
 FAILFAST = os.environ.get("BR_FAILFAST", "1") == "1"
-RUN_K = float(os.environ.get("BR_RUN_K", "1.0"))
+RUN_K = float(os.environ.get("BR_RUN_K", "2.0"))
 RUN_O = float(os.environ.get("BR_RUN_O", "0.0"))
 RUN_O_RE = float(os.environ.get("BR_RUN_O_RE", "0.0"))
 STATIC = os.environ.get("BR_STATIC", "0") == "1"
