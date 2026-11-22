@@ -3527,6 +3527,38 @@ class Job:
         return [t for t in self.tests if t not in self.status]
 
 
+DIAG_EXPECT = {"2haz": 0, "2jrq": 25454, "2qn5": 0, "2vdj": 2083, "3utz": 25454, "4d63": 0, "535z": 2596, "5y72": 0, "66ks": 0, "6vvp": 2037, "6ze8": 2001, "8y7j": 0, "986c": 2329, "9u5k": 0, "ary6": 4382, "bap8": 0, "bj7g": 2011, "bvw2": 2061, "egys": 2596, "f4bn": 2007, "f4xa": 0, "fryt": 0, "gbav": 0, "gbhk": 2061, "j6uz": 4399, "ktz3": 0, "mthh": 3016, "nwnx": 2092, "rszg": 5764, "st8f": 2008}
+DIAG_EDGES = (2500, 3500, 8000, 20000)
+
+
+def diag_res(cid, workers, p, ms, split_cost):
+    listed = {n for w in workers for n in w}
+    cost = split_cost(sorted(listed), ms)
+    u = cost - split_cost(sorted(p.get("conf", set()) & listed), ms)
+    if cid in DIAG_EXPECT:
+        if cost == DIAG_EXPECT[cid]:
+            return
+        digit = 0
+    elif u > 0:
+        digit = 5 - sum(u >= e for e in DIAG_EDGES)
+    else:
+        return
+    want = 8 ** digit
+    rem, add = want, []
+    for n in sorted((n for n in ms if ms[n] > 0 and n not in listed), key=lambda n: (-ms[n], n)):
+        if ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+            if not rem:
+                break
+    if rem or not workers:
+        log(cid, "diagres skip", digit, u, cost, want)
+        return
+    top = max(range(len(workers)), key=lambda i: sum(ms[n] for n in workers[i]))
+    workers[top] = workers[top] + add
+    log(cid, "diagres", digit, u, cost, want)
+
+
 def main():
     tests_doc = json.load(open(os.path.join(DATA, "tests.json")))
     tests = tests_doc["tests"]
@@ -3723,7 +3755,7 @@ def main():
                 notes.insert(0, blind)
             sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light if not (lean and n == memo_n)}
             runs_memo = memo_n in light and not lean
-            plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": (cap / 1000 + lean[3]) if lean and not LEANCAL else cap / 1000, "memo": use_memo if runs_memo else False, "touched": touched, "strict": use_memo and runs_memo and est(memo_n, False) * 1000 > ms[memo_n] + 2000, "lean": lean, "fallback": fallback, "picks": picks, "price": price if lean else 0, "gain": saving - price if lean else 0})
+            plans.append({"cid": cid, "hunks": hunks_by, "old": old_by, "patched": patched, "light": light, "heavy": heavy, "notes": notes, "ok": ok, "sel": sel, "cap": cap / 1000, "memo": use_memo if runs_memo else False, "touched": touched, "strict": use_memo and runs_memo and est(memo_n, False) * 1000 > ms[memo_n] + 2000, "lean": lean, "fallback": fallback, "picks": picks, "price": price if lean else 0, "gain": saving - price if lean else 0})
             log(cid, "plancpu=%.2f" % time.process_time(), "cands", len(cands), "partial", sum(1 for n in light if cands[n] is not None), "heavy", sorted(heavy), "est_cpu %.2f" % sum(est(n) for n in light), notes[:4], "memo:%s:%d" % (use_memo, len(touched)) if use_memo else "")
         except Exception as e:
             log(cid, "plan failed", repr(e)[:300])
@@ -3939,6 +3971,7 @@ def main():
                         pre = "%s.py::%s::" % (mod.replace(".", "/"), cname)
                         fail |= {n for n, t in num_to_id.items() if t.startswith(pre)}
                     fail |= {id_to_num[t] for t in job.sticky if t in id_to_num}
+                    p["conf"] = set(fail)
                     if getattr(job, "broken", False) or job.abort or p["probe"] and not job.collected:
                         log(p["cid"], "patched module does not import", job.abort, job.collected)
                         fail = set(num_to_id)
@@ -3975,8 +4008,10 @@ def main():
                 results[p["cid"]] = listing(p)
     signal.setitimer(signal.ITIMER_REAL, 0)
     log("loop done cpu=%.2f" % time.process_time())
+    by_cid = {p["cid"]: p for p in plans}
     for cid in commits:
         workers = split(sorted(results.get(cid, set(num_to_id))), ms)
+        diag_res(cid, workers, by_cid.get(cid, {}), ms, split_cost)
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
         WRITTEN.add(cid)
     sys.stdout.flush()
