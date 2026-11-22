@@ -2989,13 +2989,23 @@ def lean_run(order, stop, optcache, budgets, total, ck=None, duck=False):
     def run(expression):
         return pickle.loads(pickle.dumps(X.execute(expression, schema=schema, tables={t.name: tables[t.name] for t in find_tables(expression)})))
 
+    def ckrun(i):
+        r = S.Q[i]
+        S.hint = (ckhooks.Parsed(r["pblob"], find_tables), i)
+        return pickle.loads(pickle.dumps(X.execute(S.hint[0], schema=schema, tables={n: tables[n] for n in r["targ"]})))
+
     bad = []
     for i in order:
         blob = blobs.get(keyed.get("f:%d" % i))
         if i not in queries or blob is None:
             return [i]
         signal.setitimer(signal.ITIMER_VIRTUAL, budgets.get(i, 0))
-        got = _outcome(lambda: run(pickle.loads(pickle.dumps(parse_one(queries[i])))))
+        if ck is not None:
+            S.hint = None
+        if ck is not None and i in S.fast and "targ" in S.Q[i] and S.Q[i]["sql"] == queries[i]:
+            got = _outcome(lambda: ckrun(i))
+        else:
+            got = _outcome(lambda: run(pickle.loads(pickle.dumps(parse_one(queries[i])))))
         if duck and got[0] == "ok":
             try:
                 d = transpile(queries[i], write="duckdb")[0]

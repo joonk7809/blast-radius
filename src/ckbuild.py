@@ -72,7 +72,10 @@ def h_et(*a, **kw):
 
 def h_es(schema, *a, **kw):
     state["raw_schema"] = (schema, a, sorted(kw.items()))
-    return real_es(schema, *a, **kw)
+    r = real_es(schema, *a, **kw)
+    if state["record"]:
+        state["sta"] = r.supported_table_args
+    return r
 
 
 def h_opt(expression, schema, **kw):
@@ -123,7 +126,7 @@ for _ in range(2):
     for key in cov.pop():
         setup_cov[key] = {("setup", -1)}
 sx.optimize, sx.Plan, sx.PythonExecutor, sx.ensure_tables, sx.ensure_schema = h_opt, h_plan, HPX, h_et, h_es
-queries = {}
+queries, plines = {}, {}
 
 
 def sweep(lin, record):
@@ -135,8 +138,17 @@ def sweep(lin, record):
     for i, (meta, sql, _) in enumerate(k.tpcds_sqls):
         if not meta.get("execute"):
             continue
-        e = pickle.loads(pickle.dumps(te.parse_one(sql)))
+        if lin:
+            cov.append({})
+        setcur(("parse", i))
+        eb = pickle.dumps(te.parse_one(sql))
+        e = pickle.loads(eb)
         arg = {x.name: k.tpcds_tables[x.name] for x in te.find_tables(e)}
+        setcur(None)
+        pok = record and memo.digest(e, {})
+        if lin:
+            for key in cov.pop():
+                plines.setdefault(key, set()).add(i)
         state["q"] = i
         t0 = time.process_time()
         res = sx.execute(e, schema=te.TPCDS_SCHEMA, tables=arg)
@@ -149,7 +161,9 @@ def sweep(lin, record):
             if sorted(ns.values()) != sorted(ps.values()) or ns[pn.root] != ps[pp.root] or ck.plan_ctes(pn) != ck.plan_ctes(pp) or sorted(ps.values()) != sorted(state["sigs"].values()):
                 raise SystemExit("pinned AST plan differs on query %d" % i)
             recd = state["recd"]
-            queries[i] = {"planblob": ck.dumps((pp, ps)), "root": ps[pp.root], "ctes": ck.plan_ctes(pp), "pdig": state["pdig"], "schema": state["schema"], "kw": state["kw"], "opt": state["o"], "osql": state["osql"], "sigs": sorted(state["sigs"].values()), "steps": recd.steps, "result": pickle.dumps(res, protocol=5), "qtime": qt, "tables": sorted(arg)}
+            queries[i] = {"planblob": ck.dumps((pp, ps)), "root": ps[pp.root], "ctes": ck.plan_ctes(pp), "pdig": state["pdig"], "schema": state["schema"], "kw": state["kw"], "opt": state["o"], "osql": state["osql"], "sigs": sorted(state["sigs"].values()), "steps": recd.steps, "result": pickle.dumps(res, protocol=5), "qtime": qt, "tables": sorted(arg), "sql": sql, "sta": state["sta"], "targ": list(arg)}
+            if pok == state["pdig"]:
+                queries[i]["pblob"] = eb
 
 
 rec = os.path.join(OUT, "rec.pkl")
@@ -186,7 +200,7 @@ mon.set_events(tool, 0)
 mon.free_tool_id(tool)
 base = {n: ck.content_state(t) for n, t in k.tpcds_tables.items()}
 with open(os.path.join(OUT, "ck2.pkl"), "wb") as fh:
-    pickle.dump({"queries": queries, "lines": lines, "base": base}, fh, protocol=5)
+    pickle.dump({"queries": queries, "lines": lines, "plines": plines, "base": base}, fh, protocol=5)
 with open(os.path.join(OUT, "lines.pkl"), "wb") as fh:
     pickle.dump((lines, sorted(queries), {(q, s): r["cost"] for q, x in queries.items() for s, r in x["steps"].items()}), fh, protocol=5)
 st = [r for q in queries.values() for r in q["steps"].values()]
