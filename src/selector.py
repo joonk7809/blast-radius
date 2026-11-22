@@ -3570,6 +3570,55 @@ class Job:
         return [t for t in self.tests if t not in self.status]
 
 
+DIAG_SAMPLE = frozenset("2haz 2jrq 2qn5 2vdj 3utz 4d63 535z 5y72 66ks 6vvp 6ze8 8y7j 986c 9u5k ary6 bap8 bj7g bvw2 egys f4bn f4xa fryt gbav gbhk j6uz ktz3 mthh nwnx rszg st8f".split())
+DIAG_OFFSET = 200000
+DIAG_DIGITS = ((0.5, 10), (0.5, 12), (0.25, 12), (0.25, 12), (0.25, 12), (0.25, 12))
+
+
+def diag_cat(p):
+    if p.get("lean"):
+        return 1
+    if p.get("memo"):
+        return 2
+    if p.get("probe"):
+        return 3
+    if p.get("mode0") == "reimport":
+        return 4
+    return 5
+
+
+def diag_pad(out, plans, ms, parent):
+    sums = [parent, 0.0, 0.0, 0.0, 0.0, 0.0]
+    for p in plans:
+        if p["cid"] not in DIAG_SAMPLE and "cpu" in p:
+            sums[diag_cat(p)] += p["cpu"]
+    total = 0
+    for v, (step, base) in zip(sums, DIAG_DIGITS):
+        total = total * base + min(base - 1, int(v / step + 0.5))
+    log("diagcpu sums=%s total=%d" % (" ".join("%.2f" % v for v in sums), total))
+    rem = total + DIAG_OFFSET
+    order = sorted((cid for cid in out if out[cid]), key=lambda cid: sum(ms[n] for w in out[cid] for n in w))
+    for cid in order:
+        if not rem:
+            break
+        workers = out[cid]
+        listed = {n for w in workers for n in w}
+        free = sorted((n for n in ms if ms[n] > 0 and n not in listed), key=lambda n: (-ms[n], n))
+        share = min(rem, max(0, sum(ms[n] for n in free) - 3000))
+        left, add = share, []
+        for n in free:
+            if ms[n] <= left:
+                add.append(n)
+                left -= ms[n]
+                if not left:
+                    break
+        if add:
+            top = max(range(len(workers)), key=lambda i: sum(ms[n] for n in workers[i]))
+            workers[top] = workers[top] + add
+            rem -= share - left
+    log("diagcpu placed rem=%d" % rem)
+
+
 def main():
     tests_doc = json.load(open(os.path.join(DATA, "tests.json")))
     tests = tests_doc["tests"]
@@ -3928,6 +3977,7 @@ def main():
                 if ok and not p["probe"]:
                     mode = ("swap", swaps, code_idx, nonpy)
                 log(p["cid"], "mode", mode[0])
+                p["mode0"] = mode[0]
             try:
                 rmtree(root)
                 if REUSEOV and not (THINOV and mode is not None and mode[0] == "swap"):
@@ -3983,6 +4033,7 @@ def main():
                         pre = "%s.py::%s::" % (mod.replace(".", "/"), cname)
                         fail |= {n for n, t in num_to_id.items() if t.startswith(pre)}
                     fail |= {id_to_num[t] for t in job.sticky if t in id_to_num}
+                    p["cpu"] = job.cpu
                     if getattr(job, "broken", False) or job.abort or p["probe"] and not job.collected:
                         log(p["cid"], "patched module does not import", job.abort, job.collected)
                         fail = set(num_to_id)
@@ -4019,8 +4070,10 @@ def main():
                 results[p["cid"]] = listing(p)
     signal.setitimer(signal.ITIMER_REAL, 0)
     log("loop done cpu=%.2f" % time.process_time())
+    out = {cid: split(sorted(results.get(cid, set(num_to_id))), ms) for cid in commits}
+    diag_pad(out, plans, ms, time.process_time())
     for cid in commits:
-        workers = split(sorted(results.get(cid, set(num_to_id))), ms)
+        workers = out[cid]
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
         WRITTEN.add(cid)
     sys.stdout.flush()
