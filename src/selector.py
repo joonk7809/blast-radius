@@ -110,6 +110,11 @@ LEAN_SEED = [int(x) for x in os.environ.get("BR_LEAN_SEED", "8,5,96").split(",")
 LEAN_MEM = int(float(os.environ.get("BR_LEAN_MEM_MB", "512")) * 1048576)
 LEAN_WALL = float(os.environ.get("BR_LEAN_WALL", "90"))
 LEAN_OPT_COST = float(os.environ.get("BR_LEAN_OPT_COST", "12.0"))
+CKHOOKS = os.environ.get("BR_CKHOOKS", "0") == "1"
+LEANWIDE = os.environ.get("BR_LEANWIDE", "0") == "1"
+CK_C = float(os.environ.get("BR_CK_C", "2.0"))
+CK_K = float(os.environ.get("BR_CK_K", "0.5"))
+CK_R = float(os.environ.get("BR_CK_R", "0.25"))
 T0 = time.monotonic()
 GCOFF = os.environ.get("BR_GCOFF", "1") == "1"
 PATHRULES = os.environ.get("BR_PATHRULES", "1") == "1"
@@ -1962,6 +1967,36 @@ def lean_gate(notes, patched, old_by, hunks_by):
     return live > 0
 
 
+_WIDE_BAD = ("error:", "itf-error", "binary:", "source-encoding", "old-unparsable", "new-unparsable", "deleted-or-renamed", "newfile", "shadows-module", "pytest-config", "other:", "testfile", "fixture", "unmapped-fixture", "setupclass", "test-", "xfail", "queries:", "memo-fresh")
+
+
+def lean_wide(notes, patched, old_by):
+    if any(x.startswith(_WIDE_BAD) for x in notes):
+        return False
+    return all(rel.startswith("sqlglot/") and rel.endswith(".py") and new is not None and old_by.get(rel) is not None for rel, new in patched.items())
+
+
+_CKL = []
+
+
+def _ckhooks():
+    sys.modules.setdefault("selector", sys.modules[__name__])
+    import ckhooks
+    return ckhooks
+
+
+def ck_price(text, u, native):
+    if not _CKL:
+        with open(os.path.join(HERE, "tpc", "ck", "lines.pkl"), "rb") as fh:
+            _CKL.append(pickle.load(fh))
+    lines, queries = _CKL[0]
+    r = _ckhooks().Reach(lines, queries, text, SRC)
+    if r.allq or r.imp:
+        return native
+    rerun = r.frame | r.plan_q | r.opt_q
+    return min(native, CK_C + sum((CK_K if q in rerun else CK_R) * u.get("f:%d" % q, 0) for q in r.hot()))
+
+
 def lean_cost():
     d = memo_data()
     if d is None or len(d["keyed"].get("ds", {})) != len(d["pre"].get("ds", {})):
@@ -2673,19 +2708,20 @@ def lean_reference(te, k):
         opt[key] = pickle.dumps(out)
         return out
 
-    queries = {}
+    queries, duck = {}, {}
     X.optimize = record
     try:
         for i, (meta, sql, _) in enumerate(k.tpcds_sqls):
             if not meta.get("execute"):
                 continue
             queries[i] = sql
+            duck[i] = te.transpile(sql, write="duckdb")[0]
             expression = pickle.loads(pickle.dumps(te.parse_one(sql)))
             te.execute(expression, schema=te.TPCDS_SCHEMA, tables={t.name: k.tpcds_tables[t.name] for t in te.find_tables(expression)})
     finally:
         X.optimize = real
     root = os.path.abspath(SRC) + os.sep
-    return {"schema": te.TPCDS_SCHEMA, "hschema": te.TPCH_SCHEMA, "queries": queries, "opt": opt, "optfiles": sorted(os.path.relpath(f, root) for f in files if os.path.abspath(f).startswith(root) and os.path.isfile(f))}
+    return {"schema": te.TPCDS_SCHEMA, "hschema": te.TPCH_SCHEMA, "queries": queries, "duck": duck, "opt": opt, "optfiles": sorted(os.path.relpath(f, root) for f in files if os.path.abspath(f).startswith(root) and os.path.isfile(f))}
 
 
 def _same(a, b):
@@ -2850,7 +2886,10 @@ def _over_budget(signum, frame):
     raise QueryBudget()
 
 
-def lean_run(order, stop, optcache, budgets, total):
+_CKINFO = []
+
+
+def lean_run(order, stop, optcache, budgets, total, ck=None, duck=False):
     with open(os.path.join(HERE, "tpc", "lean.pkl"), "rb") as fh:
         ref = pickle.load(fh)
     queries, schema = ref["queries"], ref["schema"]
@@ -2879,6 +2918,14 @@ def lean_run(order, stop, optcache, budgets, total):
             return real(*a, **kw) if blob is None else pickle.loads(blob)
 
         X.optimize = cached
+    if ck is not None:
+        ckhooks = _ckhooks()
+        S = ckhooks.Session(os.path.join(HERE, "tpc", "ck"), SRC, ck, total)
+        S.install(X)
+        first = [i for i in S.order_hint() if i in order]
+        order = first + [i for i in order if i not in first]
+    if duck:
+        from sqlglot import transpile
 
     def run(expression):
         return pickle.loads(pickle.dumps(X.execute(expression, schema=schema, tables={t.name: tables[t.name] for t in find_tables(expression)})))
@@ -2890,12 +2937,22 @@ def lean_run(order, stop, optcache, budgets, total):
             return [i]
         signal.setitimer(signal.ITIMER_VIRTUAL, budgets.get(i, 0))
         got = _outcome(lambda: run(pickle.loads(pickle.dumps(parse_one(queries[i])))))
+        if duck and got[0] == "ok":
+            try:
+                d = transpile(queries[i], write="duckdb")[0]
+            except Exception:
+                d = None
+            if d != ref["duck"][i]:
+                got = ("err", "Transpile", "")
         signal.setitimer(signal.ITIMER_VIRTUAL, 0)
         if not _same(got, _outcome(lambda: pickle.loads(blob))):
             bad.append(i)
-            if stop or got[0] == "err" and got[1] in ("Timeout", "QueryBudget", "MemoryError", "RecursionError"):
+            if stop or got[0] == "err" and got[1] in ("Timeout", "QueryBudget", "MemoryError", "RecursionError", "Budget"):
                 break
     signal.setitimer(signal.ITIMER_PROF, 0)
+    if ck is not None:
+        S.restore()
+        _CKINFO.append(json.dumps({"spent": round(S.spent, 3), "nogo": S.nogo, "fb": S.fb[:8], "stats": S.stats}, separators=(",", ":")))
     return bad
 
 
@@ -3266,7 +3323,7 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None, token=""
         emit("S", MEMO_TEST)
         emit("F", MEMO_TEST)
     elif lean is not None:
-        order, optcache, budgets, total = lean
+        order, optcache, budgets, total, ck, duck = lean
         emit("S", MEMO_TEST)
         t0 = time.process_time()
         try:
@@ -3275,8 +3332,8 @@ def child_run(root, test_ids, timeouts, wfd, sel, mode=None, lean=None, token=""
                 vm = int(fh.read().split("VmSize:")[1].split()[0]) * 1024
             resource.setrlimit(resource.RLIMIT_AS, (vm + LEAN_MEM, vm + LEAN_MEM))
             signal.setitimer(signal.ITIMER_REAL, LEAN_WALL, 0.5)
-            bad = lean_run(order, not LEANCAL, optcache, budgets, total)
-            emit("Q", ",".join(map(str, bad)) or "-")
+            bad = lean_run(order, not LEANCAL, optcache, budgets, total, ck, duck)
+            emit("Q", " ".join([",".join(map(str, bad)) or "-"] + _CKINFO))
         except BaseException:
             bad = [-1]
         signal.setitimer(signal.ITIMER_REAL, 0)
@@ -3579,9 +3636,11 @@ def main():
             heavy, light, cap, blind = decide()
             lean = fallback = picks = None
             u = lean_cost() if LEAN and ok and cached and memo_n in heavy and memo_n not in FORCE_LIST and _lean_meta() else None
-            if u and lean_gate(notes, patched, old_by, hunks_by):
+            narrow = bool(u) and lean_gate(notes, patched, old_by, hunks_by)
+            wide = bool(u) and not narrow and LEANWIDE and lean_wide(notes, patched, old_by)
+            if narrow or wide:
                 need = lean_need(cov, memo_n, patched, hunks_by, notes, u)
-                optcache = not any(r in _lean_meta()["optfiles"] for r in patched if "noop:" + r not in notes)
+                optcache = narrow and not any(r in _lean_meta()["optfiles"] for r in patched if "noop:" + r not in notes)
                 if CANARY_K:
                     chosen = canary_pick(need, u, CANARY_K)
                     order = lean_order(need, u, chosen)
@@ -3589,6 +3648,8 @@ def main():
                 else:
                     order = lean_order(need, u)
                     price = LEAN_OPT_COST if optcache else LEAN_COST
+                    if CKHOOKS:
+                        price = ck_price(text, u, price)
                 if LEANCAL:
                     picks = {k: [int(q[2:]) for q in canary_pick(need, u, k)] for k in (0, 2, 4, 8)}
                 h2, l2, c2, b2 = decide(price)
@@ -3598,8 +3659,8 @@ def main():
                     heavy, light, cap, blind = (h2 - {memo_n}, sorted(set(l2) | {memo_n}), 1e9, b2) if LEANCAL else (h2, l2, c2, b2)
                     if blind:
                         heavy, light, blind = heavy - {memo_n}, [memo_n], None
-                    notes = notes + ["lean%s%s:%.1f" % (":k%d" % CANARY_K if CANARY_K else "", ":opt" if optcache else "", saving)]
-                    lean = (order, optcache, {} if LEANCAL else {int(q[2:]): BUDGET_K * c + BUDGET_C for q, c in u.items()}, 1e6 if LEANCAL else saving / LEAN_SCALE)
+                    notes = notes + ["lean%s%s%s%s:%.1f" % (":k%d" % CANARY_K if CANARY_K else "", ":opt" if optcache else "", ":wide" if wide else "", ":ck%.1f" % price if CKHOOKS else "", saving)]
+                    lean = (order, optcache, {} if LEANCAL else {int(q[2:]): BUDGET_K * c + BUDGET_C for q, c in u.items()}, 1e6 if LEANCAL else saving / LEAN_SCALE, text if CKHOOKS else None, wide)
             if blind:
                 notes.insert(0, blind)
             sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light if not (lean and n == memo_n)}
@@ -3844,6 +3905,8 @@ def main():
                     top = sorted(job.tcpu.items(), key=lambda kv: -kv[1])[:4]
                     log(p["cid"], "testcpu=%.2f" % sum(job.tcpu.values()), "top", " ".join("%s:%.2f" % (t.split("::")[-1], c) for t, c in top))
                     log(p["cid"], "fail", sorted(fail), "heavy", sorted(p["heavy"]), "cpu=%.2f" % job.cpu, "t=%.1f" % (time.monotonic() - T0))
+                    if p["lean"] and CKHOOKS:
+                        log(p["cid"], "lean", job.status.get(MEMO_TEST), job.tcpu.get(MEMO_TEST), getattr(job, "lean", None))
     except BaseException as e:
         signal.setitimer(signal.ITIMER_REAL, 0)
         log("loop failed", repr(e)[:300])
