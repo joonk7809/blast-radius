@@ -1982,8 +1982,10 @@ _CKL = []
 
 
 def _ckhooks():
-    sys.modules.setdefault("selector", sys.modules[__name__])
+    alias = sys.modules.setdefault("selector", sys.modules[__name__]) is sys.modules[__name__] and __name__ != "selector"
     import ckhooks
+    if alias:
+        del sys.modules["selector"]
     return ckhooks
 
 
@@ -1994,9 +1996,10 @@ def ck_price(text, u, native):
     lines, queries = _CKL[0]
     r = _ckhooks().Reach(lines, queries, text, SRC)
     if r.allq or r.imp:
-        return float("inf")
+        return native, False
     rerun = r.frame | r.opt_q
-    return min(native, CK_C + min(CK_BUDGET, sum((CK_K if q in rerun else CK_R) * u.get("f:%d" % q, 0) for q in r.hot())))
+    est = CK_C + min(CK_BUDGET, sum((CK_K if q in rerun else CK_R) * u.get("f:%d" % q, 0) for q in r.hot()))
+    return (est, True) if est < native else (native, False)
 
 
 def lean_cost():
@@ -3695,6 +3698,7 @@ def main():
             if narrow or wide:
                 need = lean_need(cov, memo_n, patched, hunks_by, notes, u)
                 optcache = LEANOPT and narrow and not any(r in _lean_meta()["optfiles"] for r in patched if "noop:" + r not in notes)
+                ckon = False
                 if CANARY_K:
                     chosen = canary_pick(need, u, CANARY_K)
                     order = lean_order(need, u, chosen)
@@ -3703,7 +3707,7 @@ def main():
                     order = lean_order(need, u)
                     price = LEAN_OPT_COST if optcache else LEAN_COST
                     if CKHOOKS and narrow:
-                        price = ck_price(text, u, price)
+                        price, ckon = ck_price(text, u, price)
                 if LEANCAL:
                     picks = {k: [int(q[2:]) for q in canary_pick(need, u, k)] for k in (0, 2, 4, 8)}
                 h2, l2, c2, b2 = decide(price)
@@ -3713,8 +3717,8 @@ def main():
                     heavy, light, cap, blind = (h2 - {memo_n}, sorted(set(l2) | {memo_n}), 1e9, b2) if LEANCAL else (h2, l2, c2, b2)
                     if blind:
                         heavy, light, blind = heavy - {memo_n}, [memo_n], None
-                    notes = notes + ["lean%s%s%s%s:%.1f" % (":k%d" % CANARY_K if CANARY_K else "", ":opt" if optcache else "", ":wide" if wide else "", ":ck%.1f" % price if CKHOOKS and narrow else "", saving)]
-                    lean = (order, optcache, {} if LEANCAL else {int(q[2:]): BUDGET_K * c + BUDGET_C for q, c in u.items()}, 1e6 if LEANCAL else saving / LEAN_SCALE, text if CKHOOKS and narrow else None, wide)
+                    notes = notes + ["lean%s%s%s%s:%.1f" % (":k%d" % CANARY_K if CANARY_K else "", ":opt" if optcache else "", ":wide" if wide else "", ":ck%.1f" % price if ckon else "", saving)]
+                    lean = (order, optcache, {} if LEANCAL else {int(q[2:]): BUDGET_K * c + BUDGET_C for q, c in u.items()}, 1e6 if LEANCAL else saving / LEAN_SCALE, text if ckon else None, wide)
             if blind:
                 notes.insert(0, blind)
             sel = {num_to_id[n]: (None if cands[n] is None else sorted(cands[n])) for n in light if not (lean and n == memo_n)}
