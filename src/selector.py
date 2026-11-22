@@ -2655,10 +2655,52 @@ def _outcome(run):
         return ("err", type(e).__name__, re.sub(r"0x[0-9a-fA-F]+|\d{6,}", "#", str(e)))
 
 
+def _ast_dumps(obj):
+    import copyreg
+    import sqlglot.expressions as e
+    base = getattr(e, "Expr", None) or e.Expression
+
+    class P(pickle.Pickler):
+        def reducer_override(self, x):
+            if isinstance(x, base):
+                sl = {n: getattr(x, n) for c in type(x).__mro__ for n in c.__dict__.get("__slots__", ()) if n != "__dict__" and hasattr(x, n)}
+                d = getattr(x, "__dict__", None)
+                return copyreg.__newobj__, (type(x),), (d, sl) if sl else d
+            return NotImplemented
+
+    b = io.BytesIO()
+    P(b, protocol=5).dump(obj)
+    return b.getvalue()
+
+
+def _plan_sig(plan):
+    import sqlglot.expressions as e
+    base = getattr(e, "Expr", None) or e.Expression
+
+    def v(x):
+        if isinstance(x, base):
+            return x.sql()
+        if isinstance(x, (list, tuple, set)):
+            return [v(y) for y in (sorted(x, key=repr) if isinstance(x, set) else x)]
+        if isinstance(x, dict):
+            return sorted((repr(k), v(y)) for k, y in x.items())
+        return repr(x)
+
+    seen, out, todo = set(), [], [plan.root]
+    while todo:
+        st = todo.pop()
+        if id(st) in seen:
+            continue
+        seen.add(id(st))
+        out.append((type(st).__name__, sorted((k, v(y)) for k, y in vars(st).items() if k not in ("dependencies", "dependents")), sorted(d.name for d in st.dependencies)))
+        todo.extend(st.dependencies)
+    return len(out), sorted(map(repr, out))
+
+
 def lean_reference(te, k):
     import sqlglot.executor as X
     real = X.optimize
-    opt, files = {}, set()
+    opt, files, check = {}, set(), []
 
     def prof(frame, event, arg):
         if event == "call":
@@ -2671,7 +2713,8 @@ def lean_reference(te, k):
             out = real(*a, **kw)
         finally:
             sys.setprofile(None)
-        opt[key] = pickle.dumps(out)
+        opt[key] = _ast_dumps(out)
+        check.append((key, out))
         return out
 
     queries = {}
@@ -2685,6 +2728,10 @@ def lean_reference(te, k):
             te.execute(expression, schema=te.TPCDS_SCHEMA, tables={t.name: k.tpcds_tables[t.name] for t in te.find_tables(expression)})
     finally:
         X.optimize = real
+    from sqlglot.planner import Plan
+    for key, out in check:
+        if _plan_sig(Plan(pickle.loads(opt[key]))) != _plan_sig(Plan(out)):
+            raise SystemExit("lean optcache: cached optimized AST plans differently from optimize()")
     root = os.path.abspath(SRC) + os.sep
     return {"schema": te.TPCDS_SCHEMA, "hschema": te.TPCH_SCHEMA, "queries": queries, "opt": opt, "optfiles": sorted(os.path.relpath(f, root) for f in files if os.path.abspath(f).startswith(root) and os.path.isfile(f))}
 
