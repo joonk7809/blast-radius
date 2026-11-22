@@ -15,6 +15,7 @@ t_TypeVar = type(__import__("typing").TypeVar("T"))
 SKIP_SLOTS = ("parent", "arg_key", "index", "_hash")
 POSITION = ("line", "col", "start", "end")
 DERIVED = ("_DISPATCH_CACHE",)
+HOOK = None
 
 
 class Opaque(Exception):
@@ -306,31 +307,55 @@ def build(src, out_path):
     passes = []
     anywhere = {}
     cur = [None]
+    rels = {}
+    inside = set()
+    gate = [0]
+    otool = tool + 1
+    mon.use_tool_id(otool, "memo-outside")
+
+    def rel_of(code):
+        rel = rels.get(code.co_filename)
+        if rel is None:
+            rel = rels[code.co_filename] = os.path.relpath(code.co_filename, src)
+        return rel
 
     def lcb(code, line):
-        if not code.co_filename.startswith(src):
-            return mon.DISABLE
-        rel = os.path.relpath(code.co_filename, src)
-        if state["on"]:
-            passes[-1].setdefault(cur[0][0], {}).setdefault(rel, {}).setdefault(line, set()).add(cur[0][1])
-            return mon.DISABLE
-        anywhere.setdefault(rel, set()).add(line)
+        if code.co_filename.startswith(src):
+            passes[-1].setdefault(cur[0][0], {}).setdefault(rel_of(code), {}).setdefault(line, set()).add(cur[0][1])
+        return mon.DISABLE
+
+    def ocb(code, line):
+        if code.co_filename.startswith(src):
+            at = (code, sys._getframe(1).f_lasti)
+            if state["on"]:
+                inside.add(at)
+            elif at not in inside:
+                anywhere.setdefault(rel_of(code), set()).add(line)
+        return mon.DISABLE
 
     ev = mon.events
     for e in (ev.PY_START, ev.PY_RESUME, ev.PY_THROW):
         mon.register_callback(tool, e, cb)
     mon.register_callback(tool, ev.LINE, lcb)
-    mon.set_events(tool, ev.LINE)
+    mon.register_callback(otool, ev.LINE, ocb)
+    for e in (ev.PY_START, ev.PY_RESUME):
+        mon.register_callback(otool, e, lambda *a: mon.DISABLE)
+    mon.register_callback(otool, ev.PY_THROW, lambda *a: None)
+    mon.set_events(otool, ev.LINE)
     k.setUpClass()
 
     def enter():
         if not state["on"]:
             state["t"] = time.process_time()
+            if gate[0]:
+                mon.set_events(tool, gate[0])
         state["on"] += 1
 
     def leave():
         state["on"] -= 1
         if not state["on"]:
+            if gate[0]:
+                mon.set_events(tool, 0)
             state["cpu"] += time.process_time() - state["t"]
 
     memo = {}
@@ -340,6 +365,8 @@ def build(src, out_path):
     store = {}
 
     def lookup(d, expression, raw):
+        if gate[0]:
+            return None
         t = time.process_time()
         store["x"] = {drop: digest(expression, raw, drop) for drop in itertools.chain.from_iterable(itertools.combinations(POSITION, n) for n in range(len(POSITION) + 1))}
         state["cpu"] += (time.process_time() - t) * 15 / 16
@@ -350,7 +377,9 @@ def build(src, out_path):
     def sweep(lined):
         if lined:
             passes.append({})
-        mon.set_events(tool, ev.PY_START | ev.PY_RESUME | ev.PY_THROW | (ev.LINE if lined else 0))
+        gate[0] = ev.PY_START | ev.PY_RESUME | ev.PY_THROW | ev.LINE if lined else 0
+        mon.set_events(tool, 0 if lined else ev.PY_START | ev.PY_RESUME | ev.PY_THROW)
+        mon.set_events(otool, gate[0])
         for kind, word, _, attr in KINDS:
             tables = getattr(k, attr)
             sqls = k.tpch_sqls if kind == "h" else k.tpcds_sqls
@@ -359,6 +388,7 @@ def build(src, out_path):
                     continue
                 cur[0] = (kind, "f:%d" % i)
                 if lined:
+                    inside.clear()
                     mon.restart_events()
                 t0 = time.process_time()
                 state["cpu"] = 0.0
@@ -366,7 +396,8 @@ def build(src, out_path):
                 try:
                     expression = pickle.loads(pickle.dumps(te.parse_one(sql)))
                     arg = {t.name: tables[t.name] for t in te.find_tables(expression)}
-                    result = te.execute(expression, schema=te.TPCH_SCHEMA if kind == "h" else te.TPCDS_SCHEMA, tables=arg)
+                    call = functools.partial(te.execute, expression, schema=te.TPCH_SCHEMA if kind == "h" else te.TPCDS_SCHEMA, tables=arg)
+                    result = HOOK.around(kind, "f:%d" % i, call) if HOOK and lined else call()
                     blob = pickle.dumps(result)
                     enter()
                     try:
@@ -394,7 +425,9 @@ def build(src, out_path):
             lines.setdefault(kind, {})[rel] = {ln: everyone if a.get(ln) != b.get(ln) else a[ln] for ln in set(a) | set(b)}
     hooks.remove()
     mon.set_events(tool, 0)
+    mon.set_events(otool, 0)
     mon.free_tool_id(tool)
+    mon.free_tool_id(otool)
     names, consts = set(), set()
     for rel in {r for r, _, _ in seen}:
         with open(os.path.join(src, rel), encoding="utf-8") as fh:
