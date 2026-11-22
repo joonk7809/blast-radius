@@ -50,6 +50,8 @@ UNITS = os.environ.get("BR_UNITS", "1") == "1"
 CANON = os.environ.get("BR_CANON", "1") == "1"
 DOCSTRIP = os.environ.get("BR_DOCSTRIP", "1") == "1"
 DOC = [False]
+REUSEOV = os.environ.get("BR_REUSEOV", "1") == "1"
+THINOV = os.environ.get("BR_THINOV", "1") == "1"
 OPTWARM = os.environ.get("BR_OPTWARM", "1") == "1"
 SEGPARSE = os.environ.get("BR_SEGPARSE", "1") == "1"
 LISTRULE = os.environ.get("BR_LISTRULE", "1") == "1"
@@ -1285,6 +1287,33 @@ def build_overlay(root, patched):
                 fh.write(content)
 
 
+SLOTS = []
+
+
+def _clean_view(d, s):
+    with os.scandir(d) as it:
+        entries = list(it)
+    if sorted(e.name for e in entries) != sorted(os.listdir(s)):
+        return False
+    return all(e.is_symlink() or (e.is_dir(follow_symlinks=False) and _clean_view(e.path, os.path.join(s, e.name))) for e in entries)
+
+
+def release_slot(root, patched):
+    try:
+        for rel in patched:
+            target, src = os.path.join(root, rel), os.path.join(SRC, rel)
+            if os.path.lexists(target):
+                os.unlink(target)
+            if os.path.lexists(src):
+                os.symlink(src, target)
+        if _clean_view(root, SRC):
+            SLOTS.append(root)
+            return
+    except OSError:
+        pass
+    rmtree(root)
+
+
 def rmtree(path):
     if not os.path.lexists(path):
         return
@@ -2396,13 +2425,7 @@ def main():
                 results[p["cid"]] = set(p["heavy"]) | set(p["light"])
                 continue
             root = os.path.join(TMP, "ov", p["cid"])
-            try:
-                rmtree(root)
-                build_overlay(root, p["patched"])
-            except Exception as e:
-                log(p["cid"], "overlay failed", repr(e))
-                results[p["cid"]] = set(num_to_id)
-                continue
+            slot = False
             ids = [num_to_id[n] for n in p["light"]]
             timeouts = {num_to_id[n]: max(3.0, ms[n] / 1000 * 10 + 2) for n in p["light"]}
             budget = sum(timeouts.values()) + 30
@@ -2431,11 +2454,28 @@ def main():
                 if ok:
                     mode = ("swap", swaps, code_idx, nonpy)
                 log(p["cid"], "mode", mode[0])
+            try:
+                rmtree(root)
+                if THINOV and mode is not None and mode[0] == "swap":
+                    for rel in mode[3]:
+                        os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+                        with open(os.path.join(root, rel), "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+                            fh.write(p["patched"][rel])
+                else:
+                    if REUSEOV:
+                        slot = True
+                        root = SLOTS.pop() if SLOTS else root
+                    build_overlay(root, p["patched"])
+            except Exception as e:
+                log(p["cid"], "overlay failed", repr(e))
+                results[p["cid"]] = set(num_to_id)
+                continue
             global CHILD_LAZY, CHILD_PATCHED
             CHILD_PATCHED = list(p["patched"])
             CHILD_LAZY = tpc_lazy(p["patched"])
             p["job"] = Job(p["cid"], root, ids, timeouts, time.monotonic() + budget, p["sel"], mode)
             p["root"] = root
+            p["slot"] = slot
             running.append(p)
         fds = [p["job"].fd for p in running]
         r, _, _ = select.select(fds, [], [], 0.5)
@@ -2463,7 +2503,10 @@ def main():
                     log(p["cid"], "unresolved", len(unresolved), "current", job.current, "exit", getattr(job, "exit", None))
                     fail |= {id_to_num[t] for t in unresolved}
                 results[p["cid"]] = fail | set(p["heavy"])
-                rmtree(p["root"])
+                if p["slot"]:
+                    release_slot(p["root"], p["patched"])
+                else:
+                    rmtree(p["root"])
                 top = sorted(job.tcpu.items(), key=lambda kv: -kv[1])[:4]
                 log(p["cid"], "testcpu=%.2f" % sum(job.tcpu.values()), "top", " ".join("%s:%.2f" % (t.split("::")[-1], c) for t, c in top))
                 log(p["cid"], "fail", sorted(fail), "heavy", sorted(p["heavy"]), "cpu=%.2f" % job.cpu, "t=%.1f" % (time.monotonic() - T0))
