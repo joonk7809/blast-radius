@@ -89,6 +89,7 @@ IMPORTBODY = os.environ.get("BR_IMPORTBODY", "1") == "1"
 CACHESITE = os.environ.get("BR_CACHESITE", "1") == "1"
 HELPERS = os.environ.get("BR_HELPERS", "1") == "1"
 LEANHDR = os.environ.get("BR_LEANHDR", "1") == "1"
+LEANLAST = os.environ.get("BR_LEANLAST", "1") == "1"
 HELPERS2 = os.environ.get("BR_HELPERS2", "1") == "1"
 BUDGET_FRAC = float(os.environ.get("BR_BUDGET_FRAC", "0.75"))
 PLAN_FRAC = float(os.environ.get("BR_PLAN_FRAC", "0.35"))
@@ -3718,7 +3719,7 @@ def main():
         for p in plans:
             if not p["light"] and not p["probe"]:
                 results[p["cid"]] = set(p["heavy"])
-        pending.sort(key=lambda p: -sum(ms[n] for n in p["light"]))
+        pending.sort(key=lambda p: (bool(LEANLAST and p["lean"]), -p["gain"] if LEANLAST and p["lean"] else -sum(ms[n] for n in p["light"])))
         queue = list(pending)
         end = T0 + BUDGET_FRAC * wall_span(len(commits))
 
@@ -3785,6 +3786,13 @@ def main():
         while queue or running:
             while queue and len(running) < PARALLEL:
                 p = queue.pop(0)
+                if LEANLAST and p["lean"] and p["fallback"] and time.monotonic() + p["price"] > end - 5:
+                    p.update(p["fallback"])
+                    p["runs"] = list(p["light"])
+                    log(p["cid"], "lean dropped: late")
+                    if not p["light"] and not p["probe"]:
+                        results[p["cid"]] = set(p["heavy"])
+                        continue
                 if time.monotonic() > end - 5:
                     results[p["cid"]] = listing(p)
                     continue
