@@ -6,6 +6,8 @@ import sys
 import types
 
 SRC, OUT, NPART = sys.argv[1], sys.argv[2], int(sys.argv[3])
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 os.environ["BR_SRC"] = SRC
 os.environ["SKIP_INTEGRATION"] = "0"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,7 +27,7 @@ def snapshot(mod):
     return {k: ("obj", id(v)) if isinstance(v, (types.FunctionType, type)) else selector.support_dumps(v) for k, v in vars(mod).items() if not k.startswith("__")}
 
 
-def probe(tid, wfd):
+def probe(path, tids, wfd):
     import tests.helpers as helpers
     pristine = snapshot(helpers)
     calls, owner, busy, dirty = [], {}, [], []
@@ -63,38 +65,58 @@ def probe(tid, wfd):
         owner[top] = [os.path.relpath(name, SRC), code.co_qualname, blob and base64.b64encode(blob).decode(), digest, {code.co_firstlineno}]
         calls.append(owner[top])
 
+    def take():
+        out = [c[:4] + [sorted(c[4])] for c in calls]
+        calls.clear()
+        owner.clear()
+        return out
+
     mon.use_tool_id(mon.PROFILER_ID, "helpercalls")
     mon.register_callback(mon.PROFILER_ID, mon.events.PY_START, on_start)
     mon.set_events(mon.PROFILER_ID, mon.events.PY_START)
+    out = {}
     try:
-        path, cls, meth = tid.split("::")
         m = __import__(path[:-3].replace("/", "."), fromlist=["_"])
-        unittest.TestSuite([getattr(m, cls)(meth)]).run(unittest.TestResult())
     except BaseException:
-        calls = None
+        m = None
+    boot, boot_dirty = take(), bool(dirty)
+    for tid in tids if m is not None else ():
+        dirty[:] = [1] if boot_dirty else []
+        try:
+            _, cls, meth = tid.split("::")
+            unittest.TestSuite([getattr(m, cls)(meth)]).run(unittest.TestResult())
+            ok = True
+        except BaseException:
+            ok = False
+        got = take()
+        if snapshot(helpers) != pristine:
+            dirty.append(1)
+        out[tid] = {"calls": boot + got if ok else None, "dirty": bool(dirty)}
     mon.set_events(mon.PROFILER_ID, 0)
-    if snapshot(helpers) != pristine:
-        dirty.append(1)
     with os.fdopen(wfd, "w") as fh:
-        json.dump({"calls": calls and [c[:4] + [sorted(c[4])] for c in calls], "dirty": bool(dirty)}, fh)
+        json.dump(out, fh)
 
 
 def run_part(ids, path):
     out = {}
+    groups = {}
     for tid in ids:
+        groups.setdefault(tid.split("::")[0], []).append(tid)
+    for f, tids in sorted(groups.items()):
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:
             os.close(r)
             try:
-                probe(tid, w)
+                probe(f, tids, w)
             finally:
                 os._exit(0)
         os.close(w)
         with os.fdopen(r) as fh:
             data = fh.read()
         os.waitpid(pid, 0)
-        out[tid] = json.loads(data) if data else None
+        got = json.loads(data) if data else {}
+        out.update({tid: got.get(tid) for tid in tids})
     with open(path, "w") as fh:
         json.dump(out, fh)
 
